@@ -4,7 +4,7 @@ from contextlib import aclosing
 import pytest
 from agentscope.app.message_bus import MessageBusKeys
 
-from egis_agentkit.services.assembly import ScopedMessageBus
+from egis_agentkit.extensions.compatibility.execution import ScopedMessageBus
 
 
 @pytest.mark.asyncio

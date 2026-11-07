@@ -5,7 +5,7 @@ from test_domain import expert, identities
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.models import Asset, Grant, Group
 from egis_agentkit.services import AgentService, PermissionService, ShareService
-from egis_agentkit.services.snapshots import SnapshotService
+from egis_agentkit.service.access.snapshot import SnapshotService
 from egis_agentkit.storage import tables as t
 
 
@@ -135,7 +135,7 @@ async def test_private_binding_does_not_keep_revoked_external_permission(storage
 
 @pytest.mark.asyncio
 async def test_shared_team_members_keep_distinct_pinned_resource_versions(monkeypatch):
-    from egis_agentkit.services import snapshots as module
+    from egis_agentkit.service.access import snapshot as module
 
     async def raw_view(self, identifier, view, *, conn=None):
         return {
@@ -145,8 +145,10 @@ async def test_shared_team_members_keep_distinct_pinned_resource_versions(monkey
             "payload": {"bindings": []},
         }
 
-    monkeypatch.setattr(module.AgentService, "raw_view", raw_view)
-    service = SnapshotService(None)
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(module.DefinitionViews, "raw_view", raw_view)
+    service = SnapshotService(SimpleNamespace(engine=None))
 
     async def capture(identifier, view, *, conn=None):
         version = {"first": "1.0.0", "second": "2.0.0"}[identifier]
@@ -210,7 +212,7 @@ async def test_shared_team_members_keep_distinct_pinned_resource_versions(monkey
 
 @pytest.mark.asyncio
 async def test_team_capture_retains_both_versions_from_real_approved_experts(storage):
-    from egis_agentkit.services.teams import TeamService
+    from egis_agentkit.service.team.definition import TeamService
 
     _, admin, alice, bob = await identities(storage)
     async with storage.transaction() as conn:
@@ -281,7 +283,7 @@ async def test_team_capture_retains_both_versions_from_real_approved_experts(sto
 @pytest.mark.asyncio
 async def test_asset_merge_rejects_different_content_for_same_version(storage):
     from egis_agentkit.errors import Conflict
-    from egis_agentkit.services.snapshots import node_key
+    from egis_agentkit.service.access.snapshot import node_key
 
     _, admin, _, _ = await identities(storage)
     asset = Asset(

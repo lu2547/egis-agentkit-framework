@@ -5,8 +5,8 @@ from agentscope.app.storage import AsyncSQLAlchemyStorage
 from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from ..errors import NotFound
-from . import tables
+from egis_agentkit.errors import NotFound
+from egis_agentkit.storage import tables
 
 
 class AgentKitStorage(AsyncSQLAlchemyStorage):
@@ -81,35 +81,10 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
         return record if record is not None and record.agent_id == agent_id else None
 
     async def get_session(self, user_id, agent_id, session_id):
-        from ..services.assembly import execution_scope
-
-        scope = execution_scope.get()
-        if scope and (scope.user_id, scope.agent_id, scope.session_id) == (
-            user_id,
-            agent_id,
-            session_id,
-        ):
-            return scope.session_record.model_copy(deep=True)
         return await self.read_session_unscoped(user_id, agent_id, session_id)
 
-    async def get_agent(self, user_id, agent_id):
-        from ..services.assembly import (
-            execution_scope,
-            projected_agent,
-        )
-
-        record = await super().get_agent(user_id, agent_id)
-        scope = execution_scope.get()
-        if (
-            record is not None
-            and scope
-            and (scope.user_id, scope.agent_id) == (user_id, agent_id)
-        ):
-            return projected_agent(record, scope)
-        return record
-
     async def update_session_state(self, user_id, agent_id, session_id, state):
-        from ..errors import Forbidden
+        from egis_agentkit.errors import Forbidden
 
         if await self.read_session_unscoped(user_id, agent_id, session_id) is None:
             raise Forbidden("会话归属不匹配")

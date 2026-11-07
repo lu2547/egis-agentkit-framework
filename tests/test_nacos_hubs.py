@@ -5,7 +5,8 @@ import httpx
 import pytest
 
 from egis_agentkit.config import NacosBootstrap, NacosClient, NacosError
-from egis_agentkit.hubs import NacosHubManagement, NacosMCPHub, NacosSkillHub
+from egis_agentkit.integration.nacos.registry import NacosHubManagement
+from egis_agentkit.extensions.hub import NacosMCPHub, NacosSkillHub
 
 
 @pytest.mark.asyncio
@@ -137,6 +138,8 @@ async def test_management_validates_archive_paths_and_uses_draft_lifecycle_priva
         assert requests == []
         await manager.upload_skill(archive("report/SKILL.md"), "1.0.0")
         assert requests[0].url.path.endswith("/skills/upload")
+        assert requests[0].extensions["timeout"]["read"] == 300
+        assert requests[1].extensions["timeout"]["read"] != 300
         assert b"autoPublishIfNew" in requests[0].content
         await manager.create_mcp(
             "tools",

@@ -6,12 +6,7 @@ import pytest
 
 from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.models import Definition
-from egis_agentkit.services import (
-    AgentService,
-    PermissionService,
-    ShareService,
-    UserService,
-)
+from egis_agentkit.services import AgentService, PermissionService, ShareService, UserService
 
 
 async def identities(storage):

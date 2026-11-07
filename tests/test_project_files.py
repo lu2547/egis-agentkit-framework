@@ -3,8 +3,8 @@ import os
 import pytest
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.services.file_changes import FileChangeService
-from egis_agentkit.workspace.files import WorkspaceFiles
+from egis_agentkit.service.workspace.changes import FileChangeService
+from egis_agentkit.service.workspace.files import WorkspaceFiles
 
 
 def test_project_layout_keeps_uploads_flat_and_reserved_areas_separate(tmp_path):
@@ -210,8 +210,8 @@ def test_legacy_migration_recovers_partial_journal_and_long_name_collisions(tmp_
 async def test_native_workspace_uses_project_scope_for_shared_sessions(tmp_path):
     from types import SimpleNamespace
 
-    from egis_agentkit.services.assembly import execution_scope
-    from egis_agentkit.workspace.manager import EgisLocalWorkspaceManager
+    from egis_agentkit.extensions.compatibility.execution import execution_scope
+    from egis_agentkit.extensions.workspace.local import EgisLocalWorkspaceManager
 
     manager = EgisLocalWorkspaceManager(tmp_path)
     scope = execution_scope.set(

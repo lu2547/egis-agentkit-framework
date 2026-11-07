@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.workspace.files import WorkspaceFiles
+from egis_agentkit.service.workspace.files import WorkspaceFiles
 
 
 def test_preview_rejects_cross_user_and_symlink_escape(tmp_path):
@@ -112,7 +112,7 @@ def test_discovery_preserves_newer_artifact_and_requires_explicit_code_delivery(
 
 @pytest.mark.asyncio
 async def test_shared_native_workspace_initializes_each_project_directory(tmp_path):
-    from egis_agentkit.workspace.manager import EgisLocalWorkspaceManager
+    from egis_agentkit.extensions.workspace.local import EgisLocalWorkspaceManager
 
     manager = EgisLocalWorkspaceManager(tmp_path)
     try:

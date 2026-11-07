@@ -8,8 +8,8 @@ from test_resources import Registry, archive, put_asset, service
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.models import Definition, Grant
 from egis_agentkit.services import AgentService, PermissionService
-from egis_agentkit.services.resources import skill_archive_digest
-from egis_agentkit.services.snapshots import SnapshotService
+from egis_agentkit.service.resource.service import skill_archive_digest
+from egis_agentkit.service.access.snapshot import SnapshotService
 
 
 @pytest.mark.asyncio
@@ -305,7 +305,7 @@ async def test_bound_agent_cache_rejects_symlinked_definition_ancestor(
 
 
 def cache_service_for_race(tmp_path):
-    from egis_agentkit.services.resources import ResourceService
+    from egis_agentkit.service.resource.service import ResourceService
 
     service = ResourceService(None, None, None, None, tmp_path)
     asset = {
@@ -345,7 +345,7 @@ def test_two_instances_concurrently_materialize_one_verified_cache(
     import threading
     from concurrent.futures import ThreadPoolExecutor
 
-    from egis_agentkit.services import resources as module
+    from egis_agentkit.service.resource import service as module
 
     barrier = threading.Barrier(2)
     real_rename = os.rename
@@ -387,7 +387,7 @@ async def test_competing_invalid_cache_winner_is_rejected(
     import errno
 
     from egis_agentkit.errors import Conflict
-    from egis_agentkit.services import resources as module
+    from egis_agentkit.service.resource import service as module
 
     service = cache_service_for_race(tmp_path)
     outside = tmp_path / "outside"

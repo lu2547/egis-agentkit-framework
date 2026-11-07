@@ -4,7 +4,7 @@ from test_domain import expert, identities
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.models import Grant, Group
 from egis_agentkit.services import AgentService, PermissionService
-from egis_agentkit.services.teams import TeamService
+from egis_agentkit.service.team.definition import TeamService
 
 
 @pytest.mark.asyncio

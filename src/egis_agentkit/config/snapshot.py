@@ -7,7 +7,9 @@ import yaml
 from agentscope.permission import PermissionMode
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .client import NacosClient, NacosError
+from egis_agentkit.integration.nacos.client import NacosClient, NacosError
+
+from .limits import DEFAULT_SKILL_ARCHIVE_MAX_BYTES
 
 
 class ConfigModel(BaseModel):
@@ -78,12 +80,17 @@ class PoliciesConfig(ConfigModel):
             PermissionMode.DEFAULT,
             PermissionMode.ACCEPT_EDITS,
             PermissionMode.EXPLORE,
-            PermissionMode.DONT_ASK,
+            PermissionMode.BYPASS,
         ]
     )
     allow_model_override: bool = True
     allowed_model_keys: list[str] = Field(default_factory=list)
     max_upload_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+    max_skill_archive_bytes: int = Field(
+        default=DEFAULT_SKILL_ARCHIVE_MAX_BYTES,
+        gt=0,
+        le=DEFAULT_SKILL_ARCHIVE_MAX_BYTES,
+    )
 
 
 class ConfigSnapshot(ConfigModel):

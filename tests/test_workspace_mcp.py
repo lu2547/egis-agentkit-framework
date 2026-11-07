@@ -5,8 +5,8 @@ import pytest
 from agentscope.mcp import HttpMCPConfig, MCPClient
 from test_domain import identities
 
-from egis_agentkit.services.assembly import execution_scope
-from egis_agentkit.workspace.manager import EgisLocalWorkspaceManager
+from egis_agentkit.extensions.compatibility.execution import execution_scope
+from egis_agentkit.extensions.workspace.local import EgisLocalWorkspaceManager
 
 
 @pytest.mark.asyncio
@@ -40,6 +40,7 @@ async def test_native_workspace_connects_and_reuses_stateful_mcp_per_session(
                 user_id="alice",
                 agent_id="a",
                 session_id=sid,
+                project_id="shared-project",
                 definition={"agent_type": "expert", "payload": {"bindings": []}},
             )
             token = execution_scope.set(scope)

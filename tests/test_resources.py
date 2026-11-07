@@ -12,10 +12,11 @@ from test_domain import identities
 
 from egis_agentkit.config import NacosBootstrap, NacosClient
 from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.hubs import NacosHubManagement, NacosMCPHub, NacosSkillHub
+from egis_agentkit.integration.nacos.registry import NacosHubManagement
+from egis_agentkit.extensions.hub import NacosMCPHub, NacosSkillHub
 from egis_agentkit.models import Asset, Grant, ResourceRef
-from egis_agentkit.services.permissions import PermissionService
-from egis_agentkit.services.resources import ResourceService, skill_archive_digest
+from egis_agentkit.service.access.authorization import PermissionService
+from egis_agentkit.service.resource.service import ResourceService, skill_archive_digest
 from egis_agentkit.storage import tables as t
 
 
@@ -263,7 +264,7 @@ async def test_materialization_preserves_files_checks_checksum_and_exact_inherit
     await put_asset(storage, checksum=skill_archive_digest(archive()))
     from egis_agentkit.models import Definition
     from egis_agentkit.services import AgentService
-    from egis_agentkit.services.snapshots import SnapshotService
+    from egis_agentkit.service.access.snapshot import SnapshotService
 
     root = await AgentService(storage).save(
         admin,
@@ -595,7 +596,7 @@ async def test_oversized_download_closes_upstream_stream(storage, tmp_path):
     source = Registry()
     resources, http = await service(storage, tmp_path, source)
     await put_asset(storage, owner_type="user", owner_id="alice")
-    resources.policies = SimpleNamespace(max_upload_bytes=4)
+    resources.policies = SimpleNamespace(max_skill_archive_bytes=4)
     closed = []
 
     async def stream():

@@ -2,7 +2,7 @@
 
 AgentScope 的配置管理与企业增强框架。首版已实现，不修改 AgentScope service 源码。
 
-`services` 包含 User、Agent、Team、Permission、Share、Resource、Package 等领域 Service；`storage` 继承原生 SQL Storage，增加企业表；`packages` 管理版本化装配；`config` 和 `hubs` 接 Nacos；`middleware`、`workspace`、`message_bus` 实现原生扩展点。聊天循环、团队通信、消息事件、HITL、SSE 和模型调用继续使用 AgentScope。
+`service` 按 User、Agent、Team、Permission、Project、Workspace、Resource 等领域组织；`storage` 复用原生 SQL Storage 并增加企业表；`extensions` 实现原生扩展点；`integration` 接入 Nacos 等外部系统。App 通过具名 `AgentKitServices` 组合领域服务。聊天循环、团队通信、消息事件、HITL、SSE 和模型调用继续使用 AgentScope。旧 `services` 路径暂时保留兼容导入。
 
 业务包的工具与中间件使用 AgentScope 原生类型，在版本目录的注册入口返回装配工厂。参考 [Demo 发布包](../../demo/agentscope-demo/agentkit_demo/releases/README.md)，由 App 管理接口注册。普通用户在页面创建的轻量专家只绑定已授权 Skill/MCP，不允许指定 Python 装配。
 
@@ -17,3 +17,5 @@ AgentScope 的配置管理与企业增强框架。首版已实现，不修改 Ag
 配置管理统一使用已安装的 [Nacos](./docs/配置管理.md)，只保留连接中心所需的最小部署引导，不另建本地业务配置中心。
 
 启动和真实联调见 [App](../egis-agentkit-app/README.md) 与 [实施记录](../egis-agentkit-app/docs/实施记录.md)。当前实际验收使用本地 AgentScope 2.0.11 源码；依赖范围为 `>=2.0.10,<2.1`，未单独声称已通过 2.0.10 的另一套完整验收。
+
+项目共享工作空间与删除规则见 [文件生命周期](docs/session-files.md)。

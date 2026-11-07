@@ -3,8 +3,8 @@ from test_domain import expert, identities
 
 from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.services import AgentService
-from egis_agentkit.services.file_changes import FileChangeService
-from egis_agentkit.services.tasks import TaskService
+from egis_agentkit.service.workspace.changes import FileChangeService
+from egis_agentkit.service.session.service import TaskService
 
 
 class Bus:
@@ -98,7 +98,7 @@ async def test_task_delete_keeps_project_files_and_observation_records(
     from sqlalchemy import insert, select
 
     from egis_agentkit.storage import tables as t
-    from egis_agentkit.services.projects import ProjectService
+    from egis_agentkit.service.project.service import ProjectService
 
     _, _, alice, _ = await identities(storage)
     source = await AgentService(storage).save(alice, expert())

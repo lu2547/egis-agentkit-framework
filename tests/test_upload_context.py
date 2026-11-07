@@ -5,10 +5,10 @@ from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import Read
 from test_domain import expert, identities
 
-from egis_agentkit.middleware.policy import EnterprisePolicyMiddleware
+from egis_agentkit.extensions.middleware.policy import EnterprisePolicyMiddleware
 from egis_agentkit.services import AgentService
-from egis_agentkit.services.assembly import ExecutionCoordinator, execution_scope
-from egis_agentkit.services.tasks import TaskService
+from egis_agentkit.extensions.compatibility.execution import ExecutionCoordinator, execution_scope
+from egis_agentkit.service.session.service import TaskService
 
 
 @pytest.mark.asyncio

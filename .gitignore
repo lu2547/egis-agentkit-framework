@@ -13,3 +13,4 @@ logs/
 build/
 dist/
 .worktrees/
+.vscode/

@@ -16,8 +16,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import StatementError
 from test_message_bus import pg_engine as pg_engine
 
-from egis_agentkit.message_bus import EgisMessageBus
-from egis_agentkit.message_bus._kafka import KafkaTransport
+from egis_agentkit.extensions.message_bus import EgisMessageBus
+from egis_agentkit.integration.kafka import KafkaTransport
 
 
 class LimitedBroker:

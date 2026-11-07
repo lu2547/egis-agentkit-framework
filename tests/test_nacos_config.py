@@ -2,12 +2,7 @@ import httpx
 import pytest
 import yaml
 
-from egis_agentkit.config import (
-    NacosBootstrap,
-    NacosClient,
-    NacosConfigProvider,
-    NacosError,
-)
+from egis_agentkit.config import NacosBootstrap, NacosClient, NacosConfigProvider, NacosError
 
 
 @pytest.mark.asyncio

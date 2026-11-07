@@ -1,7 +1,6 @@
 """Nacos bootstrap, REST transport and typed atomic configuration snapshots."""
 
-from .client import NacosBootstrap, NacosClient, NacosError
-from .snapshot import (
+from egis_agentkit.config.snapshot import (
     AuthConfig,
     ConfigSnapshot,
     ModelsConfig,
@@ -9,6 +8,11 @@ from .snapshot import (
     NacosConfigProvider,
     PoliciesConfig,
     RuntimeConfig,
+)
+from egis_agentkit.integration.nacos.client import (
+    NacosBootstrap,
+    NacosClient,
+    NacosError,
 )
 
 # Singular aliases support callers naming the configuration domain.

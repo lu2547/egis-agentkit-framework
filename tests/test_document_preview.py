@@ -6,7 +6,7 @@ import pytest
 from pypdf import PdfReader
 
 from egis_agentkit.errors import AgentKitError
-from egis_agentkit.services.document_preview import DocumentPreviewService
+from egis_agentkit.service.workspace.preview import DocumentPreviewService
 
 FIXTURES = Path(__file__).parents[2] / "egis-agentkit-frontend/tests/fixtures"
 

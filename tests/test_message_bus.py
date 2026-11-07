@@ -13,7 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from egis_agentkit.message_bus import EgisMessageBus, LeaseLostError
+from egis_agentkit.extensions.message_bus import EgisMessageBus, LeaseLostError
 
 
 @pytest.fixture

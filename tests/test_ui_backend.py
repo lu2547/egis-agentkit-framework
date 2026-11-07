@@ -4,8 +4,8 @@ from test_domain import expert, identities
 
 from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.services import AgentService
-from egis_agentkit.services.tasks import TaskService
-from egis_agentkit.workspace.files import WorkspaceFiles
+from egis_agentkit.service.session.service import TaskService
+from egis_agentkit.service.workspace.files import WorkspaceFiles
 
 
 def test_user_workspace_is_scoped_and_rejects_symlinks(tmp_path):
@@ -64,7 +64,7 @@ async def test_workspace_http_routes_and_task_upload_persist(storage, tmp_path):
     from fastapi.responses import JSONResponse
 
     from egis_agentkit.errors import AgentKitError
-    from egis_agentkit.services.projects import ProjectService
+    from egis_agentkit.service.project.service import ProjectService
 
     _, _, alice, bob = await identities(storage)
     source = await AgentService(storage).save(alice, expert())
@@ -86,15 +86,18 @@ async def test_workspace_http_routes_and_task_upload_persist(storage, tmp_path):
     async def domain_error(request, exc):
         return JSONResponse({"detail": str(exc)}, status_code=exc.status_code)
 
-    from egis_agentkit.services.file_changes import FileChangeService
+    from egis_agentkit.service.workspace.changes import FileChangeService
 
     changes = FileChangeService(storage, tmp_path)
-    app.state.egis_services = {
-        "files": WorkspaceFiles(tmp_path),
-        "tasks": tasks,
-        "projects": projects,
-        "file_changes": changes,
-    }
+    from types import SimpleNamespace
+
+    from egis_agentkit.service.workspace.preview import DocumentPreviewService
+    from egis_agentkit.service.workspace.service import WorkspaceService
+
+    files = WorkspaceFiles(tmp_path)
+    app.state.egis_services = SimpleNamespace(
+        workspace=WorkspaceService(files, projects, tasks, changes, DocumentPreviewService())
+    )
     app.dependency_overrides[current_user] = lambda: alice
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -151,7 +154,7 @@ async def test_workspace_http_routes_and_task_upload_persist(storage, tmp_path):
         assert (
             await client.get(f"/manager/tasks/{isolated_sid}/files", params={"area": "uploads"})
         ).json()["items"] == []
-        app.state.egis_services["files"].write(
+        files.write(
             "alice", project_id, "report.md", b"finished report"
         )
         delivered = await client.get(
@@ -161,7 +164,7 @@ async def test_workspace_http_routes_and_task_upload_persist(storage, tmp_path):
         assert (
             await client.get(f"/manager/tasks/{isolated_sid}/files", params={"area": "artifacts"})
         ).json()["items"] == []
-        app.state.egis_services["files"].write(
+        files.write(
             "alice", project_id, "nested/summary.md", b"nested delivery"
         )
         nested = await client.get(
@@ -184,8 +187,8 @@ async def test_workspace_http_routes_and_task_upload_persist(storage, tmp_path):
 
 @pytest.mark.asyncio
 async def test_team_delete_rejects_member_run_then_cascades(storage, tmp_path):
-    from egis_agentkit.message_bus import EgisMessageBus
-    from egis_agentkit.services.teams import TeamService
+    from egis_agentkit.extensions.message_bus import EgisMessageBus
+    from egis_agentkit.service.team.definition import TeamService
 
     _, _, alice, _ = await identities(storage)
     member = await AgentService(storage).save(alice, expert())
@@ -209,7 +212,7 @@ async def test_team_delete_rejects_member_run_then_cascades(storage, tmp_path):
     session = await service.session(alice, task["session_id"])
     native_team = await storage.get_team(alice.user_id, session.team_id)
     worker = native_team.data.members[0]
-    from egis_agentkit.services.file_changes import FileChangeService
+    from egis_agentkit.service.workspace.changes import FileChangeService
 
     changes = FileChangeService(storage, tmp_path)
     project_id = task["project_id"]
@@ -275,7 +278,7 @@ async def test_task_dto_reads_persisted_native_plan(storage, tmp_path):
 
 @pytest.mark.asyncio
 async def test_owner_can_delete_after_system_agent_grant_revoked(storage, tmp_path):
-    from egis_agentkit.message_bus import EgisMessageBus
+    from egis_agentkit.extensions.message_bus import EgisMessageBus
     from egis_agentkit.models import Grant
     from egis_agentkit.services import PermissionService
 

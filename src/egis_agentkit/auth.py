@@ -6,7 +6,7 @@ from functools import cached_property
 
 import jwt
 
-from .errors import Forbidden
+from egis_agentkit.errors import Forbidden
 
 
 class JWTIdentity:

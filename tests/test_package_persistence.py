@@ -4,7 +4,7 @@ import pytest
 from test_domain import identities
 
 from egis_agentkit.packages import PackageLoader
-from egis_agentkit.services.packages import PackageService
+from egis_agentkit.service.agent.package import PackageService
 
 
 @pytest.mark.asyncio

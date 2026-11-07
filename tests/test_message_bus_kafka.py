@@ -11,7 +11,7 @@ from aiokafka.errors import CommitFailedError
 from aiokafka.structs import TopicPartition
 from test_message_bus import pg_engine as pg_engine
 
-from egis_agentkit.message_bus import EgisMessageBus
+from egis_agentkit.extensions.message_bus import EgisMessageBus
 
 WAKE_QUEUE = MessageBusKeys.wakeup_queue()
 WAKE_SIGNAL = MessageBusKeys.wakeup_signal()

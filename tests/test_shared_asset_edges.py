@@ -8,7 +8,7 @@ from test_resources import Registry, service
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.models import Asset
 from egis_agentkit.services import AgentService, PermissionService, ShareService
-from egis_agentkit.services.snapshots import SnapshotService
+from egis_agentkit.service.access.snapshot import SnapshotService
 from egis_agentkit.storage import tables as t
 
 

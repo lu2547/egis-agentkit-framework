@@ -72,6 +72,8 @@ async def test_http_identity_native_write_seal_and_real_task_files(
         ),
     )
     app = await build_app(config, nacos, engine=storage.engine)
+    assert app.state.egis_services.tasks.projects is app.state.egis_services.projects
+    assert app.state.egis_bus.coordinator.projects is app.state.egis_services.projects
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app, client=("127.0.0.1", 1234)),
@@ -193,7 +195,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
                 },
             )
             assert team_response.status_code == 201, team_response.text
-            team_task = await app.state.egis_services["tasks"].create(
+            team_task = await app.state.egis_services.tasks.create(
                 admin, team_response.json()["id"], "private"
             )
             native_session = await storage.read_session_unscoped(
@@ -268,7 +270,9 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             )
             assert upload.status_code == 201, upload.text
             assert upload.json()["area"] == "uploads"
-            app.state.egis_services["files"].write(alice.user_id, sid, "report.md", b"# Real artifact\n")
+            app.state.egis_services.workspace.files.write(
+                alice.user_id, task.json()["project_id"], "report.md", b"# Real artifact\n"
+            )
             assert (
                 await client.post(
                     f"/manager/tasks/{sid}/deliver", json={"path": "report.md"}
@@ -295,7 +299,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
                     return preview_pdf
 
             preview = Preview()
-            app.state.egis_services["preview"] = preview
+            app.state.egis_services.workspace.preview = preview
             office = await client.post(
                 f"/manager/tasks/{sid}/files",
                 files={"file": ("测试 幻灯片.pptx", b"office fixture")},
@@ -307,10 +311,15 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             )
             assert rendered.status_code == 200 and rendered.content.startswith(b"%PDF-")
             assert rendered.headers["content-type"].startswith("application/pdf")
+            workspace_office = await client.post(
+                "/manager/workspace/files",
+                files={"file": ("测试 幻灯片.pptx", b"office fixture")},
+            )
+            assert workspace_office.status_code == 201
             assert (
                 await client.get(
                     "/manager/workspace/preview",
-                    params={"path": f"uploads/{sid}/测试 幻灯片.pptx"},
+                    params={"path": workspace_office.json()["path"]},
                 )
             ).status_code == 200
             assert preview.calls == 2

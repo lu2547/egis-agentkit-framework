@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    LargeBinary,
     MetaData,
     String,
     Table,
@@ -274,4 +275,41 @@ file_scan_errors = Table(
         nullable=False,
         server_default=text("now()"),
     ),
+)
+
+# Upload bytes live in PostgreSQL, making jobs independent of process-local disks.
+skill_imports = Table(
+    "ak_skill_imports", metadata,
+    Column("job_id", String(64), primary_key=True),
+    Column("owner_id", String(128), nullable=False),
+    Column("filename", String(255), nullable=False),
+    Column("category", String(80), nullable=False),
+    Column("avatar", String(64), nullable=False),
+    Column("archive", LargeBinary),
+    Column("remote_uploaded", Boolean, nullable=False, server_default=text("false")),
+    Column("status", String(16), nullable=False, server_default="queued"),
+    Column("stage", String(32), nullable=False, server_default="queued"),
+    Column("progress", BigInteger, nullable=False, server_default="0"),
+    Column("attempts", BigInteger, nullable=False, server_default="0"),
+    Column("lease_token", String(64)),
+    Column("lease_until", DateTime(timezone=True)),
+    Column("available_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("resource_id", String(128), nullable=False),
+    Column("resource_version", String(128)),
+    Column("error", Text),
+    Column("result", JSONB),
+    *audit_columns(),
+    CheckConstraint("status IN ('queued','running','succeeded','failed')"),
+    CheckConstraint("progress BETWEEN 0 AND 100"),
+)
+Index("ix_ak_skill_import_claim", skill_imports.c.status, skill_imports.c.available_at)
+Index("ix_ak_skill_import_owner", skill_imports.c.owner_id, skill_imports.c.created_at)
+
+reply_artifacts = Table(
+    "ak_reply_artifacts", metadata,
+    Column("project_id", String(128), ForeignKey("ak_projects.id", ondelete="CASCADE"), primary_key=True),
+    Column("session_id", String(128), primary_key=True),
+    Column("reply_id", String(128), primary_key=True),
+    Column("path", Text, primary_key=True),
+    Column("digest", String(64), nullable=False),
 )

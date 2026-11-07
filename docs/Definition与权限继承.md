@@ -59,4 +59,4 @@ is_skill_market_visible 只决定技能广场展示。属于某系统 Agent 的 
 
 ResourceAccessPolicyBase 接系统/共享可用范围；HTTP 管理入口先验角色/归属；Workspace、工厂、permission middleware 执行当前来源规则。企业检查通过仍继续原生 Permission/人工确认，不自动 ALLOW。
 
-V1 不开放动态组团/增员工具。静态 Team 用原生 Record/Storage 先创建固定关系，TeamSay/Inbox/成员唤醒由原生完成。不修改 service，不运行时写 grant，不使用 Redis 权限缓存。
+模型侧不开放动态组团/增员工具。静态 Team 用原生 Record/Storage 先创建固定关系，TeamSay/Inbox/成员唤醒由原生完成。2026-11-06 新增用户明确发起的个人助理会话邀请：只能选获授权的预配置 expert，保存完整快照后由原生 TeamCreate/AgentInvite 执行；固定 Team 不允许自由增员，专家不能担任主理人。成员采用独立默认权限，运行再次检查当前 USE，不继承主理人的 bypass。不修改 service，不运行时写 grant，不使用 Redis 权限缓存。流程见 [运行流程 §7](./运行流程.md)。

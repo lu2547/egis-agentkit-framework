@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from egis_agentkit.services.preferences import PreferenceService
+from egis_agentkit.service.user.preferences import PreferenceService
 
 
 @pytest.mark.asyncio

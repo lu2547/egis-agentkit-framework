@@ -6,8 +6,8 @@ import pytest
 from agentscope.middleware import ReMeMiddleware
 
 from egis_agentkit.config.snapshot import RuntimeConfig
-from egis_agentkit.services.assembly import execution_scope
-from egis_agentkit.services.factories import AgentFactories
+from egis_agentkit.extensions.compatibility.execution import execution_scope
+from egis_agentkit.extensions.agent.factory import AgentFactories
 
 original = importlib.util.find_spec
 
@@ -47,8 +47,8 @@ def test_enabled_memory_rejects_missing_dependency(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_native_middleware_is_cached_per_user_and_closed(monkeypatch, tmp_path):
-    from egis_agentkit.services import memory
-    from egis_agentkit.services.memory import MemoryService
+    from egis_agentkit.service.user import memory as memory
+    from egis_agentkit.service.user.memory import MemoryService
 
     monkeypatch.setattr(memory.importlib.util, "find_spec", lambda name: object())
     calls = []
@@ -102,7 +102,7 @@ async def test_factory_adds_memory_only_for_personal(monkeypatch, tmp_path):
     async def preferences(user):
         return {}
 
-    monkeypatch.setattr("egis_agentkit.services.factories.UserService", Users)
+    monkeypatch.setattr(factory.middleware_factory, "users", Users(None))
     monkeypatch.setattr(factory.preferences, "read", preferences)
     factory.memory = Memory()
     marker = object()
@@ -128,7 +128,7 @@ async def test_enabled_service_uses_native_model_and_starts_reme(
 ):
     pytest.importorskip("reme")
     from egis_agentkit.config.snapshot import ConfigSnapshot
-    from egis_agentkit.services.memory import MemoryService
+    from egis_agentkit.service.user.memory import MemoryService
 
     monkeypatch.setenv("MEMORY_TEST_MODEL_KEY", "unused-offline-key")
     snapshot = ConfigSnapshot.model_validate(
