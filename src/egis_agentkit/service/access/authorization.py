@@ -1,13 +1,9 @@
 from dataclasses import dataclass, field
 
-from sqlalchemy import and_, or_, select, update
-from sqlalchemy.dialects.postgresql import insert
-
 from egis_agentkit.errors import Forbidden, NotFound
-from egis_agentkit.models import Grant, User, utcnow
+from egis_agentkit.models import Grant, User
 from egis_agentkit.service.agent.views import DefinitionViews
 from egis_agentkit.service.user.service import require_admin
-from egis_agentkit.storage import tables as t
 
 
 @dataclass
@@ -37,20 +33,9 @@ class PermissionService:
             except NotFound:
                 return PermissionDecision(False)
         else:
-            async with self.storage.engine.connect() as conn:
-                target = (
-                    (
-                        await conn.execute(
-                            select(t.assets).where(
-                                t.assets.c.resource_id == resource_id,
-                                t.assets.c.resource_type == resource_type,
-                                t.assets.c.is_enabled,
-                            )
-                        )
-                    )
-                    .mappings()
-                    .first()
-                )
+            target = await self.storage.assets.find_asset(
+                resource_type, resource_id, enabled_only=True
+            )
             if target is None:
                 return PermissionDecision(False)
         if not target["is_enabled"]:
@@ -79,38 +64,7 @@ class PermissionService:
             and target["owner_type"] != "user"
         ):
             return PermissionDecision(False)
-        async with self.storage.engine.connect() as conn:
-            valid_groups = list(
-                (
-                    await conn.execute(
-                        select(t.groups.c.group_id).where(
-                            t.groups.c.group_id.in_(user.group_ids),
-                            t.groups.c.is_enabled,
-                        )
-                    )
-                ).scalars()
-            )
-            grants = [
-                dict(r)
-                for r in (
-                    await conn.execute(
-                        select(t.grants).where(
-                            t.grants.c.revoked_at.is_(None),
-                            or_(
-                                and_(
-                                    t.grants.c.principal_type == "user",
-                                    t.grants.c.principal_id == user.user_id,
-                                ),
-                                and_(
-                                    t.grants.c.principal_type == "group",
-                                    t.grants.c.principal_id.in_(valid_groups),
-                                ),
-                                t.grants.c.principal_type == "all_users",
-                            ),
-                        )
-                    )
-                ).mappings()
-            ]
+        grants = await self.storage.access.active_grants(user.user_id, user.group_ids)
         paths = []
         for grant in grants:
             if (
@@ -138,16 +92,12 @@ class PermissionService:
             except (Forbidden, NotFound):
                 return False
         elif view == "shared":
-            async with self.storage.engine.connect() as conn:
-                return (
-                    await conn.execute(
-                        select(t.reviews.c.review_id).where(
-                            t.reviews.c.resource_id == resource_id,
-                            t.reviews.c.resource_type == resource_type,
-                            t.reviews.c.is_current,
-                        )
-                    )
-                ).first() is not None
+            return (
+                await self.storage.access.approved_review(
+                    resource_id, resource_type=resource_type
+                )
+                is not None
+            )
         return True
 
     async def _find_path(self, root_type, root_id, root_view, target):
@@ -205,30 +155,16 @@ class PermissionService:
                 if not current["is_enabled"]:
                     raise Forbidden("绑定智能体已停用")
             else:
-                async with self.storage.engine.connect() as conn:
-                    enabled = await conn.scalar(
-                        select(t.assets.c.is_enabled).where(
-                            t.assets.c.resource_type == kind,
-                            t.assets.c.resource_id == identifier,
-                            t.assets.c.resource_version
-                            == node["data"]["resource_version"],
-                        )
-                    )
+                enabled = await self.storage.assets.version_is_enabled(
+                    kind, identifier, node["data"]["resource_version"]
+                )
                 if not enabled:
                     raise Forbidden("绑定资源已停用")
             pending.extend((child, inherited) for child in node.get("edges", []))
 
     async def list_grants(self, admin):
         require_admin(admin)
-        async with self.storage.engine.connect() as conn:
-            return [
-                dict(r)
-                for r in (
-                    await conn.execute(
-                        select(t.grants).order_by(t.grants.c.granted_at.desc())
-                    )
-                ).mappings()
-            ]
+        return await self.storage.access.list_grants()
 
     async def grant(self, admin: User, data: Grant, *, conn=None):
         require_admin(admin)
@@ -236,35 +172,20 @@ class PermissionService:
             async with self.storage.transaction() as connection:
                 return await self.grant(admin, data, conn=connection)
         if data.principal_type == "user":
-            exists = await conn.scalar(
-                select(t.users.c.user_id).where(
-                    t.users.c.user_id == data.principal_id, t.users.c.is_enabled
-                )
-            )
-            if exists is None:
+            principal = await self.storage.users.get_user(data.principal_id, conn=conn)
+            if principal is None or not principal["is_enabled"]:
                 raise NotFound("授权用户不存在或已停用")
         if data.principal_type == "group":
-            exists = await conn.scalar(
-                select(t.groups.c.group_id).where(
-                    t.groups.c.group_id == data.principal_id, t.groups.c.is_enabled
-                )
+            enabled = await self.storage.users.enabled_group_ids(
+                [data.principal_id], conn=conn
             )
-            if exists is None:
+            if not enabled:
                 raise NotFound("授权分组不存在或已停用")
         if data.resource_type in ("agent", "team"):
             resource = await self.storage.get_definition(data.resource_id, conn=conn)
         else:
-            resource = (
-                (
-                    await conn.execute(
-                        select(t.assets).where(
-                            t.assets.c.resource_type == data.resource_type,
-                            t.assets.c.resource_id == data.resource_id,
-                        )
-                    )
-                )
-                .mappings()
-                .first()
+            resource = await self.storage.assets.find_asset(
+                data.resource_type, data.resource_id, conn=conn
             )
             if resource is None:
                 raise NotFound()
@@ -275,45 +196,14 @@ class PermissionService:
             raise Forbidden("授权目标归属不匹配")
         if data.resource_view_type == "system" and resource["owner_type"] != "system":
             raise Forbidden("不能通过系统授权开放用户私有配置")
-        values = data.model_dump(exclude={"revoked_at"})
-        values.update(granted_by=admin.user_id, granted_at=utcnow())
-        columns = [
-            "principal_type",
-            "principal_id",
-            "resource_type",
-            "resource_id",
-            "resource_view_type",
-            "resource_owner_type",
-            "resource_owner_id",
-            "grant_source_type",
-        ]
-        statement = insert(t.grants).values(**values)
-        result = (
-            (
-                await conn.execute(
-                    statement.on_conflict_do_update(
-                        index_elements=[t.grants.c[k] for k in columns],
-                        index_where=t.grants.c.revoked_at.is_(None),
-                        set_={
-                            "source_review_id": data.source_review_id,
-                            "granted_by": admin.user_id,
-                            "granted_at": utcnow(),
-                        },
-                    ).returning(t.grants)
-                )
-            )
-            .mappings()
-            .one()
+        return await self.storage.access.upsert_grant(
+            data.model_dump(exclude={"revoked_at"}), actor=admin.user_id, conn=conn
         )
-        return dict(result)
 
     async def revoke(self, admin, grant_id):
         require_admin(admin)
         async with self.storage.transaction() as conn:
-            result = await conn.execute(
-                update(t.grants)
-                .where(t.grants.c.id == grant_id)
-                .values(revoked_at=utcnow(), revoked_by=admin.user_id)
-            )
-            if not result.rowcount:
+            if not await self.storage.access.revoke_grant(
+                grant_id, actor=admin.user_id, conn=conn
+            ):
                 raise NotFound()

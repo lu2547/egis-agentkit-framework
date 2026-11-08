@@ -1,5 +1,6 @@
 """Nacos bootstrap, REST transport and typed atomic configuration snapshots."""
 
+from egis_agentkit.config.environment import nacos_bootstrap
 from egis_agentkit.config.snapshot import (
     AuthConfig,
     ConfigSnapshot,
@@ -20,6 +21,7 @@ ModelConfig = ModelsConfig
 PolicyConfig = PoliciesConfig
 
 __all__ = [
+    "nacos_bootstrap",
     "NacosBootstrap",
     "NacosClient",
     "NacosError",

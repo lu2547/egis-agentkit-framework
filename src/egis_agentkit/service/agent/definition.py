@@ -1,6 +1,5 @@
 from hashlib import sha256
 
-from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
@@ -12,7 +11,6 @@ from egis_agentkit.service.agent.views import (
 )
 from egis_agentkit.service.user.service import require_admin
 from egis_agentkit.storage import AgentKitStorage
-from egis_agentkit.storage import tables as t
 
 
 class AgentDefinitionManager:
@@ -106,21 +104,13 @@ class AgentDefinitionManager:
         from egis_agentkit.service.access.authorization import PermissionService
 
         for ref in data.payload.get("bindings", []):
-            asset = (
-                (
-                    await conn.execute(
-                        select(t.assets).where(
-                            t.assets.c.resource_type == ref["resource_type"],
-                            t.assets.c.resource_id == ref["resource_id"],
-                            t.assets.c.resource_version == ref["resource_version"],
-                            t.assets.c.is_enabled,
-                        )
-                    )
-                )
-                .mappings()
-                .first()
+            asset = await self.storage.assets.get(
+                ref["resource_type"],
+                ref["resource_id"],
+                ref["resource_version"],
+                conn=conn,
             )
-            if asset is None:
+            if asset is None or not asset["is_enabled"]:
                 raise NotFound("绑定资源或指定版本不存在")
             if ref["resource_view_type"] == "shared":
                 await require_current_shared_asset(conn, asset)

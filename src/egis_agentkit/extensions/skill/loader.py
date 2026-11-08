@@ -3,12 +3,46 @@
 import asyncio
 from copy import deepcopy
 from pathlib import Path
+from typing import Protocol
 
-from agentscope.skill import SkillLoaderBase
+from agentscope.skill import Skill, SkillLoaderBase
+from agentscope.state import AgentState
 from pydantic import ValidationError
 
 from egis_agentkit.errors import AgentKitError, Forbidden
-from egis_agentkit.service.resource.activation import SkillActivation
+from egis_agentkit.models import SkillActivation, User
+
+
+class SkillStateStorage(Protocol):
+    async def update_session_state(
+        self, user_id: str, agent_id: str, session_id: str, state: AgentState
+    ) -> None: ...
+
+
+class SkillResources(Protocol):
+    @property
+    def storage(self) -> SkillStateStorage: ...
+
+    @property
+    def workspace_root(self) -> Path: ...
+
+    async def installed_assets(
+        self, user: User, resource_type: str, *, enabled_only: bool
+    ) -> dict[str, dict]: ...
+
+    async def skill_descriptors(
+        self, user: User, refs: list[dict], *, authorization_scope: object
+    ) -> list[Skill]: ...
+
+    async def materialize_skill(
+        self, user: User, resource_id: str, version: str, *, authorization_scope: object
+    ) -> Skill: ...
+
+    async def skill_pin(self, user: User, ref: dict, skill: Skill) -> dict: ...
+
+    async def restore_skill(
+        self, user: User, pin: dict, *, authorization_scope: object
+    ) -> Skill: ...
 
 
 class LiveSkillLoader(SkillLoaderBase):
@@ -18,7 +52,7 @@ class LiveSkillLoader(SkillLoaderBase):
     content. Native Session state owns those pins across turns and workers.
     """
 
-    def __init__(self, user, scope, resources):
+    def __init__(self, user: User, scope, resources: SkillResources):
         self.user, self.scope, self.resources = user, scope, resources
         self.loaded = {}
         self.pins = {}
@@ -26,7 +60,7 @@ class LiveSkillLoader(SkillLoaderBase):
         self._state = None
         self._lock = asyncio.Lock()
 
-    async def bind_state(self, state):
+    async def bind_state(self, state: AgentState) -> None:
         if self._state is state:
             return
         self.loaded.clear()
@@ -127,7 +161,7 @@ class LiveSkillLoader(SkillLoaderBase):
             )
         return result
 
-    async def list_skills(self):
+    async def list_skills(self) -> list[Skill]:
         result = []
         for ref in await self.refs():
             try:
@@ -141,7 +175,7 @@ class LiveSkillLoader(SkillLoaderBase):
                     result.append(self.loaded.get(skill.name, skill))
         return result
 
-    async def refresh_access(self):
+    async def refresh_access(self) -> None:
         """Recheck current USE/enablement before every protected tool action."""
         for name in list(self.loaded):
             pin = next(p for p in self.pins.values() if p["skill_name"] == name)
@@ -151,7 +185,7 @@ class LiveSkillLoader(SkillLoaderBase):
                 self.loaded.pop(name, None)
                 self.unavailable[name] = str(exc)
 
-    async def activate(self, name):
+    async def activate(self, name: str) -> None:
         async with self._lock:
             if name in self.unavailable:
                 raise Forbidden(self.unavailable[name])

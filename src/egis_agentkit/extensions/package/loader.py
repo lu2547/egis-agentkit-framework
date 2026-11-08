@@ -13,33 +13,16 @@ import re
 import shutil
 import sys
 import tempfile
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType, ModuleType
-from typing import Any
 
-from agentscope.middleware import MiddlewareBase
-from agentscope.tool import ToolBase
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 
 from egis_agentkit.models import Asset
-
-
-@dataclass(frozen=True)
-class Assembly:
-    tools_factory: Callable[[Any], Awaitable[list[ToolBase]]] | None = None
-    middlewares_factory: (
-        Callable[[Any, Any], Awaitable[list[MiddlewareBase]]] | None
-    ) = None
-
-    def __post_init__(self):
-        for factory in (self.tools_factory, self.middlewares_factory):
-            if factory is not None and not (
-                inspect.iscoroutinefunction(factory)
-                or inspect.iscoroutinefunction(getattr(factory, "__call__", None))
-            ):
-                raise ValueError("Assembly factories must be asynchronous callables")
+from egis_agentkit.packages.contracts import Assembly as Assembly
+from egis_agentkit.packages.contracts import PackageLoadState
 
 
 def _tree_files(path: Path) -> list[Path]:
@@ -128,10 +111,9 @@ class PackageLoader:
                 r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?", version
             ):
                 raise ValueError
-            if (
-                type(manifest.get("framework_api_version")) is not int
-                or manifest["framework_api_version"] != 1
-            ):
+            if type(manifest.get("framework_api_version")) is not int or manifest[
+                "framework_api_version"
+            ] not in (1, 2):
                 raise ValueError
             if not isinstance(entrypoint, str):
                 raise ValueError
@@ -264,7 +246,10 @@ class PackageLoader:
                     owner_id="system",
                     checksum_sha256=digest,
                     entrypoint=selected,
-                    payload={"package_path": str(path), "framework_api_version": 1},
+                    payload={
+                        "package_path": str(path),
+                        "framework_api_version": manifest["framework_api_version"],
+                    },
                 )
                 updated = dict(self._registry)
                 updated[key] = _Loaded(candidate, asset, path, namespace)
@@ -304,7 +289,7 @@ class PackageLoader:
         )
         self._registry = MappingProxyType(updated)
 
-    def status(self) -> list[dict]:
+    def status(self) -> list[PackageLoadState]:
         return [
             {
                 "assembly_ref": ref,

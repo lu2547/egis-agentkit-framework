@@ -2,22 +2,31 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from agentscope.app.storage import AsyncSQLAlchemyStorage
-from sqlalchemy import inspect, select, text
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from egis_agentkit.errors import NotFound
-from egis_agentkit.storage import tables
+from egis_agentkit.errors import Forbidden
+
+from . import tables
+from .access import AccessStorage
+from .definition import DefinitionStorage
+from .resource import ResourceAssetStorage
+from .user import UserStorage
 
 
 class AgentKitStorage(AsyncSQLAlchemyStorage):
     """Keep upstream storage intact, share an explicitly owned PG engine.
 
-    Schema creation is an explicit deploy operation, never an implicit side
-    effect of serving HTTP. Services use SQLAlchemy transactions directly.
+    Schema creation is an explicit deploy operation. Services coordinate
+    enterprise transactions and reuse native persistence for runtime records.
     """
 
     def __init__(self, url: str, engine: AsyncEngine):
         self.engine = engine
+        self.users = UserStorage(engine)
+        self.definitions = DefinitionStorage(engine)
+        self.access = AccessStorage(engine)
+        self.assets = ResourceAssetStorage(engine)
         super().__init__(url, engine=engine, create_tables=False)
 
     async def migrate_enterprise(self) -> None:
@@ -50,30 +59,21 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
             yield conn
 
     async def get_user(self, user_id: str):
-        async with self.engine.connect() as conn:
-            row = (
-                (
-                    await conn.execute(
-                        select(tables.users).where(tables.users.c.user_id == user_id)
-                    )
-                )
-                .mappings()
-                .first()
-            )
-        return dict(row) if row else None
+        return await self.users.get_user(user_id)
 
     async def get_definition(self, definition_id: str, *, conn=None):
-        statement = select(tables.definitions).where(
-            tables.definitions.c.id == definition_id
-        )
-        if conn is not None:
-            row = (await conn.execute(statement)).mappings().first()
-        else:
-            async with self.engine.connect() as connection:
-                row = (await connection.execute(statement)).mappings().first()
-        if row is None:
-            raise NotFound()
-        return dict(row)
+        return await self.definitions.get_definition(definition_id, conn=conn)
+
+    async def locate_session(self, session_id: str) -> tuple[str, str] | None:
+        # The native lock identifies a session by ID alone.
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT user_id, agent_id FROM sessions WHERE id=:id"),
+                    {"id": session_id},
+                )
+            ).one_or_none()
+        return (row.user_id, row.agent_id) if row is not None else None
 
     async def read_session_unscoped(self, user_id, agent_id, session_id):
         record = await super().get_session(user_id, agent_id, session_id)
@@ -84,8 +84,6 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
         return await self.read_session_unscoped(user_id, agent_id, session_id)
 
     async def update_session_state(self, user_id, agent_id, session_id, state):
-        from egis_agentkit.errors import Forbidden
-
         if await self.read_session_unscoped(user_id, agent_id, session_id) is None:
             raise Forbidden("会话归属不匹配")
         return await super().update_session_state(user_id, agent_id, session_id, state)

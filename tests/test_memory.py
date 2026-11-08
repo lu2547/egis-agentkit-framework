@@ -6,8 +6,11 @@ import pytest
 from agentscope.middleware import ReMeMiddleware
 
 from egis_agentkit.config.snapshot import RuntimeConfig
-from egis_agentkit.extensions.compatibility.execution import execution_scope
 from egis_agentkit.extensions.agent.factory import AgentFactories
+from egis_agentkit.extensions.compatibility.execution import (
+    ExecutionScope,
+    execution_scope,
+)
 
 original = importlib.util.find_spec
 
@@ -86,7 +89,7 @@ async def test_native_middleware_is_cached_per_user_and_closed(monkeypatch, tmp_
 @pytest.mark.asyncio
 async def test_factory_adds_memory_only_for_personal(monkeypatch, tmp_path):
     config = SimpleNamespace(snapshot=SimpleNamespace(runtime=runtime(), policies=None))
-    factory = AgentFactories(None, None, tmp_path, config_provider=config)
+    factory = AgentFactories(SimpleNamespace(engine=None), None, tmp_path, config_provider=config)
 
     class Users:
         def __init__(self, storage):
@@ -107,12 +110,17 @@ async def test_factory_adds_memory_only_for_personal(monkeypatch, tmp_path):
     factory.memory = Memory()
     marker = object()
     for kind, expected in [("personal", True), ("private", False)]:
-        scope = SimpleNamespace(
+        scope = ExecutionScope(
             user_id="alice",
             agent_id="a",
             session_id="s",
             assembly=None,
             definition={"agent_type": kind, "payload": {}},
+            snapshot={"nodes": {}},
+            binding={"is_team": False},
+            session_record=object(),
+            workdir=tmp_path / ".work",
+            artifacts_dir=tmp_path / "artifacts",
         )
         token = execution_scope.set(scope)
         try:

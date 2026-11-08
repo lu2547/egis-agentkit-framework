@@ -1,8 +1,30 @@
+from contextlib import AbstractAsyncContextManager
+from typing import Protocol
+
 from agentscope.middleware import MiddlewareBase
 
 
+class ProjectSession(Protocol):
+    @property
+    def user_id(self) -> str: ...
+
+    @property
+    def project_id(self) -> str: ...
+
+    @property
+    def session_id(self) -> str: ...
+
+
+class FileChangeTracker(Protocol):
+    async def observe_safe(self, user_id: str, project_id: str) -> None: ...
+
+    def track_deliveries(
+        self, user_id: str, project_id: str, session_id: str, reply_id: str
+    ) -> AbstractAsyncContextManager[None]: ...
+
+
 class FileChangesMiddleware(MiddlewareBase):
-    def __init__(self, changes, scope):
+    def __init__(self, changes: FileChangeTracker, scope: ProjectSession):
         self.changes, self.scope = changes, scope
 
     async def on_reply(self, agent, input_kwargs, next_handler):
@@ -24,8 +46,10 @@ class FileChangesMiddleware(MiddlewareBase):
         await self.changes.observe_safe(self.scope.user_id, self.scope.project_id)
         try:
             async with self.changes.track_deliveries(
-                self.scope.user_id, self.scope.project_id,
-                self.scope.session_id, agent.state.reply_id,
+                self.scope.user_id,
+                self.scope.project_id,
+                self.scope.session_id,
+                agent.state.reply_id,
             ):
                 async for event in next_handler(**input_kwargs):
                     yield event

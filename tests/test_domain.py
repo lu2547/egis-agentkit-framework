@@ -3,10 +3,17 @@
 import asyncio
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.models import Definition
-from egis_agentkit.services import AgentService, PermissionService, ShareService, UserService
+from egis_agentkit.services import (
+    AgentService,
+    PermissionService,
+    ShareService,
+    UserService,
+)
 
 
 async def identities(storage):
@@ -85,6 +92,32 @@ async def test_own_save_needs_no_review_shared_snapshot_is_immutable(storage):
     again = await shares.decide(admin, review["review_id"], True, "重试")
     assert again["shared_version"] == approved["shared_version"] == 1
     assert len(await PermissionService(storage).list_grants(admin)) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_approval_keeps_previous_review_and_grant_current(storage):
+    _, admin, alice, _ = await identities(storage)
+    agents, shares = AgentService(storage), ShareService(storage)
+    source = await agents.save(alice, expert())
+    previous = await shares.submit(alice, "agent", source["id"])
+    await shares.decide(admin, previous["review_id"], True, "通过")
+    pending = await shares.submit(alice, "agent", source["id"])
+    async with storage.transaction() as conn:
+        await conn.execute(
+            text(
+                "ALTER TABLE ak_share_reviews ADD CONSTRAINT test_reject_review_reason "
+                "CHECK (review_reason <> 'force failure')"
+            )
+        )
+
+    with pytest.raises(IntegrityError, match="test_reject_review_reason"):
+        await shares.decide(admin, pending["review_id"], True, "force failure")
+
+    reviews = {review["review_id"]: review for review in await shares.list(alice)}
+    assert reviews[previous["review_id"]]["is_current"]
+    assert reviews[pending["review_id"]]["review_status_type"] == "pending"
+    grants = await PermissionService(storage).list_grants(admin)
+    assert [grant["source_review_id"] for grant in grants] == [previous["review_id"]]
 
 
 @pytest.mark.asyncio

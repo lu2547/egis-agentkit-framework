@@ -1,52 +1,57 @@
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import unquote, urlparse
 
-from sqlalchemy import select, update
-from sqlalchemy.dialects.postgresql import insert
-
 from egis_agentkit.errors import Conflict, NotFound
-from egis_agentkit.models import utcnow
+from egis_agentkit.models import Asset, User
+from egis_agentkit.packages.contracts import Assembly, PackageLoadState
 from egis_agentkit.service.user.service import require_admin
-from egis_agentkit.storage import tables as t
+from egis_agentkit.storage import AgentKitStorage
+from egis_agentkit.storage.package import PackageStorage
+
+
+class AssemblyLoader(Protocol):
+    """Operations needed to register, inspect and resolve assembly releases."""
+
+    async def load(
+        self,
+        package_path: Path,
+        *,
+        expected_sha256: str | None = None,
+        entrypoint: str | None = None,
+    ) -> Asset: ...
+
+    def get(self, assembly_ref: str, assembly_version: str) -> Assembly: ...
+
+    def disable(self, assembly_ref: str, assembly_version: str) -> None: ...
+
+    def status(self) -> list[PackageLoadState]: ...
 
 
 class PackageService:
-    def __init__(self, storage, loader):
+    def __init__(self, storage: AgentKitStorage, loader: AssemblyLoader):
         self.storage, self.loader = storage, loader
+        self.releases = PackageStorage(storage.engine)
 
     async def register(
-        self, user, path, *, checksum=None, entrypoint=None, owner_id="egis-demo"
-    ):
+        self,
+        user: User,
+        path: Path | str,
+        *,
+        checksum: str | None = None,
+        entrypoint: str | None = None,
+        owner_id: str = "egis-demo",
+    ) -> dict:
         require_admin(user)
+        path = Path(path)
         asset = await self.loader.load(
             path, expected_sha256=checksum, entrypoint=entrypoint
         )
         asset.owner_id = owner_id
-        asset.download_url = Path(path).resolve().as_uri()
+        asset.download_url = path.resolve().as_uri()
         async with self.storage.transaction() as conn:
-            await conn.execute(
-                insert(t.assets)
-                .values(
-                    **asset.model_dump(),
-                    created_by=user.user_id,
-                    updated_by=user.user_id,
-                )
-                .on_conflict_do_nothing()
-            )
-            prior = (
-                (
-                    await conn.execute(
-                        select(t.assets)
-                        .where(
-                            t.assets.c.resource_type == "assembly",
-                            t.assets.c.resource_id == asset.resource_id,
-                            t.assets.c.resource_version == asset.resource_version,
-                        )
-                        .with_for_update()
-                    )
-                )
-                .mappings()
-                .one()
+            prior = await self.releases.register_release(
+                asset, actor=user.user_id, conn=conn
             )
             if not prior["is_enabled"]:
                 raise Conflict("已停用的包版本不能重新注册")
@@ -55,22 +60,14 @@ class PackageService:
                 asset.entrypoint,
             ):
                 raise Conflict("同一包版本的内容不可覆盖")
-            return dict(prior)
+            return prior
 
-    async def list(self, user):
+    async def list(self, user: User) -> list[dict]:
         require_admin(user)
         states = {
             (r["assembly_ref"], r["assembly_version"]): r for r in self.loader.status()
         }
-        async with self.storage.engine.connect() as conn:
-            rows = [
-                dict(r)
-                for r in (
-                    await conn.execute(
-                        select(t.assets).where(t.assets.c.resource_type == "assembly")
-                    )
-                ).mappings()
-            ]
+        rows = await self.releases.list_releases()
         return [
             {
                 **row,
@@ -82,19 +79,13 @@ class PackageService:
             for row in rows
         ]
 
-    async def disable(self, user, resource_id, version):
+    async def disable(self, user: User, resource_id: str, version: str) -> None:
         require_admin(user)
         async with self.storage.transaction() as conn:
-            result = await conn.execute(
-                update(t.assets)
-                .where(
-                    t.assets.c.resource_type == "assembly",
-                    t.assets.c.resource_id == resource_id,
-                    t.assets.c.resource_version == version,
-                )
-                .values(is_enabled=False, updated_by=user.user_id, updated_at=utcnow())
+            disabled = await self.releases.disable_release(
+                resource_id, version, actor=user.user_id, conn=conn
             )
-            if not result.rowcount:
+            if not disabled:
                 raise NotFound()
         try:
             self.loader.disable(resource_id, version)
@@ -108,23 +99,16 @@ class PackageService:
             raise Conflict("发布包缺少持久化位置")
         return Path(unquote(urlparse(location).path))
 
-    async def resolve(self, resource_id, version):
-        async with self.storage.engine.connect() as conn:
-            row = (
-                (
-                    await conn.execute(
-                        select(t.assets).where(
-                            t.assets.c.resource_type == "assembly",
-                            t.assets.c.resource_id == resource_id,
-                            t.assets.c.resource_version == version,
-                            t.assets.c.is_enabled,
-                        )
-                    )
-                )
-                .mappings()
-                .first()
-            )
-        if row is None:
+    async def resolve(self, resource_id: str, version: str) -> Assembly:
+        assembly, _ = await self.resolve_for_run(resource_id, version)
+        return assembly
+
+    async def resolve_for_run(
+        self, resource_id: str, version: str
+    ) -> tuple[Assembly, int]:
+        """Resolve the exact release and its callback contract together."""
+        row = await self.releases.get_release(resource_id, version)
+        if row is None or not row["is_enabled"]:
             raise NotFound("发布包不存在或已停用")
         if not row["checksum_sha256"] or not row["entrypoint"]:
             raise Conflict("发布包缺少固定的摘要或入口")
@@ -155,24 +139,7 @@ class PackageService:
             if (loaded.resource_id, loaded.resource_version) != (resource_id, version):
                 raise Conflict("发布包标识与注册版本不匹配")
             # The import may have taken long enough for another node to disable it.
-            async with self.storage.engine.connect() as conn:
-                current = (
-                    (
-                        await conn.execute(
-                            select(
-                                t.assets.c.is_enabled,
-                                t.assets.c.checksum_sha256,
-                                t.assets.c.entrypoint,
-                            ).where(
-                                t.assets.c.resource_type == "assembly",
-                                t.assets.c.resource_id == resource_id,
-                                t.assets.c.resource_version == version,
-                            )
-                        )
-                    )
-                    .mappings()
-                    .first()
-                )
+            current = await self.releases.get_release(resource_id, version)
             if current is None or not current["is_enabled"]:
                 raise NotFound("发布包不存在或已停用")
             if (current["checksum_sha256"], current["entrypoint"]) != (
@@ -181,18 +148,13 @@ class PackageService:
             ):
                 raise Conflict("发布包注册信息已变化")
         try:
-            return self.loader.get(resource_id, version)
+            return (
+                self.loader.get(resource_id, version),
+                row["payload"].get("framework_api_version", 1),
+            )
         except KeyError:
             raise Conflict("本地发布包已停用") from None
 
-    async def restore_loaded(self):
-        async with self.storage.engine.connect() as conn:
-            rows = (
-                await conn.execute(
-                    select(t.assets.c.resource_id, t.assets.c.resource_version).where(
-                        t.assets.c.resource_type == "assembly", t.assets.c.is_enabled
-                    )
-                )
-            ).all()
-        for resource_id, version in rows:
+    async def restore_loaded(self) -> None:
+        for resource_id, version in await self.releases.enabled_release_keys():
             await self.resolve(resource_id, version)

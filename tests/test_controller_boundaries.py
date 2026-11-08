@@ -34,11 +34,11 @@ def make_details(storage):
 def test_manager_openapi_is_unchanged():
     app = FastAPI()
     app.include_router(manager_router.router)
-    # Contract includes the async Skill imports and per-reply artifacts APIs. Includes every method, status, tag,
-    # operation ID, parameter, multipart field and request/response schema.
+    # Includes the existing project and task file-delete operations, plus
+    # every method, parameter and request/response schema in the manager API.
     digest = hashlib.sha256(json.dumps(app.openapi(), sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-    assert digest == "ebecc598cf8640371a5ac97dd24095b50ac39fb7634fea50399acf9ed3b2d78d"
-    assert sum(len(operations) for operations in app.openapi()["paths"].values()) == 80
+    assert digest == "427826f7717bb100e08ec4eae0cc1aaecd773405db7b5e8bf07314bc6ecc34bb"
+    assert sum(len(operations) for operations in app.openapi()["paths"].values()) == 82
 
 
 def test_controllers_do_not_own_storage_file_io_or_other_controllers():
@@ -116,6 +116,30 @@ async def test_team_detail_only_exposes_orchestrator_configuration_to_editors(st
     visible = await details.get(alice, team["id"], "system", "team")
     assert "orchestrator_config" not in visible
     assert not visible["is_usable"]
+
+
+@pytest.mark.asyncio
+async def test_team_list_and_delete_use_team_service():
+    calls = []
+    user = object()
+
+    class Teams:
+        async def list(self, actor):
+            calls.append(("list", actor))
+            return [{"id": "team-one"}]
+
+        async def delete(self, actor, identifier):
+            calls.append(("delete", actor, identifier))
+
+    app = FastAPI()
+    app.state.egis_services = SimpleNamespace(teams=Teams())
+    app.dependency_overrides[current_user] = lambda: user
+    app.include_router(manager_router.router)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        assert (await client.get("/manager/teams")).json() == {"items": [{"id": "team-one"}]}
+        assert (await client.delete("/manager/teams/team-one")).status_code == 204
+    assert calls == [("list", user), ("delete", user, "team-one")]
 
 
 @pytest.mark.asyncio

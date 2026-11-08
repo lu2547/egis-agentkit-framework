@@ -2,14 +2,23 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from typing import Protocol
 
 from agentscope.middleware import MiddlewareBase
+
+
+class WorkspacePaths(Protocol):
+    @property
+    def workdir(self) -> Path: ...
+
+    @property
+    def artifacts_dir(self) -> Path: ...
 
 
 class WorkspacePromptMiddleware(MiddlewareBase):
     """Describe project paths and bounded, no-follow listings of uploaded inputs."""
 
-    def __init__(self, scope):
+    def __init__(self, scope: WorkspacePaths):
         self.scope = scope
 
     @property

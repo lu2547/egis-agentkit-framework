@@ -4,14 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from agentscope.app.message_bus import MessageBusKeys
-from agentscope.app.storage import (
-    AgentData,
-    AgentRecord,
-    SessionConfig,
-    TeamData,
-    TeamMember,
-    TeamRecord,
-)
+from agentscope.app.storage import SessionConfig, TeamMember
 from agentscope.app.storage._model._session import TeamOrigin
 from agentscope.permission import PermissionMode
 from agentscope.state import AgentState
@@ -21,7 +14,9 @@ from egis_agentkit.errors import Conflict, Forbidden, NotFound
 from egis_agentkit.models import new_id
 from egis_agentkit.service.access.authorization import PermissionService
 from egis_agentkit.service.access.snapshot import SnapshotService
+from egis_agentkit.service.agent.assembly import AgentRecordFactory
 from egis_agentkit.service.project.service import ProjectService, purge_session_bus
+from egis_agentkit.service.team.assembly import TeamRecordFactory
 from egis_agentkit.service.team.collaboration import (
     CollaborationService,
     collaboration_allowed,
@@ -136,14 +131,11 @@ class TaskService:
 
         async def project(node_key, *, member=False):
             definition = snapshot["nodes"][node_key]["data"]
-            native = AgentRecord(
-                user_id=user.user_id,
+            native = AgentRecordFactory.create(
+                user.user_id,
+                name=definition["agent_name"],
+                system_prompt=definition["payload"]["system_prompt"],
                 source="team" if member else "user",
-                data=AgentData(
-                    name=definition["agent_name"],
-                    system_prompt=definition["payload"]["system_prompt"],
-                    chat_config={"invite_config": {"invitable": False}},
-                ),
             )
             await self.storage.upsert_agent(user.user_id, native)
             created_agents.append(native.id)
@@ -215,15 +207,13 @@ class TaskService:
                             role="created",
                         )
                     )
-                team = TeamRecord(
-                    user_id=user.user_id,
-                    session_id=leader_session.id,
+                team = TeamRecordFactory.create(
+                    user.user_id,
                     leader_agent_id=leader.id,
-                    data=TeamData(
-                        name=root["team_display_name"],
-                        description=root["payload"]["description"],
-                        members=members,
-                    ),
+                    leader_session_id=leader_session.id,
+                    name=root["team_display_name"],
+                    description=root["payload"]["description"],
+                    members=members,
                 )
                 await self.storage.upsert_team(user.user_id, team)
                 for _, sid in created_sessions:
@@ -263,26 +253,15 @@ class TaskService:
         from egis_agentkit.service.user.service import UserService
 
         user = await UserService(self.storage).get(user.user_id)
-        async with self.storage.engine.connect() as conn:
-            locator = (
-                (
-                    await conn.execute(
-                        text("SELECT user_id, agent_id FROM sessions WHERE id=:id"),
-                        {"id": session_id},
-                    )
-                )
-                .mappings()
-                .first()
-            )
+        locator = await self.storage.locate_session(session_id)
         if (
             locator is None
-            or locator["user_id"] != user.user_id
-            or agent_id
-            and locator["agent_id"] != agent_id
+            or locator[0] != user.user_id
+            or (agent_id and locator[1] != agent_id)
         ):
             raise Forbidden("会话不存在或不可访问")
         session = await self.storage.read_session_unscoped(
-            user.user_id, locator["agent_id"], session_id
+            user.user_id, locator[1], session_id
         )
         binding = session.state.middle_context.get("egis_agentkit", {})
         if not binding.get("is_initialized"):

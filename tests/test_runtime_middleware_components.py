@@ -1,12 +1,15 @@
 import asyncio
 import inspect
 import json
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
 
 import pytest
+from agentscope.middleware import MiddlewareBase
 from agentscope.permission import (
     PermissionBehavior,
     PermissionContext,
@@ -17,13 +20,55 @@ from agentscope.permission import (
 from agentscope.skill import Skill
 from agentscope.state import AgentState
 from agentscope.tool import Read, Toolkit
+from agentscope.workspace import WorkspaceBase
+from test_packages import release
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.extensions.agent import factory as factories
-from egis_agentkit.extensions.compatibility.execution import ExecutionScope, execution_scope
 from egis_agentkit.extensions import middleware as components
+from egis_agentkit.extensions.agent import factory as factories
+from egis_agentkit.extensions.compatibility.execution import (
+    ExecutionScope,
+    execution_scope,
+)
+from egis_agentkit.extensions.compatibility.policy import (
+    team_prompt_middleware,
+    tool_access_middleware,
+)
 from egis_agentkit.extensions.middleware.file_changes import FileChangesMiddleware
 from egis_agentkit.extensions.middleware.policy import EnterprisePolicyMiddleware
+from egis_agentkit.packages import Assembly, AssemblyContext, PackageLoader
+
+
+def test_core_middleware_import_leaves_enterprise_wiring_unloaded():
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import sys
+from egis_agentkit.extensions.middleware import (
+    FileChangesMiddleware,
+    SkillBindingMiddleware,
+    TeamPromptMiddleware,
+    ToolAccessMiddleware,
+    UserPreferenceMiddleware,
+    WorkspacePromptMiddleware,
+)
+from egis_agentkit.extensions.skill import LiveSkillLoader
+
+forbidden = (
+    "egis_agentkit.service",
+    "egis_agentkit.storage",
+    "egis_agentkit.extensions.compatibility",
+    "egis_agentkit_app",
+)
+loaded = sorted(
+    name for name in sys.modules
+    if any(name == root or name.startswith(root + ".") for root in forbidden)
+)
+assert not loaded, loaded
+"""],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def component(name):
@@ -66,6 +111,9 @@ def scope_at(tmp_path, *, kind="private", team=False, assembly=None):
 class Resources:
     def __init__(self, tmp_path, trace):
         self.trace = trace
+        self.workspace_root = tmp_path
+        self.storage = self
+        self.saved = []
         self.descriptor = Skill("report", "Report skill", "", "", 0)
         self.materialized = Skill(
             "report", "Report skill", str(tmp_path / "skills" / "report"),
@@ -74,9 +122,13 @@ class Resources:
         self.installed = []
         self.scopes = []
 
-    async def list(self, user, resource_type):
+    async def installed_assets(self, user, resource_type, *, enabled_only):
         assert resource_type == "skill"
-        return self.installed
+        assert enabled_only
+        return {
+            ref["resource_id"]: ref for ref in self.installed
+            if ref["is_installed"] and ref["is_enabled"]
+        }
 
     async def skill_descriptors(self, user, refs, *, authorization_scope):
         self.trace.append("descriptors")
@@ -88,6 +140,18 @@ class Resources:
         self.scopes.append(authorization_scope)
         self.trace.append("activate")
         return self.materialized
+
+    async def skill_pin(self, user, ref, skill):
+        return {
+            **ref,
+            "source_checksum_sha256": "a" * 64,
+            "cache_checksum_sha256": "b" * 64,
+            "cache_dir": "skills/report",
+            "skill_name": skill.name,
+        }
+
+    async def update_session_state(self, user_id, agent_id, session_id, state):
+        self.saved.append((user_id, agent_id, session_id, state))
 
 
 class Permissions:
@@ -143,15 +207,15 @@ async def test_skill_binding_and_access_share_native_viewer_state(tmp_path, monk
             await permissions.validate_snapshot(user, snapshot)
 
         monkeypatch.setattr(PermissionService, "validate_snapshot", validate)
-        policy = EnterprisePolicyMiddleware(None, user, scope, resources=resources)
+        policy = EnterprisePolicyMiddleware(SimpleNamespace(engine=None), user, scope, resources=resources)
         middlewares, access, loader = [policy], policy, policy.skills
     else:
         loader = skill_loader(user, scope, resources)
-        access = component("ToolAccessMiddleware")(user, scope, permissions=permissions, skills=loader)
-        binding = component("SkillBindingMiddleware")(loader)
+        access = tool_access_middleware(user, scope, permissions, loader)
+        binding = component("SkillBindingMiddleware")(loader, bind_state=loader.bind_state)
         middlewares = [access, binding]
     toolkit = Toolkit()
-    agent = SimpleNamespace(toolkit=toolkit)
+    agent = SimpleNamespace(toolkit=toolkit, state=AgentState())
     native_remove = toolkit.remove_tool
     removed = []
 
@@ -172,11 +236,14 @@ async def test_skill_binding_and_access_share_native_viewer_state(tmp_path, monk
     assert len(removed) == 1 and "TeamSay" in removed[0]
     assert (await toolkit.tool_groups[0].list_skills())[0] is resources.descriptor
     trace.clear()
-    decision = await access.on_check_permission(None, call_input("Skill", skill="report"), allow)
+    decision = await access.on_check_permission(agent, call_input("Skill", skill="report"), allow)
     assert decision.behavior == PermissionBehavior.ALLOW
-    assert trace == ["validate", "descriptors", "activate"]
+    assert trace == ["validate", "descriptors", "descriptors", "activate"]
+    user_id, agent_id, session_id, saved = resources.saved[0]
+    assert (user_id, agent_id, session_id) == ("alice", "agent-one", "session-two")
+    assert saved.middle_context["egis_agentkit"]["activated_skills"]["report"]["skill_name"] == "report"
     assert (await toolkit.tool_groups[0].list_skills())[0] is resources.materialized
-    viewed = await toolkit.builtin_skill_viewer.tool.call("report", AgentState())
+    viewed = await toolkit.builtin_skill_viewer.tool.call("report", agent.state)
     assert viewed.content[0].text == "Full report instructions"
     assert all(bound is scope for bound in resources.scopes)
 
@@ -186,7 +253,7 @@ async def test_skill_binding_and_access_share_native_viewer_state(tmp_path, monk
 async def test_snapshot_validation_precedes_dynamic_tool_denial(tmp_path, name):
     trace = []
     permissions = Permissions(trace)
-    access = component("ToolAccessMiddleware")(object(), scope_at(tmp_path), permissions=permissions)
+    access = tool_access_middleware(object(), scope_at(tmp_path), permissions)
 
     async def native(**kwargs):
         pytest.fail("A forbidden tool must not reach native execution")
@@ -201,36 +268,46 @@ async def test_snapshot_validation_precedes_dynamic_tool_denial(tmp_path, name):
 
 
 @pytest.mark.asyncio
-async def test_skill_activation_precedes_native_permission_and_revocation_blocks_it(tmp_path):
+async def test_skill_activation_requires_native_allow_and_current_snapshot(tmp_path):
     trace = []
     scope = scope_at(tmp_path)
     resources = Resources(tmp_path, trace)
     loader = skill_loader(object(), scope, resources)
     permissions = Permissions(trace)
-    access = component("ToolAccessMiddleware")(object(), scope, permissions=permissions, skills=loader)
+    access = tool_access_middleware(object(), scope, permissions, loader)
+    agent = SimpleNamespace(state=AgentState())
     native_decision = PermissionDecision(PermissionBehavior.ASK, "native confirmation")
 
     async def native(**kwargs):
         trace.append("native")
         return native_decision
 
-    assert await access.on_check_permission(None, call_input("Skill", skill="report"), native) is native_decision
-    assert trace == ["validate", "descriptors", "activate", "native"]
+    for behavior in (PermissionBehavior.ASK, PermissionBehavior.DENY):
+        native_decision = PermissionDecision(behavior, "native decision")
+        assert await access.on_check_permission(agent, call_input("Skill", skill="report"), native) is native_decision
+        assert trace == ["validate", "native"]
+        assert not resources.saved
+        trace.clear()
+
+    native_decision = PermissionDecision(PermissionBehavior.ALLOW, "native approval")
+    result = await access.on_check_permission(agent, call_input("Skill", skill="unknown"), native)
+    assert result.behavior == PermissionBehavior.DENY
+    assert trace == ["validate", "native", "descriptors", "descriptors"]
+    trace.clear()
+
+    assert await access.on_check_permission(agent, call_input("Skill", skill="report"), native) is native_decision
+    assert trace == ["validate", "native", "descriptors", "descriptors", "activate"]
     trace.clear()
     permissions.revoked = True
-    result = await access.on_check_permission(None, call_input("Skill", skill="report"), native)
+    result = await access.on_check_permission(agent, call_input("Skill", skill="report"), native)
     assert result.behavior == PermissionBehavior.DENY and trace == ["validate"]
-    permissions.revoked = False
-    trace.clear()
-    result = await access.on_check_permission(None, call_input("Skill", skill="unknown"), native)
-    assert result.behavior == PermissionBehavior.DENY and trace == ["validate", "descriptors"]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("behavior", [PermissionBehavior.ALLOW, PermissionBehavior.ASK, PermissionBehavior.DENY])
 async def test_project_read_keeps_native_permission_decision(tmp_path, behavior):
     scope = scope_at(tmp_path)
-    access = component("ToolAccessMiddleware")(object(), scope, permissions=Permissions([]))
+    access = tool_access_middleware(object(), scope, Permissions([]))
     rule = PermissionRule(tool_name="Read", rule_content=None, behavior=behavior, source="userSettings")
     context = PermissionContext(**{f"{behavior.value}_rules": {"Read": [rule]}})
     engine = PermissionEngine(context)
@@ -254,6 +331,8 @@ async def test_path_guard_limits_project_writes_and_activated_skill_reads(tmp_pa
     scope.workdir.mkdir(parents=True)
     resources = Resources(tmp_path, [])
     loader = skill_loader(object(), scope, resources)
+    agent = SimpleNamespace(state=AgentState())
+    await loader.bind_state(agent.state)
     await loader.activate("report")
     foreign = tmp_path / "foreign" / "private.txt"
     (scope.workdir / "escape").symlink_to(tmp_path / "foreign", target_is_directory=True)
@@ -266,9 +345,9 @@ async def test_path_guard_limits_project_writes_and_activated_skill_reads(tmp_pa
         "archive": tmp_path / "user" / "alice" / "uploads" / "input.pdf",
         "escape": scope.workdir / "escape" / "private.txt",
     }
-    access = component("ToolAccessMiddleware")(object(), scope, permissions=Permissions([]), skills=loader)
+    access = tool_access_middleware(object(), scope, Permissions([]), loader)
     data = {"path" if tool in ("Glob", "Grep") else "file_path": str(paths[area])}
-    result = await access.on_check_permission(None, call_input(tool, **data), allow)
+    result = await access.on_check_permission(agent, call_input(tool, **data), allow)
     permitted = area in ("work", "artifacts") or (area in ("uploads", "skill") and tool in ("Read", "Glob", "Grep"))
     assert result.behavior == (PermissionBehavior.ALLOW if permitted else PermissionBehavior.DENY)
 
@@ -277,9 +356,10 @@ async def test_path_guard_limits_project_writes_and_activated_skill_reads(tmp_pa
 async def test_unactivated_skills_and_parent_traversal_are_not_readable(tmp_path):
     scope = scope_at(tmp_path)
     loader = skill_loader(object(), scope, Resources(tmp_path, []))
-    access = component("ToolAccessMiddleware")(object(), scope, permissions=Permissions([]), skills=loader)
+    access = tool_access_middleware(object(), scope, Permissions([]), loader)
+    agent = SimpleNamespace(state=AgentState())
     for path in (tmp_path / "skills" / "report" / "SKILL.md", scope.workdir / ".." / ".." / "other-project" / "file.txt"):
-        result = await access.on_check_permission(None, call_input("Read", file_path=str(path)), allow)
+        result = await access.on_check_permission(agent, call_input("Read", file_path=str(path)), allow)
         assert result.behavior == PermissionBehavior.DENY
 
 
@@ -287,9 +367,13 @@ async def test_unactivated_skills_and_parent_traversal_are_not_readable(tmp_path
 async def test_personal_loader_refreshes_installed_enabled_skills(tmp_path):
     scope = scope_at(tmp_path, kind="personal")
     resources = Resources(tmp_path, [])
-    loader = skill_loader(object(), scope, resources)
+    loader = skill_loader(SimpleNamespace(user_id="alice"), scope, resources)
+    await loader.bind_state(AgentState())
     assert await loader.list_skills() == []
-    resources.installed = [dict(scope.definition["payload"]["bindings"][0], is_installed=True, is_enabled=False)]
+    resources.installed = [dict(
+        scope.definition["payload"]["bindings"][0],
+        owner_type="system", owner_id="system", is_installed=True, is_enabled=False,
+    )]
     assert await loader.list_skills() == []
     resources.installed[0]["is_enabled"] = True
     await loader.activate("report")
@@ -346,7 +430,7 @@ async def test_workspace_prompt_has_bounded_file_and_directory_scan(tmp_path):
 
 @pytest.mark.asyncio
 async def test_team_and_preference_prompts_are_independent(tmp_path):
-    team = component("TeamPromptMiddleware")
+    team = team_prompt_middleware
     preference = component("UserPreferenceMiddleware")
     assert await team(scope_at(tmp_path)).on_system_prompt(None, "base") == "base"
     prompt = await team(scope_at(tmp_path, team=True)).on_system_prompt(None, "base")
@@ -354,7 +438,7 @@ async def test_team_and_preference_prompts_are_independent(tmp_path):
     assert await preference("").on_system_prompt(None, prompt) == prompt
     prompt = await preference("Answer briefly").on_system_prompt(None, prompt)
     assert prompt.count("Answer briefly") == 1 and "不能扩大工具权限" in prompt
-    access = component("ToolAccessMiddleware")(object(), scope_at(tmp_path, team=True), permissions=Permissions([]))
+    access = tool_access_middleware(object(), scope_at(tmp_path, team=True), Permissions([]))
     assert (await access.on_check_permission(None, call_input("TeamSay"), allow)).behavior == PermissionBehavior.ALLOW
 
 
@@ -387,23 +471,79 @@ class Changes:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("api_version", [1, 2])
+async def test_release_manifest_selects_callback_context(storage, tmp_path, api_version):
+    from test_domain import identities
+
+    from egis_agentkit.service.agent.package import PackageService
+
+    package = release(tmp_path, "1.0.0", api_version=api_version, body="""
+from egis_agentkit.packages import Assembly
+
+seen = []
+
+async def tools(scope):
+    seen.append(scope)
+    return []
+
+async def middlewares(scope, workspace):
+    assert scope is seen[0]
+    seen.append(scope)
+    return []
+
+class ReportAssembly(Assembly):
+    feature = "reports"
+
+registered = ReportAssembly(tools, middlewares)
+
+def register():
+    return registered
+""")
+    loader = PackageLoader([tmp_path])
+    _, admin, _, _ = await identities(storage)
+    packages = PackageService(storage, loader)
+    asset = await packages.register(admin, package)
+    assert asset["payload"]["framework_api_version"] == api_version
+    assembly = loader.get(asset["resource_id"], asset["resource_version"])
+    assert assembly.feature == "reports"
+    assert assembly.tools_factory.__globals__["registered"] is assembly
+    bound, bound_version = await packages.resolve_for_run(asset["resource_id"], asset["resource_version"])
+    assert bound is assembly and bound_version == api_version
+    scope = replace(scope_at(tmp_path, assembly=bound), assembly_api_version=bound_version)
+    factory = factories.SessionMiddlewareFactory(
+        None, users=Users(), preferences=Preferences(), file_changes=Changes()
+    )
+    token = execution_scope.set(scope)
+    try:
+        ids = (scope.user_id, scope.agent_id, scope.session_id)
+        assert await factories.BoundToolFactory()(*ids) == []
+        await factory(*ids, WorkspaceBase())
+    finally:
+        execution_scope.reset(token)
+    expected = scope if api_version == 1 else scope.package_context
+    seen = assembly.tools_factory.__globals__["seen"]
+    assert len(seen) == 2 and all(context is expected for context in seen)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["personal", "private"])
 async def test_factories_use_injected_services_and_the_exact_bound_scope(tmp_path, monkeypatch, kind):
     users, preferences, changes = Users(), Preferences(), Changes()
     seen = []
-    workspace = object()
-    extra = object()
+    workspace = WorkspaceBase()
+    extra = MiddlewareBase()
+    bound_tool = Read(model_input_types=[])
 
-    async def tools(scope):
-        seen.append(scope)
-        return ["bound tool"]
+    async def tools(context):
+        seen.append(context)
+        return [bound_tool]
 
-    async def middlewares(scope, supplied_workspace):
-        seen.append(scope)
+    async def middlewares(context, supplied_workspace):
+        seen.append(context)
         assert supplied_workspace is workspace
         return [extra]
 
-    scope = scope_at(tmp_path, kind=kind, assembly=SimpleNamespace(tools_factory=tools, middlewares_factory=middlewares))
+    scope = scope_at(tmp_path, kind=kind, assembly=Assembly(tools, middlewares))
     resources = Resources(tmp_path, [])
 
     def unexpected(*args, **kwargs):
@@ -412,7 +552,7 @@ async def test_factories_use_injected_services_and_the_exact_bound_scope(tmp_pat
     for name in ("UserService", "PreferenceService", "FileChangeService", "MemoryService"):
         monkeypatch.setattr(factories, name, unexpected)
     config = SimpleNamespace(snapshot=SimpleNamespace(runtime=SimpleNamespace(memory=SimpleNamespace(is_enabled=True)), policies=None))
-    factory = factories.AgentFactories(None, None, tmp_path, resources, config, users=users, preferences=preferences, memory=None, file_changes=changes)
+    factory = factories.AgentFactories(SimpleNamespace(engine=None), None, tmp_path, resources, config, users=users, preferences=preferences, memory=None, file_changes=changes)
     assert factory.memory is None
     assert isinstance(factory.tool_factory, factories.BoundToolFactory)
     assert isinstance(factory.middleware_factory, factories.SessionMiddlewareFactory)
@@ -422,11 +562,14 @@ async def test_factories_use_injected_services_and_the_exact_bound_scope(tmp_pat
         assert list(inspect.signature(callback).parameters) == ["user_id", "agent_id", "session_id", "workspace"]
     token = execution_scope.set(scope)
     try:
-        assert await factory.tools("alice", "agent-one", "session-two") == ["bound tool"]
+        assert await factory.tools("alice", "agent-one", "session-two") == [bound_tool]
         result = await factory.middlewares("alice", "agent-one", "session-two", workspace)
     finally:
         execution_scope.reset(token)
-    assert len(seen) == 2 and all(bound is scope for bound in seen)
+    assert len(seen) == 2 and seen[0] is seen[1] is scope.package_context
+    assert seen[0] == AssemblyContext(
+        "alice", "agent-one", "session-two", "project-one", scope.workdir, scope.artifacts_dir
+    )
     assert not any(isinstance(mw, EnterprisePolicyMiddleware) for mw in result)
     assert isinstance(result[0], FileChangesMiddleware) and result[0].changes is changes
     assert result[-1] is extra
@@ -443,7 +586,8 @@ async def test_factories_use_injected_services_and_the_exact_bound_scope(tmp_pat
     async def terminal(**kwargs):
         yield "event"
 
-    assert await reply_chain(result[:-1], SimpleNamespace(toolkit=Toolkit()), terminal) == ["event"]
+    agent = SimpleNamespace(toolkit=Toolkit(), state=AgentState())
+    assert await reply_chain(result[:-1], agent, terminal) == ["event"]
     assert changes.observations == [("alice", "project-one", False), ("alice", "project-one", False)]
 
 
@@ -465,17 +609,21 @@ async def test_both_factories_reject_missing_or_mismatched_execution_scope(tmp_p
 @pytest.mark.asyncio
 async def test_factories_do_not_reresolve_or_mix_scopes_across_sessions(tmp_path):
     component("ToolAccessMiddleware")
-    factory = factories.AgentFactories(None, object(), tmp_path, users=Users(), preferences=Preferences(), memory=None, file_changes=Changes())
+    factory = factories.AgentFactories(SimpleNamespace(engine=None), object(), tmp_path, users=Users(), preferences=Preferences(), memory=None, file_changes=Changes())
 
-    async def tools(scope):
+    seen = []
+
+    async def tools(context):
         await asyncio.sleep(0)
-        return [scope]
+        seen.append(("tool", context))
+        return []
 
-    async def middlewares(scope, workspace):
+    async def middlewares(context, workspace):
         await asyncio.sleep(0)
-        return [scope]
+        seen.append(("middleware", context))
+        return []
 
-    assembly = SimpleNamespace(tools_factory=tools, middlewares_factory=middlewares)
+    assembly = Assembly(tools, middlewares)
     one = scope_at(tmp_path, assembly=assembly)
     two = replace(one, session_id="session-three")
 
@@ -483,13 +631,15 @@ async def test_factories_do_not_reresolve_or_mix_scopes_across_sessions(tmp_path
         token = execution_scope.set(scope)
         try:
             ids = (scope.user_id, scope.agent_id, scope.session_id)
-            assert (await factory.tools(*ids))[0] is scope
-            result = await factory.middlewares(*ids, None)
-            assert result[-1] is scope and result[0].scope is scope
+            assert await factory.tools(*ids) == []
+            result = await factory.middlewares(*ids, WorkspaceBase())
+            assert result[0].scope is scope
         finally:
             execution_scope.reset(token)
 
     await asyncio.gather(build(one), build(two))
+    for scope in (one, two):
+        assert [kind for kind, context in seen if context is scope.package_context] == ["tool", "middleware"]
     unregistered = replace(one, assembly=None, definition={"agent_type": "private", "payload": {"implementation": {"assembly_ref": "missing", "assembly_version": "1.0.0"}}})
     token = execution_scope.set(unregistered)
     try:

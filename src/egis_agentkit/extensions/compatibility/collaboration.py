@@ -14,11 +14,11 @@ from copy import deepcopy
 from agentscope.app._tool._agent_invite import AgentInvite, _display_name
 from agentscope.app._tool._team_create import TeamCreate
 from agentscope.app._tool._team_say import TeamSay
-from agentscope.app.storage import AgentData, AgentRecord
 from agentscope.message import Msg, ToolResultState
 from sqlalchemy import delete, insert
 
 from egis_agentkit.errors import Conflict, Forbidden
+from egis_agentkit.service.agent.assembly import AgentRecordFactory
 from egis_agentkit.service.project.service import purge_session_bus
 from egis_agentkit.service.team.collaboration import (
     collaboration_allowed,
@@ -238,20 +238,13 @@ async def _apply_invitations(user, scope, state, native_create, inputs, permissi
                 )
                 member.update(status="joined", worker_session_id=existing.session_id)
             else:
-                record = AgentRecord(
-                    id=member["native_agent_id"],
-                    user_id=scope.user_id,
+                record = AgentRecordFactory.create(
+                    scope.user_id,
+                    name=root["agent_name"],
+                    system_prompt=root["payload"]["system_prompt"],
                     source="team",
-                    data=AgentData(
-                        name=root["agent_name"],
-                        system_prompt=root["payload"]["system_prompt"],
-                        chat_config={
-                            "invite_config": {
-                                "invitable": True,
-                                "invite_description": member["display_name"],
-                            }
-                        },
-                    ),
+                    record_id=member["native_agent_id"],
+                    invite_description=member["display_name"],
                 )
                 await storage.upsert_agent(scope.user_id, record)
                 adapter.member = member

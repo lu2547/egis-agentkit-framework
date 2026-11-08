@@ -10,6 +10,12 @@ class TeamDefinitionManager:
         self.agents = AgentDefinitionManager(storage, policies)
         self.repository = self.agents.repository
 
+    async def list(self, user) -> list[dict]:
+        return await self.agents.list(user, definition_type="team")
+
+    async def delete(self, user, identifier: str) -> None:
+        await self.agents.delete(user, identifier)
+
     async def save(self, user, data: dict) -> dict:
         if data.get("orchestrator_id"):
             raise Forbidden("主理人由专家团管理，不能选择一个 expert 充当主理人")

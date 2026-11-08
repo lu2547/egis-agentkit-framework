@@ -2,6 +2,7 @@ from copy import deepcopy
 
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.models import Asset, Definition
+from egis_agentkit.storage.access import AccessStorage
 from egis_agentkit.storage.definition import DefinitionStorage
 
 
@@ -15,7 +16,7 @@ async def require_current_shared_asset(conn, asset):
     """Validate a new shared edge against its exact current approved asset."""
     if asset["owner_type"] != "user":
         raise Forbidden("共享资源归属不匹配")
-    review = await DefinitionStorage(conn.engine).approved_review(
+    review = await AccessStorage(conn.engine).approved_review(
         asset["resource_id"], resource_type=asset["resource_type"], conn=conn
     )
     approved = review["snapshot"].get("asset") if review else None
@@ -32,13 +33,14 @@ class DefinitionViews:
 
     def __init__(self, storage):
         self.repository = DefinitionStorage(storage.engine)
+        self.access = AccessStorage(storage.engine)
 
     async def raw_view(self, definition_id: str, view: str, *, conn=None) -> dict:
         row = await self.repository.get_definition(definition_id, conn=conn)
         if not row["is_enabled"]:
             raise Forbidden("资源已停用")
         if view == "shared":
-            review = await self.repository.approved_review(definition_id, conn=conn)
+            review = await self.access.approved_review(definition_id, conn=conn)
             if review is None:
                 raise Forbidden("资源尚未通过共享审核")
             root = deepcopy(review["snapshot"]["root"])

@@ -6,13 +6,20 @@ import pytest
 from agentscope.app._tool._team_create import TeamCreate
 from agentscope.app.message_bus import InMemoryMessageBus, MessageBusKeys
 from agentscope.message import Msg
-from agentscope.permission import PermissionMode
-from agentscope.tool import Toolkit
+from agentscope.permission import PermissionBehavior, PermissionDecision, PermissionMode
+from agentscope.tool import Read, Toolkit
+from agentscope.workspace import WorkspaceBase
 from test_domain import expert, identities
 
+from egis_agentkit.config.snapshot import PoliciesConfig
 from egis_agentkit.errors import Conflict, Forbidden
+from egis_agentkit.extensions.agent.factory import AgentFactories
 from egis_agentkit.extensions.compatibility.execution import ExecutionCoordinator
-from egis_agentkit.extensions.middleware.tool_access import ToolAccessMiddleware
+from egis_agentkit.extensions.compatibility.policy import (
+    team_prompt_middleware,
+    tool_access_middleware,
+)
+from egis_agentkit.extensions.middleware import ToolAccessMiddleware
 from egis_agentkit.service.access.authorization import PermissionService
 from egis_agentkit.service.session.service import TaskService
 from egis_agentkit.services import AgentService
@@ -32,6 +39,32 @@ async def setup_task(storage, tmp_path):
 
 def ref(writer):
     return {"definition_id": writer["id"], "resource_view_type": "private"}
+
+
+@pytest.mark.asyncio
+async def test_middleware_keeps_the_policy_of_the_locked_run(storage, tmp_path):
+    alice, _, _, task = await setup_task(storage, tmp_path)
+    current = PoliciesConfig(config_version=1)
+    config = SimpleNamespace(snapshot=SimpleNamespace(policies=current))
+    factory = AgentFactories(
+        storage, None, tmp_path, config_provider=config, memory=None
+    ).middleware_factory
+
+    async def native_allow(**kwargs):
+        return PermissionDecision(PermissionBehavior.ALLOW, "native")
+
+    async with ExecutionCoordinator(storage, tmp_path, config).bind(task["session_id"]):
+        config.snapshot = SimpleNamespace(policies=PoliciesConfig(
+            config_version=2, allow_personal_self_use=False,
+        ))
+        middlewares = await factory(
+            alice.user_id, task["agent_id"], task["session_id"], WorkspaceBase()
+        )
+        access = next(mw for mw in middlewares if isinstance(mw, ToolAccessMiddleware))
+        result = await access.on_check_permission(
+            None, {"tool": Read(model_input_types=[]), "tool_input": {}}, native_allow
+        )
+        assert result.behavior == PermissionBehavior.ALLOW
 
 
 @pytest.mark.asyncio
@@ -307,9 +340,8 @@ async def test_native_worker_keeps_snapshot_and_permission_gate_blocks_roster_to
                 ]
             )
             agent = SimpleNamespace(toolkit=toolkit, state=scope.session_record.state)
-            middleware = ToolAccessMiddleware(
-                alice, scope, permissions=PermissionService(storage)
-            )
+            middleware = tool_access_middleware(alice, scope, PermissionService(storage))
+            team_prompt = team_prompt_middleware(scope)
 
             async def downstream(**kwargs):
                 yield "native reply"
@@ -345,6 +377,10 @@ async def test_native_worker_keeps_snapshot_and_permission_gate_blocks_roster_to
                 assert decision.behavior == PermissionBehavior.DENY
             team = await storage.get_team("alice", scope.session_record.team_id)
             member = team.data.members[0]
+            assert (
+                f"{writer['agent_name']}@{member.agent_id[:8]}"
+                in await team_prompt.on_system_prompt(agent, "system")
+            )
         changed = expert()
         changed.id = writer["id"]
         changed.config_version = writer["config_version"]

@@ -6,12 +6,9 @@ import hashlib
 import json
 from itertools import islice
 
-from sqlalchemy import select
-
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
 from egis_agentkit.service.access.snapshot import SnapshotService
 from egis_agentkit.service.team.collaboration import collaboration_allowed
-from egis_agentkit.storage import tables as t
 
 
 class ComposerService:
@@ -104,24 +101,9 @@ class ComposerService:
         scanned = after or ""
         while len(result) < count:
             # Authorization can reject many candidates; keep each DB read bounded.
-            async with self.storage.engine.connect() as conn:
-                rows = (
-                    (
-                        await conn.execute(
-                            select(t.definitions)
-                            .where(
-                                t.definitions.c.definition_type == "agent",
-                                t.definitions.c.agent_type == "expert",
-                                t.definitions.c.is_enabled,
-                                t.definitions.c.id > scanned,
-                            )
-                            .order_by(t.definitions.c.id)
-                            .limit(50)
-                        )
-                    )
-                    .mappings()
-                    .all()
-                )
+            rows = await self.storage.definitions.list_enabled_experts_after(
+                scanned, limit=50
+            )
             if not rows:
                 break
             for row in rows:
@@ -171,41 +153,12 @@ class ComposerService:
         result = []
         scanned = after.rsplit("@", 1)[0] if after else ""
         while len(result) < count:
-            async with self.storage.engine.connect() as conn:
-                # Page resources, not versions. Otherwise an older installed
-                # version can reappear after a cursor/page boundary.
-                identifiers = list(
-                    (
-                        await conn.execute(
-                            select(t.assets.c.resource_id)
-                            .where(
-                                t.assets.c.resource_type == "skill",
-                                t.assets.c.resource_id > scanned,
-                            )
-                            .distinct()
-                            .order_by(t.assets.c.resource_id)
-                            .limit(50)
-                        )
-                    ).scalars()
-                )
-                if not identifiers:
-                    break
-                rows = (
-                    (
-                        await conn.execute(
-                            select(t.assets)
-                            .where(
-                                t.assets.c.resource_type == "skill",
-                                t.assets.c.resource_id.in_(identifiers),
-                            )
-                            .order_by(
-                                t.assets.c.resource_id, t.assets.c.resource_version
-                            )
-                        )
-                    )
-                    .mappings()
-                    .all()
-                )
+            # Page resources so an older installed version stays in its resource's page.
+            identifiers, rows = await self.storage.assets.page_versions(
+                "skill", scanned, limit=50
+            )
+            if not identifiers:
+                break
             selected = await self.resources.installed_assets(
                 user, "skill", rows, enabled_only=True
             )

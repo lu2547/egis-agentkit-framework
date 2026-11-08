@@ -4,21 +4,25 @@ No execution loop lives here. Scope lifetime exactly matches the native
 session lock; native State persists the JSON-only snapshot for HITL resume.
 """
 
+from __future__ import annotations
+
 import asyncio
 from contextlib import AsyncExitStack, aclosing, asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from agentscope.app.message_bus import MessageBusKeys
-from agentscope.app.storage import AgentData, AgentRecord
-from sqlalchemy import text
+from agentscope.app.storage import AgentRecord, SessionRecord
 
+from egis_agentkit.config import PoliciesConfig
 from egis_agentkit.errors import AgentKitError, Forbidden, NotFound
 from egis_agentkit.extensions.message_bus import EgisMessageBus
+from egis_agentkit.packages import Assembly, AssemblyContext
 from egis_agentkit.service.access.authorization import PermissionService
 from egis_agentkit.service.access.snapshot import SnapshotService
+from egis_agentkit.service.agent.assembly import AgentRecordFactory
 from egis_agentkit.service.project.service import ProjectService
 from egis_agentkit.service.team.collaboration import validate_collaborators
 from egis_agentkit.service.user.service import UserService
@@ -33,11 +37,32 @@ class ExecutionScope:
     definition: dict
     snapshot: dict
     binding: dict
-    session_record: object
+    session_record: SessionRecord
     workdir: Path
     artifacts_dir: Path
-    assembly: object | None = None
+    assembly: Assembly[AssemblyContext | ExecutionScope] | None = None
     project_id: str = ""
+    policies: PoliciesConfig | None = None
+    assembly_api_version: int = 2
+    package_context: AssemblyContext = field(init=False)
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "package_context",
+            AssemblyContext(
+                user_id=self.user_id,
+                agent_id=self.agent_id,
+                session_id=self.session_id,
+                project_id=self.project_id,
+                workdir=self.workdir,
+                artifacts_dir=self.artifacts_dir,
+            ),
+        )
+
+    @property
+    def assembly_context(self) -> AssemblyContext | ExecutionScope:
+        return self if self.assembly_api_version == 1 else self.package_context
 
 
 execution_scope: ContextVar[ExecutionScope | None] = ContextVar(
@@ -64,12 +89,14 @@ class ExecutionCoordinator:
         models=None,
         packages=None,
         projects=None,
+        users=None,
     ):
         self.storage = storage
         self.files = WorkspaceFiles(Path(workspace_root))
         self.config_provider = config_provider
         self.loader, self.models = loader, models
         self.packages = packages
+        self.users = users if users is not None else UserService(storage)
         self.projects = (
             projects
             if projects is not None
@@ -78,25 +105,14 @@ class ExecutionCoordinator:
 
     @asynccontextmanager
     async def bind(self, session_id, *, session_lock_held=False):
-        # Narrow native-schema adapter: identity lookup does not leak to HTTP.
-        async with self.storage.engine.connect() as conn:
-            locator = (
-                (
-                    await conn.execute(
-                        text("SELECT user_id, agent_id FROM sessions WHERE id=:id"),
-                        {"id": session_id},
-                    )
-                )
-                .mappings()
-                .first()
-            )
+        locator = await self.storage.locate_session(session_id)
         if locator is None:
             raise NotFound("会话不存在")
-        user_id, agent_id = locator["user_id"], locator["agent_id"]
+        user_id, agent_id = locator
         session = await self.storage.read_session_unscoped(
             user_id, agent_id, session_id
         )
-        user = await UserService(self.storage).get(user_id)
+        user = await self.users.get(user_id)
         projects = self.projects
         if not session.state.middle_context.get("egis_agentkit", {}).get(
             "is_initialized"
@@ -109,7 +125,8 @@ class ExecutionCoordinator:
         policies = (
             self.config_provider.snapshot.policies if self.config_provider else None
         )
-        await PermissionService(self.storage, policies).require(
+        permissions = PermissionService(self.storage, policies)
+        await permissions.require(
             user,
             binding["root_resource_type"],
             binding["definition_id"],
@@ -136,12 +153,8 @@ class ExecutionCoordinator:
             )
             binding["agent_node_key"] = snapshot["root_key"]
         node = snapshot["nodes"][binding["agent_node_key"]]
-        await PermissionService(self.storage, policies).validate_snapshot(
-            user, snapshot
-        )
-        await validate_collaborators(
-            PermissionService(self.storage, policies), user, binding
-        )
+        await permissions.validate_snapshot(user, snapshot)
+        await validate_collaborators(permissions, user, binding)
         # Availability remains current even though configuration stays pinned.
         current = await self.storage.get_definition(node["resource_id"])
         if not current["is_enabled"]:
@@ -169,10 +182,11 @@ class ExecutionCoordinator:
         artifacts = self.files.area_root(user_id, project["id"], "artifacts")
         implementation = node["data"]["payload"].get("implementation")
         assembly = None
+        assembly_api_version = 2
         if implementation:
             if self.packages is None:
                 raise Forbidden("未配置发布包装配服务")
-            assembly = await self.packages.resolve(
+            assembly, assembly_api_version = await self.packages.resolve_for_run(
                 implementation["assembly_ref"], implementation["assembly_version"]
             )
         scope = ExecutionScope(
@@ -187,6 +201,8 @@ class ExecutionCoordinator:
             artifacts,
             assembly,
             project["id"],
+            policies=policies,
+            assembly_api_version=assembly_api_version,
         )
         async with projects.guard(user, project["id"]):
             await asyncio.to_thread(projects.initialize_files, user_id, project["id"])
@@ -247,15 +263,6 @@ class ScopedMessageBus(EgisMessageBus):
 
 def projected_agent(record: AgentRecord, scope: ExecutionScope) -> AgentRecord:
     data = scope.definition
-    payload = data["payload"]
-    return record.model_copy(
-        update={
-            "data": AgentData(
-                id=record.data.id,
-                name=data["agent_name"],
-                system_prompt=payload["system_prompt"],
-                chat_config={"invite_config": {"invitable": False}},
-            )
-        },
-        deep=True,
+    return AgentRecordFactory.project(
+        record, name=data["agent_name"], system_prompt=data["payload"]["system_prompt"]
     )

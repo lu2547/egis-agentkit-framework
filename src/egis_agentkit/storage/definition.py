@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from egis_agentkit.errors import NotFound
 from egis_agentkit.models import utcnow
 from egis_agentkit.storage import tables as t
+from egis_agentkit.storage.access import AccessStorage
 
 
 class DefinitionStorage:
@@ -41,14 +42,9 @@ class DefinitionStorage:
     async def approved_review(
         self, resource_id: str, *, resource_type: str | None = None, conn=None
     ) -> dict | None:
-        statement = select(t.reviews).where(
-            t.reviews.c.resource_id == resource_id,
-            t.reviews.c.is_current,
-            t.reviews.c.review_status_type == "approved",
+        return await AccessStorage(self.engine).approved_review(
+            resource_id, resource_type=resource_type, conn=conn
         )
-        if resource_type is not None:
-            statement = statement.where(t.reviews.c.resource_type == resource_type)
-        return await self._first(statement, conn=conn)
 
     async def read_catalog(
         self, definition_type="agent", *, conn=None
@@ -68,11 +64,27 @@ class DefinitionStorage:
         ]
         reviews = (
             await conn.execute(
-                select(t.reviews.c.resource_id, t.reviews.c.review_status_type)
-                .order_by(t.reviews.c.submitted_at)
+                select(
+                    t.reviews.c.resource_id, t.reviews.c.review_status_type
+                ).order_by(t.reviews.c.submitted_at)
             )
         ).all()
         return rows, dict(reviews)
+
+    async def list_enabled_experts_after(self, after: str, *, limit: int) -> list[dict]:
+        async with self.engine.connect() as conn:
+            rows = await conn.execute(
+                select(t.definitions)
+                .where(
+                    t.definitions.c.definition_type == "agent",
+                    t.definitions.c.agent_type == "expert",
+                    t.definitions.c.is_enabled,
+                    t.definitions.c.id > after,
+                )
+                .order_by(t.definitions.c.id)
+                .limit(limit)
+            )
+            return [dict(row) for row in rows.mappings()]
 
     async def ensure_personal(self, values: dict, *, actor: str, conn: AsyncConnection):
         await conn.execute(
@@ -85,25 +97,33 @@ class DefinitionStorage:
         self, values: dict, *, actor: str, conn: AsyncConnection
     ) -> dict:
         row = (
-            await conn.execute(
-                insert(t.definitions)
-                .values(**values, created_by=actor, updated_by=actor)
-                .returning(t.definitions)
+            (
+                await conn.execute(
+                    insert(t.definitions)
+                    .values(**values, created_by=actor, updated_by=actor)
+                    .returning(t.definitions)
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         return dict(row)
 
     async def update_definition(
         self, definition_id: str, values: dict, *, actor: str, conn: AsyncConnection
     ) -> dict:
         row = (
-            await conn.execute(
-                update(t.definitions)
-                .where(t.definitions.c.id == definition_id)
-                .values(**values, updated_by=actor, updated_at=utcnow())
-                .returning(t.definitions)
+            (
+                await conn.execute(
+                    update(t.definitions)
+                    .where(t.definitions.c.id == definition_id)
+                    .values(**values, updated_by=actor, updated_at=utcnow())
+                    .returning(t.definitions)
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         return dict(row)
 
     async def disable_definition(

@@ -4,6 +4,11 @@ from egis_agentkit_app.bootstrap import build_app
 from test_domain import identities
 
 from egis_agentkit.config import ConfigSnapshot, NacosBootstrap, NacosClient
+from egis_agentkit.extensions.agent.factory import (
+    BoundToolFactory,
+    SessionMiddlewareFactory,
+)
+from egis_agentkit.extensions.compatibility.storage import ExecutionStorage
 
 
 class Config:
@@ -72,8 +77,20 @@ async def test_http_identity_native_write_seal_and_real_task_files(
         ),
     )
     app = await build_app(config, nacos, engine=storage.engine)
-    assert app.state.egis_services.tasks.projects is app.state.egis_services.projects
-    assert app.state.egis_bus.coordinator.projects is app.state.egis_services.projects
+    services = app.state.egis_services
+    assert services.tasks.projects is services.projects
+    assert app.state.egis_bus.coordinator.projects is services.projects
+    assert isinstance(app.state.storage, ExecutionStorage)
+    assert app.state.storage is not services.tasks.storage
+    assert app.state.storage.engine is services.tasks.storage.engine is storage.engine
+    assert app.state.egis_bus.coordinator.storage is services.tasks.storage
+    assert services.agents.packages is services.packages
+    assert isinstance(app.state.extra_agent_tools, BoundToolFactory)
+    factory = app.state.extra_agent_middlewares
+    assert isinstance(factory, SessionMiddlewareFactory)
+    assert factory.users is services.users
+    assert factory.preferences is services.preferences
+    assert factory.file_changes is services.workspace.file_changes
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app, client=("127.0.0.1", 1234)),

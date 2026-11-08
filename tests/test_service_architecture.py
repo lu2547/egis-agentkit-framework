@@ -8,6 +8,9 @@ import pytest
 @pytest.mark.parametrize(
     ("module", "symbol"),
     [
+        ("egis_agentkit.bootstrap", "build_components"),
+        ("egis_agentkit.config", "nacos_bootstrap"),
+        ("egis_agentkit.packages", "AssemblyContext"),
         ("egis_agentkit.service.agent", "AgentService"),
         ("egis_agentkit.service.agent.package", "PackageService"),
         ("egis_agentkit.service.team", "TeamService"),
@@ -37,6 +40,7 @@ def test_public_entry_points_load_without_application(module, symbol):
 def test_storage_and_integration_do_not_depend_on_runtime_extensions():
     import ast
     from pathlib import Path
+
     import egis_agentkit
 
     root = Path(egis_agentkit.__file__).parent

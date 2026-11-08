@@ -1,7 +1,8 @@
 """Native record-read compatibility until AgentScope exposes a pre-read hook.
 
-Only the native ChatService receives this storage. Enterprise services and the
-execution coordinator use the unprojected AgentKitStorage on the same engine.
+The native application receives this storage. Reads are projected only when
+they match the bound execution. Enterprise services and the coordinator use
+unprojected AgentKitStorage on the same engine.
 This is deliberately not presented as a public SDK extension contract.
 """
 

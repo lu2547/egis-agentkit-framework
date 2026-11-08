@@ -48,6 +48,18 @@ class ResourceRef(Model):
     resource_view_type: ViewType = "system"
 
 
+class SkillActivation(ResourceRef):
+    """JSON-only skill activation stored in native AgentState.middle_context."""
+
+    source_checksum_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    cache_checksum_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    cache_dir: str = Field(min_length=1)
+    skill_name: str = Field(min_length=1)
+
+    def reference(self):
+        return {key: getattr(self, key) for key in ResourceRef.model_fields}
+
+
 class Implementation(Model):
     assembly_ref: str
     assembly_version: str

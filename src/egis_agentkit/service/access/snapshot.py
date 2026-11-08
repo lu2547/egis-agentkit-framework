@@ -2,14 +2,11 @@
 
 from copy import deepcopy
 
-from sqlalchemy import select
-
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
 from egis_agentkit.service.agent.views import (
     DefinitionViews,
     require_current_shared_asset,
 )
-from egis_agentkit.storage import tables as t
 
 
 def node_key(resource_type, resource_id, view, version=None):
@@ -56,19 +53,7 @@ class SnapshotService:
             async with self.storage.engine.connect() as connection:
                 return await self.capture(definition_id, view, conn=connection)
         if view == "shared":
-            review = (
-                (
-                    await conn.execute(
-                        select(t.reviews).where(
-                            t.reviews.c.resource_id == definition_id,
-                            t.reviews.c.is_current,
-                            t.reviews.c.review_status_type == "approved",
-                        )
-                    )
-                )
-                .mappings()
-                .first()
-            )
+            review = await self.storage.access.approved_review(definition_id, conn=conn)
             if review is None:
                 raise Forbidden("资源尚未共享")
             # Always consult the source tombstone, but never its current payload.
@@ -128,21 +113,13 @@ class SnapshotService:
                     await self._visit(child, child_view, snapshot, visiting, conn)
         else:
             for ref in data["payload"].get("bindings", []):
-                row = (
-                    (
-                        await conn.execute(
-                            select(t.assets).where(
-                                t.assets.c.resource_type == ref["resource_type"],
-                                t.assets.c.resource_id == ref["resource_id"],
-                                t.assets.c.resource_version == ref["resource_version"],
-                                t.assets.c.is_enabled,
-                            )
-                        )
-                    )
-                    .mappings()
-                    .first()
+                row = await self.storage.assets.get(
+                    ref["resource_type"],
+                    ref["resource_id"],
+                    ref["resource_version"],
+                    conn=conn,
                 )
-                if row is None:
+                if row is None or not row["is_enabled"]:
                     raise NotFound("绑定资源指定版本不存在或已停用")
                 if ref["resource_view_type"] == "shared":
                     await require_current_shared_asset(conn, row)

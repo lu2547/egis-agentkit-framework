@@ -24,7 +24,6 @@ from agentscope.app._service._mcp_render import render_mcp
 from agentscope.app.storage import MCPRecord, SkillRecord
 from agentscope.skill import Skill
 from packaging.version import Version
-from sqlalchemy import or_, select, text
 
 from egis_agentkit.catalog_icons import catalog_icon_id
 from egis_agentkit.config.limits import DEFAULT_SKILL_ARCHIVE_MAX_BYTES
@@ -33,7 +32,6 @@ from egis_agentkit.models import Asset, ResourceRef, utcnow
 from egis_agentkit.service.access.authorization import PermissionService
 from egis_agentkit.service.resource.activation import SkillActivation
 from egis_agentkit.service.user.service import UserService, require_admin
-from egis_agentkit.storage import tables as t
 
 ResourceView = dict
 _hub_access: ContextVar[tuple | None] = ContextVar(
@@ -239,37 +237,17 @@ class ResourceService:
     async def _asset(self, kind, rid, version, *, conn=None):
         self._kind(kind)
         self._identity(rid, version)
-        query = select(t.assets).where(
-            t.assets.c.resource_type == kind,
-            t.assets.c.resource_id == rid,
-            t.assets.c.resource_version == version,
-        )
-        if conn is None:
-            async with self.storage.engine.connect() as connection:
-                row = (await connection.execute(query)).mappings().first()
-        else:
-            row = (await conn.execute(query)).mappings().first()
+        row = await self.storage.assets.get(kind, rid, version, conn=conn)
         if row is None:
             raise NotFound()
-        return dict(row)
+        return row
 
     async def _review_asset(self, asset):
-        async with self.storage.engine.connect() as conn:
-            row = (
-                await conn.execute(
-                    select(t.reviews.c.snapshot).where(
-                        t.reviews.c.resource_type == asset["resource_type"],
-                        t.reviews.c.resource_id == asset["resource_id"],
-                        t.reviews.c.is_current,
-                        t.reviews.c.review_status_type == "approved",
-                    )
-                )
-            ).scalar_one_or_none()
-        approved = (row or {}).get("asset")
-        if (
-            not approved
-            or approved.get("resource_version") != asset["resource_version"]
-        ):
+        review = await self.storage.access.approved_review(
+            asset["resource_id"], resource_type=asset["resource_type"]
+        )
+        approved = ((review or {}).get("snapshot") or {}).get("asset")
+        if not approved or approved.get("resource_version") != asset["resource_version"]:
             return None
         return approved
 
@@ -393,23 +371,7 @@ class ResourceService:
         active = _hub_access.get()
         if active and active[:3] == (user_id, resource_type, resource_id):
             return True
-        async with self.storage.engine.connect() as conn:
-            rows = (
-                (
-                    await conn.execute(
-                        select(t.assets).where(
-                            t.assets.c.resource_type == resource_type,
-                            t.assets.c.is_enabled,
-                            or_(
-                                t.assets.c.resource_id == resource_id,
-                                t.assets.c.payload["nacos_name"].astext == resource_id,
-                            ),
-                        )
-                    )
-                )
-                .mappings()
-                .all()
-            )
+        rows = await self.storage.assets.list_enabled_by_source_name(resource_type, resource_id)
         # The native callback has no version argument. Other users' shared sources
         # are admitted only inside an exact-version enterprise operation above.
         for row in rows:
@@ -541,11 +503,7 @@ class ResourceService:
         )
         records = {record.id: record for record in records}
         if rows is None:
-            statement = select(t.assets).where(t.assets.c.resource_type == resource_type)
-            if resource_ids is not None:
-                statement = statement.where(t.assets.c.resource_id.in_(resource_ids))
-            async with self.storage.engine.connect() as conn:
-                rows = (await conn.execute(statement)).mappings().all()
+            rows = await self.storage.assets.list_versions(resource_type, resource_ids=resource_ids)
         selected = {}
         for row in rows:
             asset = dict(row)
@@ -568,17 +526,7 @@ class ResourceService:
         self._kind(resource_type)
         if not user.is_enabled:
             raise Forbidden()
-        async with self.storage.engine.connect() as conn:
-            rows = [
-                dict(row)
-                for row in (
-                    await conn.execute(
-                        select(t.assets).where(
-                            t.assets.c.resource_type == resource_type
-                        )
-                    )
-                ).mappings()
-            ]
+        rows = await self.storage.assets.list_versions(resource_type)
         selected = await self._latest_visible_assets(user, resource_type, rows)
         # Installed cards continue to describe/control the user's chosen
         # version even when a newer catalog version has been published.
@@ -628,17 +576,7 @@ class ResourceService:
     async def _owner_for_save(self, user, kind, rid, version, data, conn):
         if not user.is_enabled:
             raise Forbidden()
-        rows = (
-            (
-                await conn.execute(
-                    select(t.assets).where(
-                        t.assets.c.resource_type == kind, t.assets.c.resource_id == rid
-                    )
-                )
-            )
-            .mappings()
-            .all()
-        )
+        rows = await self.storage.assets.list_versions(kind, resource_ids=[rid], conn=conn)
         if any(row["owner_type"] == "system" for row in rows):
             require_admin(user)
         if any(
@@ -687,15 +625,9 @@ class ResourceService:
             data.get("avatar"), default="book" if kind == "skill" else "code"
         )
         async with self.storage.transaction() as conn:
-            await conn.execute(
-                text("SELECT pg_advisory_xact_lock(hashtextextended(:identity,0))"),
-                {"identity": kind + ":" + rid},
-            )
+            await self.storage.assets.lock_resource(kind, rid, conn=conn)
             if import_job_id:
-                existing = (await conn.execute(select(t.assets).where(
-                    t.assets.c.resource_type == kind, t.assets.c.resource_id == rid,
-                    t.assets.c.resource_version == version,
-                ))).mappings().first()
+                existing = await self.storage.assets.get(kind, rid, version, conn=conn)
                 if existing:
                     if existing["owner_id"] != user.user_id or existing["payload"].get("import_job_id") != import_job_id:
                         raise Conflict("Import identity already exists")
@@ -771,13 +703,7 @@ class ResourceService:
             if progress:
                 await progress("publishing", 85)
             await self._publish_private(asset.model_dump())
-            await conn.execute(
-                t.assets.insert().values(
-                    **asset.model_dump(),
-                    created_by=user.user_id,
-                    updated_by=user.user_id,
-                )
-            )
+            await self.storage.assets.insert_asset(asset, actor=user.user_id, conn=conn)
         return await self._view(user, asset.model_dump())
 
     @staticmethod
@@ -814,10 +740,7 @@ class ResourceService:
         rid = data.get("resource_id")
         base_version = data.get("base_version")
         if rid:
-            async with self.storage.engine.connect() as conn:
-                versions = (await conn.execute(select(t.assets).where(
-                    t.assets.c.resource_type == "skill", t.assets.c.resource_id == rid,
-                ))).mappings().all()
+            versions = await self.storage.assets.list_versions("skill", resource_ids=[rid])
             if versions:
                 if any(not self._editable(user, asset) for asset in versions):
                     raise Forbidden()

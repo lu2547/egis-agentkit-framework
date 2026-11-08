@@ -10,7 +10,7 @@ import pytest
 from egis_agentkit.packages import PackageLoader, package_digest
 
 
-def release(root, version, *, body=None, reference="test.report"):
+def release(root, version, *, body=None, reference="test.report", api_version=1):
     folder = root / version
     folder.mkdir(parents=True)
     (folder / "manifest.json").write_text(
@@ -19,7 +19,7 @@ def release(root, version, *, body=None, reference="test.report"):
                 "assembly_ref": reference,
                 "version": version,
                 "entrypoint": "package:register",
-                "framework_api_version": 1,
+                "framework_api_version": api_version,
             }
         )
     )
@@ -131,18 +131,20 @@ async def test_manifest_requirement_and_return_contract_are_checked(tmp_path):
 @pytest.mark.asyncio
 async def test_business_demo_native_tool_writes_versioned_work_and_artifact(tmp_path):
     from agentscope.tool import ToolBase, ToolChunk
+    from agentscope.workspace import WorkspaceBase
+
+    from egis_agentkit.packages import AssemblyContext
 
     root = (
         Path(__file__).resolve().parents[3]
         / "demo/agentscope-demo/agentkit_demo/releases"
     )
     loader = PackageLoader([root])
-    scope = SimpleNamespace(
+    scope = AssemblyContext(
         user_id="alice",
         agent_id="agent-a",
         session_id="session-a",
-        definition={},
-        snapshot={},
+        project_id="project-a",
         workdir=tmp_path / "work",
         artifacts_dir=tmp_path / "artifacts",
     )
@@ -168,7 +170,7 @@ async def test_business_demo_native_tool_writes_versioned_work_and_artifact(tmp_
     await newtool(title="New review", findings=["Current"])
     assert "Package version: 1.1.0" in (scope.artifacts_dir / "report.md").read_text()
     assert tool.version == "1.0.0"
-    middlewares = await old.middlewares_factory(scope, None)
+    middlewares = await old.middlewares_factory(scope, WorkspaceBase())
     assert len(middlewares) == 1
     assert "1.0.0" in await middlewares[0].on_system_prompt(None, "System")
 

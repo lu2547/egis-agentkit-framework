@@ -1,14 +1,24 @@
+from agentscope.middleware import MiddlewareBase
+from agentscope.tool import ToolBase
+from agentscope.workspace import WorkspaceBase
+
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.extensions.compatibility.execution import execution_scope
+from egis_agentkit.extensions.compatibility.execution import (
+    ExecutionScope,
+    execution_scope,
+)
+from egis_agentkit.extensions.compatibility.policy import (
+    team_prompt_middleware,
+    tool_access_middleware,
+)
 from egis_agentkit.extensions.middleware import (
     FileChangesMiddleware,
     SkillBindingMiddleware,
-    TeamPromptMiddleware,
-    ToolAccessMiddleware,
     UserPreferenceMiddleware,
     WorkspacePromptMiddleware,
 )
 from egis_agentkit.extensions.skill.loader import LiveSkillLoader
+from egis_agentkit.packages import Assembly, AssemblyContext
 from egis_agentkit.service.access.authorization import PermissionService
 from egis_agentkit.service.user.memory import MemoryService
 from egis_agentkit.service.user.preferences import PreferenceService
@@ -18,7 +28,7 @@ from egis_agentkit.service.workspace.changes import FileChangeService
 _UNSET = object()
 
 
-def _scope(user_id, agent_id, session_id):
+def _scope(user_id: str, agent_id: str, session_id: str) -> ExecutionScope:
     scope = execution_scope.get()
     if scope is None or (scope.user_id, scope.agent_id, scope.session_id) != (
         user_id,
@@ -29,7 +39,9 @@ def _scope(user_id, agent_id, session_id):
     return scope
 
 
-def _assembly(scope):
+def _assembly(
+    scope: ExecutionScope,
+) -> Assembly[AssemblyContext | ExecutionScope] | None:
     if scope.assembly is not None:
         return scope.assembly
     if not scope.definition["payload"].get("implementation"):
@@ -40,14 +52,14 @@ def _assembly(scope):
 class BoundToolFactory:
     """Native three-ID callback; use only the assembly pinned in the scope."""
 
-    async def __call__(self, user_id, agent_id, session_id):
+    async def __call__(
+        self, user_id: str, agent_id: str, session_id: str
+    ) -> list[ToolBase]:
         scope = _scope(user_id, agent_id, session_id)
         assembly = _assembly(scope)
-        return (
-            await assembly.tools_factory(scope)
-            if assembly and assembly.tools_factory
-            else []
-        )
+        if assembly is None or assembly.tools_factory is None:
+            return []
+        return await assembly.tools_factory(scope.assembly_context)
 
 
 class SessionMiddlewareFactory:
@@ -69,11 +81,15 @@ class SessionMiddlewareFactory:
         self.file_changes, self.memory = file_changes, memory
         self.resources, self.config = resources, config_provider
 
-    async def __call__(self, user_id, agent_id, session_id, workspace):
+    async def __call__(
+        self, user_id: str, agent_id: str, session_id: str, workspace: WorkspaceBase
+    ) -> list[MiddlewareBase]:
         scope = _scope(user_id, agent_id, session_id)
         assembly = _assembly(scope)
         user = await self.users.get(user_id)
-        policies = self.config.snapshot.policies if self.config else None
+        policies = getattr(scope, "policies", _UNSET)
+        if policies is _UNSET:
+            policies = self.config.snapshot.policies if self.config else None
         personal = scope.definition["agent_type"] == "personal"
         preferences = await self.preferences.read(user) if personal else {}
         skills = (
@@ -81,23 +97,24 @@ class SessionMiddlewareFactory:
             if self.resources is not None
             else None
         )
-        result = [
+        result: list[MiddlewareBase] = [
             FileChangesMiddleware(self.file_changes, scope),
-            ToolAccessMiddleware(
-                user,
-                scope,
-                permissions=PermissionService(self.storage, policies),
-                skills=skills,
+            tool_access_middleware(
+                user, scope, PermissionService(self.storage, policies), skills
             ),
-            SkillBindingMiddleware(skills),
+            SkillBindingMiddleware(
+                skills, bind_state=skills.bind_state if skills is not None else None
+            ),
             WorkspacePromptMiddleware(scope),
-            TeamPromptMiddleware(scope),
+            team_prompt_middleware(scope),
             UserPreferenceMiddleware("\n\n".join(preferences.values())),
         ]
         if personal and self.memory is not None:
             result.append(await self.memory.for_user(user))
-        if assembly and assembly.middlewares_factory:
-            result.extend(await assembly.middlewares_factory(scope, workspace))
+        if assembly is not None and assembly.middlewares_factory is not None:
+            result.extend(
+                await assembly.middlewares_factory(scope.assembly_context, workspace)
+            )
         return result
 
 
@@ -132,7 +149,8 @@ class AgentFactories:
         if memory is _UNSET:
             memory = (
                 MemoryService(storage, workspace_root, config_provider)
-                if config_provider and config_provider.snapshot.runtime.memory.is_enabled
+                if config_provider
+                and config_provider.snapshot.runtime.memory.is_enabled
                 else None
             )
         self.tool_factory = BoundToolFactory()
