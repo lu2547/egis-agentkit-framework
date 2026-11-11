@@ -5,17 +5,19 @@ from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import Read
 from test_domain import expert, identities
 
-from egis_agentkit.extensions.middleware.policy import EnterprisePolicyMiddleware
-from egis_agentkit.services import AgentService
-from egis_agentkit.extensions.compatibility.execution import ExecutionCoordinator, execution_scope
-from egis_agentkit.service.session.service import TaskService
+from egis_agentkit.extension._tool_access_callback import tool_access_middleware
+from egis_agentkit.extension._workspace_prompt_middleware_impl import WorkspacePromptMiddleware
+from egis_agentkit.service.access._permission import PermissionService
+from egis_agentkit.service.agent._expert_definition import ExpertDefinition
+from egis_agentkit.extension._session_lock_override import ExecutionCoordinator, execution_scope
+from egis_agentkit.service._session import SessionService
 
 
 @pytest.mark.asyncio
 async def test_uploaded_pdf_is_named_by_its_readable_project_path(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
-    source = await AgentService(storage).save(alice, expert())
-    tasks = TaskService(storage, tmp_path)
+    source = await ExpertDefinition(storage).build(alice, expert())
+    tasks = SessionService(storage, tmp_path)
     task = await tasks.create(alice, source["id"], "private")
     pdf = (
         Path(__file__).parents[2] / "egis-agentkit-frontend/tests/fixtures/preview.pdf"
@@ -23,9 +25,9 @@ async def test_uploaded_pdf_is_named_by_its_readable_project_path(storage, tmp_p
     target = tasks.files.write(
         alice.user_id, task["project_id"], "[初级] 第三期 文件.pdf", pdf, area="uploads"
     )
-    archive = tasks.files.write_user(
-        alice.user_id, "uploads/[初级] 第三期 文件.pdf", pdf
-    )
+    archive = tasks.files.user_root(alice.user_id) / "uploads" / "[初级] 第三期 文件.pdf"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(pdf)
     second = await tasks.create(
         alice, source["id"], "private", project_id=task["project_id"]
     )
@@ -43,8 +45,9 @@ async def test_uploaded_pdf_is_named_by_its_readable_project_path(storage, tmp_p
         alice.user_id, "other-project", "private.txt", b"private", area="uploads"
     )
     async with ExecutionCoordinator(storage, tmp_path).bind(second["session_id"]):
-        policy = EnterprisePolicyMiddleware(storage, alice, execution_scope.get())
-        prompt = await policy.on_system_prompt(None, "system")
+        scope = execution_scope.get()
+        policy = tool_access_middleware(alice, scope, PermissionService(storage))
+        prompt = await WorkspacePromptMiddleware(scope).on_system_prompt(None, "system")
         assert str(target) in prompt and "pages" in prompt
         assert (
             "上传资料直接位于根目录" in prompt

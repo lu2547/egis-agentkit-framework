@@ -1,5 +1,1 @@
-"""service resource entry points."""
-
-from .service import ResourceService
-
-__all__ = ['ResourceService']
+"""技能、连接器和工具各自的管理能力。"""

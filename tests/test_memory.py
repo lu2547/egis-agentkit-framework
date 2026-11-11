@@ -5,35 +5,54 @@ from types import SimpleNamespace
 import pytest
 from agentscope.middleware import ReMeMiddleware
 
-from egis_agentkit.config.snapshot import RuntimeConfig
-from egis_agentkit.extensions.agent.factory import AgentFactories
-from egis_agentkit.extensions.compatibility.execution import (
+from egis_agentkit.backend.nacos import AgentKitConfig
+from egis_agentkit.backend.nacos._settings import MemoryConfig
+from egis_agentkit.extension._session_lock_override import (
     ExecutionScope,
     execution_scope,
 )
+from egis_agentkit.service.agent._memory import MemoryService
+from egis_agentkit.extension._session_middlewares_callback import SessionMiddlewareFactory
 
 original = importlib.util.find_spec
 
 
-def runtime(**extra):
-    return RuntimeConfig.model_validate(
+def memory_snapshot(tmp_path, **memory):
+    return AgentKitConfig.model_validate(
         {
-            "config_version": 1,
-            "workspace_root": "/tmp/work",
-            "release_roots": [],
-            "auth": {
-                "mode": "demo",
-                "issuer": "test",
-                "audience": "test",
-                "algorithm": "HS256",
+            "revision": 1,
+            "agent": {"personal": {"memory": memory}},
+            "workspace": {
+                "runtime": {"root": str(tmp_path)},
+                "upload": {"max_bytes": 20_971_520},
             },
-            **extra,
+            "user": {
+                "identity": {
+                    "mode": "demo",
+                    "issuer": "test",
+                    "audience": "test",
+                    "algorithm": "HS256",
+                },
+            },
+            "model": {
+                "catalog": {
+                    "models": [
+                        {
+                            "key": "model",
+                            "display_name": "Offline",
+                            "model": "offline-test",
+                            "api_key_env": "MEMORY_TEST_MODEL_KEY",
+                        }
+                    ]
+                },
+                "selection": {"default_key": "model"},
+            },
         }
     )
 
 
 def test_memory_defaults_to_disabled():
-    assert runtime().memory.is_enabled is False
+    assert MemoryConfig().is_enabled is False
 
 
 def test_enabled_memory_rejects_missing_dependency(monkeypatch, tmp_path):
@@ -41,17 +60,15 @@ def test_enabled_memory_rejects_missing_dependency(monkeypatch, tmp_path):
         "importlib.util.find_spec",
         lambda name: None if name == "reme" else original(name),
     )
-    config = SimpleNamespace(
-        snapshot=SimpleNamespace(runtime=runtime(memory={"is_enabled": True}))
-    )
+    config = SimpleNamespace(snapshot=memory_snapshot(tmp_path, is_enabled=True))
     with pytest.raises(RuntimeError, match="reme-ai"):
-        AgentFactories(None, None, tmp_path, config_provider=config)
+        MemoryService(None, tmp_path, config)
 
 
 @pytest.mark.asyncio
 async def test_native_middleware_is_cached_per_user_and_closed(monkeypatch, tmp_path):
-    from egis_agentkit.service.user import memory as memory
-    from egis_agentkit.service.user.memory import MemoryService
+    from egis_agentkit.service.agent import _memory as memory
+    from egis_agentkit.service.agent._memory import MemoryService
 
     monkeypatch.setattr(memory.importlib.util, "find_spec", lambda name: object())
     calls = []
@@ -66,12 +83,14 @@ async def test_native_middleware_is_cached_per_user_and_closed(monkeypatch, tmp_
 
     monkeypatch.setattr(memory.ModelService, "resolve", resolve)
     monkeypatch.setattr(memory, "get_model", get_model)
-    service = MemoryService(None, tmp_path, object())
+    config = SimpleNamespace(snapshot=memory_snapshot(tmp_path, is_enabled=True, top_k=3))
+    service = MemoryService(None, tmp_path, config)
     alice = SimpleNamespace(user_id="alice")
     bob = SimpleNamespace(user_id="bob")
     one, same = await asyncio.gather(service.for_user(alice), service.for_user(alice))
     other = await service.for_user(bob)
     assert isinstance(one, ReMeMiddleware) and one is same and one is not other
+    assert one._parameters.top_k == 3
     assert one._workspace_dir == str(tmp_path / "user" / "alice" / "memory")
     assert other._workspace_dir == str(tmp_path / "user" / "bob" / "memory")
     assert calls == ["alice", "bob"]
@@ -87,14 +106,9 @@ async def test_native_middleware_is_cached_per_user_and_closed(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
-async def test_factory_adds_memory_only_for_personal(monkeypatch, tmp_path):
-    config = SimpleNamespace(snapshot=SimpleNamespace(runtime=runtime(), policies=None))
-    factory = AgentFactories(SimpleNamespace(engine=None), None, tmp_path, config_provider=config)
+async def test_factory_adds_memory_only_for_personal(tmp_path):
 
     class Users:
-        def __init__(self, storage):
-            pass
-
         async def get(self, user_id):
             return SimpleNamespace(user_id=user_id)
 
@@ -105,18 +119,18 @@ async def test_factory_adds_memory_only_for_personal(monkeypatch, tmp_path):
     async def preferences(user):
         return {}
 
-    monkeypatch.setattr(factory.middleware_factory, "users", Users(None))
-    monkeypatch.setattr(factory.preferences, "read", preferences)
-    factory.memory = Memory()
+    factory = SessionMiddlewareFactory(
+        None, users=Users(), personal=SimpleNamespace(read_documents=preferences),
+        file_changes=object(), memory=Memory(),
+    )
     marker = object()
     for kind, expected in [("personal", True), ("private", False)]:
         scope = ExecutionScope(
             user_id="alice",
             agent_id="a",
             session_id="s",
-            assembly=None,
             definition={"agent_type": kind, "payload": {}},
-            snapshot={"nodes": {}},
+            root_definition={},
             binding={"is_team": False},
             session_record=object(),
             workdir=tmp_path / ".work",
@@ -124,7 +138,7 @@ async def test_factory_adds_memory_only_for_personal(monkeypatch, tmp_path):
         )
         token = execution_scope.set(scope)
         try:
-            result = await factory.middlewares("alice", "a", "s", None)
+            result = await factory("alice", "a", "s", None)
             assert (marker in result) is expected
         finally:
             execution_scope.reset(token)
@@ -135,29 +149,8 @@ async def test_enabled_service_uses_native_model_and_starts_reme(
     storage, tmp_path, monkeypatch
 ):
     pytest.importorskip("reme")
-    from egis_agentkit.config.snapshot import ConfigSnapshot
-    from egis_agentkit.service.user.memory import MemoryService
-
     monkeypatch.setenv("MEMORY_TEST_MODEL_KEY", "unused-offline-key")
-    snapshot = ConfigSnapshot.model_validate(
-        {
-            "config_version": 1,
-            "runtime": runtime().model_dump(),
-            "models": {
-                "config_version": 1,
-                "default_key": "model",
-                "models": [
-                    {
-                        "key": "model",
-                        "display_name": "Offline",
-                        "model": "offline-test",
-                        "api_key_env": "MEMORY_TEST_MODEL_KEY",
-                    }
-                ],
-            },
-            "policies": {"config_version": 1},
-        }
-    )
+    snapshot = memory_snapshot(tmp_path, is_enabled=True)
     service = MemoryService(storage, tmp_path, SimpleNamespace(snapshot=snapshot))
     try:
         middleware = await service.for_user(SimpleNamespace(user_id="alice"))

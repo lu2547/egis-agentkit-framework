@@ -5,8 +5,8 @@ import pytest
 from agentscope.mcp import HttpMCPConfig, MCPClient
 from test_domain import identities
 
-from egis_agentkit.extensions.compatibility.execution import execution_scope
-from egis_agentkit.extensions.workspace.local import EgisLocalWorkspaceManager
+from egis_agentkit.extension._session_lock_override import execution_scope
+from egis_agentkit.extension._workspace_manager_impl import EgisLocalWorkspaceManager
 
 
 @pytest.mark.asyncio
@@ -23,11 +23,15 @@ async def test_native_workspace_connects_and_reuses_stateful_mcp_per_session(
         def __init__(self):
             self.storage = storage
 
-        async def mcps_for_refs(self, user, refs, authorization_scope=None):
+        async def mcps_for_refs(
+            self, user, refs, authorization_scope=None, *, skip_unavailable=False
+        ):
             return [
                 MCPClient(
                     name="demo",
-                    mcp_config=HttpMCPConfig(url="http://127.0.0.1:8766/mcp"),
+                    mcp_config=HttpMCPConfig(
+                        url=os.getenv("AGENTKIT_TEST_MCP_URL", "http://127.0.0.1:8766/mcp")
+                    ),
                     is_stateful=True,
                 )
             ]

@@ -1,0 +1,191 @@
+# Data ID: agentkit.yaml。部署前按当前 namespace 的生效配置核对以下示例值。
+# 环境变量字段保存部署密钥名；实际密钥由部署系统注入。
+agentkit:
+  revision: 1
+  agent:
+    catalog:
+      defaultPageSize: 50
+      maxPageSize: 100
+      candidateBatchSize: 50
+    personal:
+      documents:
+        templates:
+          agent: agent.md
+          soul: soul.md
+          user: user.md
+        maxBytes: 64000
+      memory:
+        isEnabled: false
+        topK: 5
+    remote:
+      request:
+        maxBytes: 1048576
+      callback:
+        publicBaseUrl: null
+        publicBaseUrlEnv: null
+        maxBytes: 1048576
+        maxClockSkewSeconds: 300
+        minSecretBytes: 32
+        pollSeconds: 1.0
+      timeout:
+        defaultSeconds: 60.0
+        maxSeconds: 300.0
+        cancelSeconds: 1.0
+        websocketCloseSeconds: 0.5
+        stopSeconds: 0.75
+      retry:
+        defaultRetries: 1
+        maxAttempts: 4
+        backoffSeconds: 0.1
+  team:
+    invite:
+      maxMembers: 16
+      maxRequestIdLength: 128
+    roster:
+      maxMembers: 20
+  skill:
+    archive:
+      maxBytes: 52428799
+      maxExpandedBytes: null
+    import:
+      leaseSeconds: 90.0
+      maxAttempts: 3
+      pollSeconds: 2.0
+      retryBackoffSeconds: 5.0
+      maxRetryDelaySeconds: 60.0
+      listLimit: 100
+  session:
+    permissions:
+      defaultMode: bypass
+      allowedModes:
+      - default
+      - accept_edits
+      - explore
+      - bypass
+    composer:
+      defaultPageSize: 10
+      maxPageSize: 10
+      candidateBatchSize: 50
+      maxQueryLength: 500
+      maxCursorLength: 2048
+    listing:
+      maxSessions: 200
+    naming:
+      defaultName: 新对话
+      maxLength: 80
+      createMaxLength: 200
+  connector:
+    oauth:
+      credentialKeyEnv: AGENTKIT_MCP_CREDENTIAL_KEY
+      redirectUri: null
+      redirectUriEnv: null
+      timeoutSeconds: 10.0
+      stateLifetimeSeconds: 600.0
+      refreshWindowSeconds: 15.0
+      tokenLifetimeSeconds: 3600
+      maxTokenLifetimeSeconds: 31536000
+  tool:
+    defaults:
+      registeredIds: null
+  access:
+    allowPrivateSelfUse: true
+    allowPersonalSelfUse: true
+  user:
+    identity:
+      mode: jwt
+      issuer: https://identity.example.com
+      audience: egis-agentkit
+      algorithm: RS256
+      jwksUrl: https://identity.example.com/.well-known/jwks.json
+      signingSecretEnv: AGENTKIT_JWT_SECRET
+      demoPasswordEnv: AGENTKIT_DEMO_PASSWORD
+      jwtLifetimeSeconds: 3600
+      jwtClockSkewSeconds: 10.0
+      jwtMaxTokenLength: 16384
+      jwtMinSigningSecretLength: 32
+      jwksCacheSeconds: 300
+      jwksTimeoutSeconds: 10.0
+      demoMinPasswordLength: 16
+  project:
+    defaults:
+      name: 默认项目
+      maxNameLength: 128
+  workspace:
+    changes:
+      defaultPageSize: 50
+      maxPageSize: 100
+    runtime:
+      root: /srv/agentkit/workspace
+      mode: local
+      sandbox: {}
+    upload:
+      maxBytes: 20971520
+    scan:
+      maxDepth: 32
+      maxEntries: 10000
+      maxPathBytes: 2048
+      maxTotalBytes: 209715200
+      readChunkBytes: 1048576
+    preview:
+      timeoutSeconds: 45.0
+      maxBytes: 20971520
+      maxConcurrent: 2
+      maxPending: 4
+    delivery:
+      maxEntries: 10000
+      maxTotalBytes: 209715200
+    download:
+      secretEnv: AGENTKIT_DOWNLOAD_SECRET
+      minSecretLength: 32
+  model:
+    catalog:
+      models:
+      - key: company
+        displayName: Company model
+        model: company-model
+        credentialType: openai_credential
+        modelClass: openai_chat
+        baseUrl: https://model.example.com/v1
+        apiKeyEnv: AGENTKIT_MODEL_API_KEY
+        parameters: {}
+    selection:
+      defaultKey: company
+      allowOverride: true
+      allowedKeys:
+      - company
+  backend:
+    postgres:
+      connection:
+        urlEnv: AGENTKIT_DATABASE_URL
+      pool:
+        size: 10
+        maxOverflow: 10
+    kafka:
+      connection:
+        deploymentMode: standalone
+        bootstrapServers:
+        - 127.0.0.1:9092
+        topicPrefix: egis-agentkit
+        consumerGroup: egis-agentkit-wakeup-v1
+      topics:
+        partitions: 8
+        replicationFactor: 1
+      transport:
+        bufferSize: 256
+        startupTimeoutSeconds: 45.0
+        pollTimeoutMilliseconds: 200
+        fullBufferBackoffSeconds: 0.05
+        retryBackoffSeconds: 0.5
+        expirySweepSeconds: 60.0
+        partitionFetchMaxBytes: 1048576
+        fetchMaxBytes: 4194304
+      broadcast:
+        inlineMaxBytes: 524288
+        maxBytes: 33554432
+        maxKeyBytes: 65536
+        payloadTtlSeconds: 3600
+        storageTimeoutSeconds: 30.0
+    nacos:
+      refresh:
+        intervalSeconds: 10.0
+        failureIntervalSeconds: 10.0

@@ -1,23 +1,25 @@
 import pytest
 from sqlalchemy.dialects.postgresql import insert
-from test_domain import expert, identities
+from test_domain import COMPANY, expert, identities
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.models import Asset, Grant, Group
-from egis_agentkit.services import AgentService, PermissionService, ShareService
-from egis_agentkit.service.access.snapshot import SnapshotService
+from egis_agentkit.service.access._permission import PermissionService
+from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.service.access._share import ShareService
+from egis_agentkit.service.agent._expert_definition import ExpertDefinition
 from egis_agentkit.storage import tables as t
+from egis_agentkit.storage.model import Asset, Grant, Group
 
 
 @pytest.mark.asyncio
 async def test_group_revocation_does_not_use_stale_turn_user(storage):
     users, admin, alice, _ = await identities(storage)
-    row = await AgentService(storage).save(admin, expert("sys", "system"))
+    row = await ExpertDefinition(storage).build(admin, expert("sys", "system"))
     await users.save_group(admin, Group(group_id="g", group_name="研发"))
     alice.group_ids = ["g"]
     await users.update_user(admin, alice)
     permissions = PermissionService(storage)
-    await permissions.grant(
+    await GrantService(storage).grant(
         admin,
         Grant(
             principal_type="group",
@@ -39,7 +41,7 @@ async def test_group_revocation_does_not_use_stale_turn_user(storage):
 @pytest.mark.asyncio
 async def test_unreviewed_binding_does_not_expand_shared_inherited_use(storage):
     _, admin, alice, bob = await identities(storage)
-    permissions, agents = PermissionService(storage), AgentService(storage)
+    permissions, agents = PermissionService(storage), ExpertDefinition(storage)
     async with storage.transaction() as conn:
         for name in ("a", "b"):
             asset = Asset(
@@ -55,7 +57,7 @@ async def test_unreviewed_binding_does_not_expand_shared_inherited_use(storage):
                 )
             )
     for name in ("a", "b"):
-        await permissions.grant(
+        await GrantService(storage).grant(
             admin,
             Grant(
                 principal_type="user",
@@ -76,14 +78,23 @@ async def test_unreviewed_binding_does_not_expand_shared_inherited_use(storage):
             "resource_view_type": "system",
         }
     ]
-    row = await agents.save(alice, value)
+    row = await agents.build(alice, value)
     shares = ShareService(storage)
-    review = await shares.submit(alice, "agent", row["id"])
+    review = await shares.submit(alice, "agent", row["id"], target=COMPANY)
     await shares.decide(admin, review["review_id"], True, "通过")
     value.id = row["id"]
     value.payload["bindings"][0]["resource_id"] = "b"
     await agents.save(alice, value)
-    assert (await permissions.explain(bob, "skill", "a", "system")).is_allowed
+    assert not (await permissions.explain(bob, "skill", "a", "system")).is_allowed
+    assert not (
+        await permissions.explain(
+            bob,
+            "skill",
+            "a",
+            "system",
+            agent_id=row["id"],
+        )
+    ).is_allowed
     assert not (await permissions.explain(bob, "skill", "b", "system")).is_allowed
 
 
@@ -104,7 +115,7 @@ async def test_private_binding_does_not_keep_revoked_external_permission(storage
             )
         )
     permissions = PermissionService(storage)
-    grant = await permissions.grant(
+    grant = await GrantService(storage).grant(
         admin,
         Grant(
             principal_type="user",
@@ -125,126 +136,48 @@ async def test_private_binding_does_not_keep_revoked_external_permission(storage
             "resource_view_type": "system",
         }
     ]
-    row = await AgentService(storage).save(alice, value)
-    snapshot = await SnapshotService(storage).capture(row["id"], "private")
-    await permissions.validate_snapshot(alice, snapshot)
-    await permissions.revoke(admin, grant["id"])
+    row = await ExpertDefinition(storage).build(alice, value)
+    snapshot = await storage.definitions.read_view(row["id"], "private")
+    await permissions.require_execution(alice, snapshot)
+    await GrantService(storage).revoke(admin, grant["id"])
     with pytest.raises(Forbidden):
-        await permissions.validate_snapshot(alice, snapshot)
-
-
-@pytest.mark.asyncio
-async def test_shared_team_members_keep_distinct_pinned_resource_versions(monkeypatch):
-    from egis_agentkit.service.access import snapshot as module
-
-    async def raw_view(self, identifier, view, *, conn=None):
-        return {
-            "id": identifier,
-            "definition_type": "agent",
-            "config_version": 1,
-            "payload": {"bindings": []},
-        }
-
-    from types import SimpleNamespace
-
-    monkeypatch.setattr(module.DefinitionViews, "raw_view", raw_view)
-    service = SnapshotService(SimpleNamespace(engine=None))
-
-    async def capture(identifier, view, *, conn=None):
-        version = {"first": "1.0.0", "second": "2.0.0"}[identifier]
-        root = f"agent:shared:{identifier}"
-        asset = f"skill:system:report:{version}"
-        return {
-            "root_key": root,
-            "nodes": {
-                root: {
-                    "resource_type": "agent",
-                    "resource_id": identifier,
-                    "resource_view_type": "shared",
-                    "data": {},
-                    "edges": [asset],
-                },
-                asset: {
-                    "resource_type": "skill",
-                    "resource_id": "report",
-                    "resource_view_type": "system",
-                    "data": {"resource_version": version},
-                    "edges": [],
-                },
-            },
-        }
-
-    monkeypatch.setattr(service, "capture", capture)
-    team = {
-        "definition_type": "team",
-        "id": "team",
-        "config_version": 1,
-        "payload": {
-            "orchestrator": {
-                "definition_id": "leader",
-                "resource_view_type": "private",
-            },
-            "members": [
-                {"definition_id": i, "resource_view_type": "shared"}
-                for i in ("first", "second")
-            ],
-        },
-    }
-    # Simulate existing frozen shared snapshots with the legacy keys currently generated by capture.
-    original_capture = capture
-
-    async def legacy_capture(*args, **kwargs):
-        sub = await original_capture(*args, **kwargs)
-        asset_key = next(k for k in sub["nodes"] if k.startswith("skill:"))
-        node = sub["nodes"].pop(asset_key)
-        legacy_key = "skill:system:report"
-        sub["nodes"][legacy_key] = node
-        sub["nodes"][sub["root_key"]]["edges"] = [legacy_key]
-        return sub
-
-    monkeypatch.setattr(service, "capture", legacy_capture)
-    snapshot = {"nodes": {}, "source_versions": {}}
-    await service._visit(team, "private", snapshot, set(), object())
-    for identifier, version in [("first", "1.0.0"), ("second", "2.0.0")]:
-        edge = snapshot["nodes"][f"agent:shared:{identifier}"]["edges"][0]
-        assert snapshot["nodes"][edge]["data"]["resource_version"] == version
+        await permissions.require_execution(alice, snapshot)
 
 
 @pytest.mark.asyncio
 async def test_team_capture_retains_both_versions_from_real_approved_experts(storage):
-    from egis_agentkit.service.team.definition import TeamService
+    from egis_agentkit.service.team._definition import TeamDefinition
 
     _, admin, alice, bob = await identities(storage)
-    async with storage.transaction() as conn:
-        for version in ("1.0.0", "2.0.0"):
-            asset = Asset(
-                resource_type="skill",
-                resource_id="report",
-                resource_version=version,
-                owner_type="system",
-                owner_id="sys",
-            )
+    permissions = PermissionService(storage)
+    agents, shares = ExpertDefinition(storage), ShareService(storage)
+    members = []
+    for name, version in [("first", "1.0.0"), ("second", "2.0.0")]:
+        asset = Asset(
+            resource_type="skill",
+            resource_id="report",
+            resource_version=version,
+            owner_type="system",
+            owner_id="sys",
+        )
+        async with storage.transaction() as conn:
             await conn.execute(
                 insert(t.assets).values(
                     **asset.model_dump(), created_by="admin", updated_by="admin"
                 )
             )
-    permissions = PermissionService(storage)
-    await permissions.grant(
-        admin,
-        Grant(
-            principal_type="user",
-            principal_id="alice",
-            resource_type="skill",
-            resource_id="report",
-            resource_view_type="system",
-            resource_owner_type="system",
-            resource_owner_id="sys",
-        ),
-    )
-    agents, shares = AgentService(storage), ShareService(storage)
-    members = []
-    for name, version in [("first", "1.0.0"), ("second", "2.0.0")]:
+        await GrantService(storage).grant(
+            admin,
+            Grant(
+                principal_type="user",
+                principal_id="alice",
+                resource_type="skill",
+                resource_id="report",
+                resource_view_type="system",
+                resource_owner_type="system",
+                resource_owner_id="sys",
+            ),
+        )
         value = expert(name=name)
         value.payload["bindings"] = [
             {
@@ -254,11 +187,11 @@ async def test_team_capture_retains_both_versions_from_real_approved_experts(sto
                 "resource_view_type": "system",
             }
         ]
-        saved = await agents.save(alice, value)
-        review = await shares.submit(alice, "agent", saved["id"])
+        saved = await agents.build(alice, value)
+        review = await shares.submit(alice, "agent", saved["id"], target=COMPANY)
         await shares.decide(admin, review["review_id"], True, "approved")
         members.append({"definition_id": saved["id"], "resource_view_type": "shared"})
-    team = await TeamService(storage).save(
+    team = await TeamDefinition(storage).save(
         alice,
         {
             "team_name": "testteam",
@@ -270,52 +203,18 @@ async def test_team_capture_retains_both_versions_from_real_approved_experts(sto
             "members": members,
         },
     )
-    review = await shares.submit(alice, "team", team["id"])
+    review = await shares.submit(alice, "team", team["id"], target=COMPANY)
     await shares.decide(admin, review["review_id"], True, "approved")
-    snapshot = await SnapshotService(storage).capture(team["id"], "shared")
-    for member, version in zip(members, ("1.0.0", "2.0.0")):
-        key = "agent:shared:" + member["definition_id"]
-        edge = snapshot["nodes"][key]["edges"][0]
-        assert snapshot["nodes"][edge]["data"]["resource_version"] == version
-    await permissions.validate_snapshot(bob, snapshot)
-
-
-@pytest.mark.asyncio
-async def test_asset_merge_rejects_different_content_for_same_version(storage):
-    from egis_agentkit.errors import Conflict
-    from egis_agentkit.service.access.snapshot import node_key
-
-    _, admin, _, _ = await identities(storage)
-    asset = Asset(
-        resource_type="skill",
-        resource_id="report",
-        resource_version="1.0.0",
-        owner_type="system",
-        owner_id="sys",
-        checksum_sha256="a" * 64,
+    decision = await permissions.require(bob, "team", team["id"], "shared")
+    snapshot = await storage.definitions.read_view(
+        team["id"],
+        "shared",
+        version=decision.resource_version,
+        **decision.source_options,
     )
-    async with storage.transaction() as conn:
-        await conn.execute(
-            insert(t.assets).values(
-                **asset.model_dump(), created_by="admin", updated_by="admin"
-            )
-        )
-    value = expert("sys", "system")
-    value.payload["bindings"] = [
-        {
-            "resource_type": "skill",
-            "resource_id": "report",
-            "resource_version": "1.0.0",
-            "resource_view_type": "system",
-        }
-    ]
-    row = await AgentService(storage).save(admin, value)
-    async with storage.engine.connect() as conn:
-        snapshot = await SnapshotService(storage).capture(
-            row["id"], "system", conn=conn
-        )
-        key = node_key("skill", "report", "system", "1.0.0")
-        snapshot["nodes"][key]["data"]["checksum_sha256"] = "b" * 64
-        del snapshot["nodes"][snapshot["root_key"]]
-        with pytest.raises(Conflict):
-            await SnapshotService(storage)._visit(row, "system", snapshot, set(), conn)
+    from egis_agentkit.service.team._definition import team_member_definitions
+
+    definitions = await team_member_definitions(storage, snapshot)
+    for member, version in zip(members, ("1.0.0", "2.0.0")):
+        assert definitions[member["definition_id"]]["payload"]["bindings"][0]["resource_version"] == version
+    await permissions.require_execution(bob, snapshot)

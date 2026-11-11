@@ -2,7 +2,12 @@ import httpx
 import pytest
 import yaml
 
-from egis_agentkit.config import NacosBootstrap, NacosClient, NacosConfigProvider, NacosError
+from egis_agentkit.backend.nacos import (
+    NacosBootstrap,
+    NacosClient,
+    NacosConfigProvider,
+    NacosError,
+)
 
 
 @pytest.mark.asyncio
@@ -25,39 +30,43 @@ async def test_real_v33_config_query_envelope_extracts_content_and_rejects_neste
         assert await client.get_config("real.yaml") == "config_version: 1"
         body["data"]["success"] = False
         body["data"]["errorCode"] = 20004
-        with pytest.raises(NacosError):
+        with pytest.raises(NacosError) as exc:
             await client.get_config("real.yaml")
+        assert exc.value.operation_code == 20004
 
 
-def documents(version=1):
+def documents(revision=1):
     return {
-        "agentkit-runtime.yaml": {
-            "config_version": version,
-            "workspace_root": "/tmp/work",
-            "release_roots": ["/tmp/releases"],
-            "auth": {
-                "mode": "demo",
-                "issuer": "egis",
-                "audience": "agentkit",
-                "algorithm": "HS256",
-            },
-        },
-        "agentkit-models.yaml": {
-            "config_version": version,
-            "default_key": "company",
-            "models": [
-                {
-                    "key": "company",
-                    "display_name": "Company",
-                    "model": "demo",
-                    "api_key_env": "COMPANY_API_KEY",
-                }
-            ],
-        },
-        "agentkit-policies.yaml": {
-            "config_version": version,
-            "allow_private_self_use": True,
-        },
+        "agentkit.yaml": {
+            "agentkit": {
+                "revision": revision,
+                "workspace": {
+                    "runtime": {"root": "/tmp/work"},
+                    "upload": {"maxBytes": 20_971_520},
+                },
+                "user": {
+                    "identity": {
+                        "mode": "demo",
+                        "issuer": "egis",
+                        "audience": "agentkit",
+                        "algorithm": "HS256",
+                    }
+                },
+                "model": {
+                    "selection": {"defaultKey": "company"},
+                    "catalog": {
+                        "models": [
+                            {
+                                "key": "company",
+                                "displayName": "Company",
+                                "model": "demo",
+                                "apiKeyEnv": "COMPANY_API_KEY",
+                            }
+                        ]
+                    },
+                },
+            }
+        }
     }
 
 
@@ -106,8 +115,58 @@ async def test_client_rejects_cross_origin_paths_and_scrubs_server_errors():
 
 
 @pytest.mark.asyncio
-async def test_snapshot_refresh_atomic_invalid_or_mixed_version_keeps_last_valid():
+async def test_snapshot_reads_one_document_and_updates_typed_hot_settings():
     docs = documents()
+    requests = []
+
+    def handle(req):
+        data_id = req.url.params["dataId"]
+        requests.append(data_id)
+        return httpx.Response(
+            200,
+            json={"code": 0, "data": yaml.safe_dump(docs[data_id])},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        provider = NacosConfigProvider(
+            NacosClient(NacosBootstrap(server_url="http://registry"), http_client=http)
+        )
+        with pytest.raises(RuntimeError):
+            _ = provider.snapshot
+        first = await provider.refresh()
+        assert first.revision == 1 and first.model.catalog.models[0].key == "company"
+        docs.update(documents(2))
+        current = docs["agentkit.yaml"]["agentkit"]
+        current["model"]["selection"]["defaultKey"] = "missing"
+        with pytest.raises(NacosError, match=r"agentkit\.model\.selection\.defaultKey"):
+            await provider.refresh()
+        assert provider.snapshot == first
+        docs.update(documents(2))
+        docs["agentkit.yaml"]["agentkit"]["workspace"]["upload"]["maxBytes"] = 40
+        second = await provider.refresh()
+        assert second.revision == 2
+        assert second.workspace.upload.max_bytes == 40
+        assert first.workspace.upload.max_bytes == 20_971_520
+        docs.update(documents(3))
+        docs["agentkit.yaml"]["agentkit"]["workspace"]["runtime"]["root"] = "/different"
+        with pytest.raises(NacosError, match="restart"):
+            await provider.refresh()
+        assert provider.restart_required is True
+        assert provider.snapshot == second
+    assert requests == ["agentkit.yaml"] * 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [None, "4096", True])
+async def test_first_refresh_rejects_missing_or_invalid_key_without_exposing_value(
+    value,
+):
+    docs = documents()
+    upload = docs["agentkit.yaml"]["agentkit"]["workspace"]["upload"]
+    if value is None:
+        del upload["maxBytes"]
+    else:
+        upload["maxBytes"] = value
 
     def handle(req):
         return httpx.Response(
@@ -119,29 +178,14 @@ async def test_snapshot_refresh_atomic_invalid_or_mixed_version_keeps_last_valid
         provider = NacosConfigProvider(
             NacosClient(NacosBootstrap(server_url="http://registry"), http_client=http)
         )
+        with pytest.raises(
+            NacosError, match=r"agentkit\.workspace\.upload\.maxBytes"
+        ) as exc:
+            await provider.refresh()
+        assert "4096" not in str(exc.value)
+        assert not provider.is_connected
         with pytest.raises(RuntimeError):
             _ = provider.snapshot
-        first = await provider.refresh()
-        assert first.config_version == 1 and first.models.models[0].key == "company"
-        docs["agentkit-models.yaml"]["config_version"] = 2
-        with pytest.raises(NacosError):
-            await provider.refresh()
-        assert provider.snapshot == first
-        docs.update(documents(2))
-        docs["agentkit-models.yaml"]["default_key"] = "missing"
-        with pytest.raises(NacosError):
-            await provider.refresh()
-        assert provider.snapshot == first
-        docs.update(documents(2))
-        second = await provider.refresh()
-        assert second.config_version == 2
-        assert first.config_version == 1
-        docs.update(documents(3))
-        docs["agentkit-runtime.yaml"]["workspace_root"] = "/different"
-        with pytest.raises(NacosError):
-            await provider.refresh()
-        assert provider.restart_required is True
-        assert provider.snapshot == second
 
 
 @pytest.mark.asyncio
@@ -159,9 +203,9 @@ async def test_snapshot_consumers_cannot_mutate_shared_provider_state():
             NacosClient(NacosBootstrap(server_url="http://registry"), http_client=http)
         )
         snapshot = await provider.refresh()
-        snapshot.models.models.clear()
-        assert provider.snapshot.models.default_key == "company"
-        assert len(provider.snapshot.models.models) == 1
+        snapshot.model.catalog.models.clear()
+        assert provider.snapshot.model.selection.default_key == "company"
+        assert len(provider.snapshot.model.catalog.models) == 1
 
 
 @pytest.mark.asyncio
@@ -179,7 +223,7 @@ async def test_config_batch_rejects_changed_content_without_new_version():
             NacosClient(NacosBootstrap(server_url="http://registry"), http_client=http)
         )
         first = await provider.refresh()
-        docs["agentkit-policies.yaml"]["allow_private_self_use"] = False
+        docs["agentkit.yaml"]["agentkit"]["access"] = {"allowPrivateSelfUse": False}
         with pytest.raises(NacosError):
             await provider.refresh()
         assert provider.snapshot == first
@@ -251,12 +295,62 @@ async def test_config_poller_refreshes_and_shutdown_stops_further_fetches():
         provider = NacosConfigProvider(
             NacosClient(NacosBootstrap(server_url="http://registry"), http_client=http)
         )
-        await provider.start(interval=0.005)
+        docs["agentkit.yaml"]["agentkit"]["backend"] = {
+            "nacos": {"refresh": {"intervalSeconds": 0.005}}
+        }
+        await provider.start()
         docs.update(documents(2))
         async with asyncio.timeout(1):
-            while provider.snapshot.config_version != 2:
+            while provider.snapshot.revision != 2:
                 await asyncio.sleep(0.005)
         await provider.close()
         stopped = fetched
         await asyncio.sleep(0.02)
         assert fetched == stopped
+
+
+@pytest.mark.asyncio
+async def test_unregistered_platform_default_keeps_last_valid_snapshot():
+    docs = documents()
+
+    def handle(req):
+        return httpx.Response(
+            200,
+            json={"code": 0, "data": yaml.safe_dump(docs[req.url.params["dataId"]])},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        provider = NacosConfigProvider(
+            NacosClient(NacosBootstrap(server_url="http://registry"), http_client=http)
+        )
+        first = await provider.refresh()
+        provider.bind_platform_tool_ids({"Read", "Write"})
+        docs.update(documents(2))
+        docs["agentkit.yaml"]["agentkit"]["tool"] = {
+            "defaults": {"registeredIds": ["UnknownTool"]}
+        }
+        with pytest.raises(
+            NacosError, match=r"agentkit\.tool\.defaults\.registeredIds"
+        ):
+            await provider.refresh()
+        assert provider.snapshot == first
+        assert provider.last_error is not None
+
+
+def test_yaml_rejects_duplicate_agentkit_root():
+    from egis_agentkit.backend.nacos import load_agentkit_config
+
+    content = yaml.safe_dump(documents()["agentkit.yaml"])
+    with pytest.raises(NacosError, match="duplicate"):
+        load_agentkit_config(content + content)
+
+
+def test_checked_in_agentkit_example_validates():
+    from pathlib import Path
+
+    from egis_agentkit.backend.nacos import load_agentkit_config
+
+    example = Path(__file__).resolve().parents[1] / "examples/nacos/agentkit.yaml"
+    settings = load_agentkit_config(example.read_text())
+    assert settings.workspace.upload.max_bytes == 20_971_520
+    assert settings.model.selection.default_key == "company"

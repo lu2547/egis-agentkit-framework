@@ -19,12 +19,12 @@ workspace/user/<user_id>/projects/<project_id>/
 ## 表与接口
 
 - `ak_projects`：`id`、`owner_id`、`project_name`、`status_type`、`is_default` 和审计字段；每个用户至多一个默认项目。
-- `ak_project_sessions`：`session_id`、`project_id`；同一项目可关联独立专家、个人助理或专家团的多个原生会话。
-- 文件变更、指纹、扫描基线和扫描错误表按 `project_id` 保存。
+- `sessions.project_id` 从该会话的 AgentKit 状态绑定生成，并按项目和会话所有者索引。同一项目可以包含独立专家、个人助理和专家团的多个原生会话。
+- `ak_workspace_file_fingerprints` 保存文件指纹，`ak_workspace_file_changes` 保存变更历史，均按 `project_id` 关联。扫描基线和扫描错误保存在项目记录中。
 
 `/manager/projects` 提供列表、新建；`/manager/projects/<id>` 提供详情、重命名、删除。所有操作检查项目所有权。
 
-`/manager/projects/<id>/files`、`file`、`preview`、`deliver`、`file-changes` 提供文件与预览接口。保留 `/manager/tasks/<sid>/...` 作为同一项目能力的兼容入口。文件 DTO 的 `area=uploads` 表示项目根目录中的资料，**不是物理 uploads 目录**；`work` 对应 `.work`，`artifacts` 对应交付目录。路径始终相对于 area，禁止绝对路径、上跳和符号链接。上传同名文件不会覆盖已有文件。
+`/manager/projects/<id>/files`、`file`、`preview`、`deliver`、`file-changes` 提供文件与预览接口。`area=uploads` 对应项目根目录，`area=work` 对应 `.work`，`area=artifacts` 对应交付目录。路径始终相对于 area，禁止绝对路径、上跳和符号链接。上传同名文件默认返回 409。显式提交 `overwrite=true` 可以覆盖。
 
 ## 交付
 
@@ -43,26 +43,16 @@ flowchart TD
   H --> I[删除项目及关联行]
 ```
 
-运行、上传、读取与预览持有项目共享锁；项目删除需要独占锁。正在运行或操作中的项目返回 409，防止部分删除。删除失败保留 `deleting` 状态供重试，晚到的扫描不会重建目录。删除其他项目、旧用户归档目录不受影响。
+运行、上传、读取与预览持有项目共享锁。项目删除需要独占锁。正在运行或操作中的项目返回 409，防止部分删除。删除失败保留 `deleting` 状态供重试，晚到的扫描不会重建目录。
 
-## 旧数据迁移
-
-显式 `migrate` 命令将四张文件观察表的作用域列从 `session_id` 改为 `project_id`，并新增项目表。部署前停止旧实例，避免同时使用两套表结构。
-
-旧版受管 Session 首次读取或列出项目时归入用户的默认项目，旧 `uploads/<sid>`、`work/<sid>`、`artifacts/<sid>` 合并到新目录；同名不同内容加确定性后缀，不覆盖。文件映射日志在删除源文件前 fsync，支持中断重试；对应历史记录的路径同步调整。项目关联及文件历史先提交，再更新原生 Session 配置；失败后可修复剩余步骤。用户旧归档目录中的直接文件不会被擅自移动。
-
-
-## 回复卡片与项目产物（2026-11-06）
+## 回复卡片与项目产物
 
 右侧产物面板列项目 artifacts 全量；消息下的卡片只列该会话该次回复新增或修改的交付，通过 `ak_reply_artifacts(project_id, session_id, reply_id, path, digest)` 持久关联。`GET /manager/tasks/<sid>/artifacts` 返回 reply_id，前端按原生消息 ID 归组，不能把项目全量挂到最新回复末尾。历史文件没有可靠 reply_id 时只出现在项目面板，不猜测归属。
 
-单次 Write/Edit/Bash 使用项目文件锁并比较前后指纹，交付本次改变的正式文件，过程脚本不自动交付。锁不包住模型调用或团队唤醒。查询项目产物会核对数据库已确认的旧会话归属，对后续误写回旧 artifacts/<sid> 的交付做可重试对账；不扫描未知用户目录或备份。
-
+单次 Write/Edit/Bash 使用项目文件锁并比较前后指纹，交付本次改变的正式文件，过程脚本不自动交付。锁不包住模型调用或团队唤醒。
 
 ## 工作空间删除
 
 项目文件和自建子目录可通过文件行悬停删除按钮删除；目录删除需确认递归删除。项目根目录、`.work` 和 `artifacts` 根目录保留，后端拒绝删除，不仅隐藏前端按钮。文件操作仍使用项目归属校验和不跟随符号链接的目录描述符访问。
 
 删除产物后，既有文件变更记录中的删除时间用于阻止自动发现把未变化的 `.work` 副本重新复制回来；后来修改/重新生成或显式交付的文件仍可成为产物。删除 session 不删除项目文件。
-
-本次仅进行类型、语法与静态检查，按用户要求未运行测试。

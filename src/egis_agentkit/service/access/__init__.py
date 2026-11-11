@@ -1,6 +1,1 @@
-"""service access entry points."""
-
-from .authorization import PermissionService
-from .sharing import ShareService
-
-__all__ = ['PermissionService', 'ShareService']
+"""资源权限、授权来源和共享审核。"""

@@ -1,25 +1,69 @@
+import asyncio
+from contextlib import asynccontextmanager
+
 import httpx
 import pytest
 from egis_agentkit_app.bootstrap import build_app
 from test_domain import identities
 
-from egis_agentkit.config import ConfigSnapshot, NacosBootstrap, NacosClient
-from egis_agentkit.extensions.agent.factory import (
-    BoundToolFactory,
+from egis_agentkit.backend.nacos import AgentKitConfig, NacosBootstrap, NacosClient
+from egis_agentkit.errors import Forbidden
+from egis_agentkit.extension._agent_tools_callback import BoundToolFactory
+from egis_agentkit.extension._session_middlewares_callback import (
     SessionMiddlewareFactory,
 )
-from egis_agentkit.extensions.compatibility.storage import ExecutionStorage
+from egis_agentkit.extension._session_storage_override import ExecutionStorage
 
 
 class Config:
     def __init__(self, snapshot):
         self.snapshot, self.is_connected, self.restart_required = snapshot, True, False
+        self.last_error = None
 
     async def start(self):
         pass
 
     async def close(self):
         pass
+
+
+def app_snapshot(tmp_path, **domains):
+    return AgentKitConfig.model_validate(
+        {
+            "revision": 1,
+            "backend": {"postgres": {"connection": {"url_env": "TEST_DB_URL"}}},
+            "workspace": {
+                "runtime": {"root": str(tmp_path)},
+                "upload": {"max_bytes": 20_971_520},
+                "download": {"secret_env": "TEST_DOWNLOAD"},
+            },
+            "user": {
+                "identity": {
+                    "mode": "demo",
+                    "issuer": "test",
+                    "audience": "test",
+                    "algorithm": "HS256",
+                    "signing_secret_env": "TEST_JWT",
+                    "demo_password_env": "TEST_LOGIN",
+                }
+            },
+            "model": {
+                "selection": {"default_key": "test"},
+                "catalog": {
+                    "models": [
+                        {
+                            "key": "test",
+                            "display_name": "测试模型",
+                            "model": "test",
+                            "api_key_env": "TEST_MODEL_KEY",
+                            "model_class": "openai_chat",
+                        }
+                    ]
+                },
+            },
+            **domains,
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -34,42 +78,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
     monkeypatch.setenv("TEST_JWT", "jwt-secret-with-more-than-thirty-two-bytes")
     monkeypatch.setenv("TEST_LOGIN", "a-test-password-with-enough-entropy")
     monkeypatch.setenv("TEST_MODEL_KEY", "test-only-unused-model-key")
-    config = Config(
-        ConfigSnapshot.model_validate(
-            {
-                "config_version": 1,
-                "runtime": {
-                    "config_version": 1,
-                    "database_url_env": "TEST_DB_URL",
-                    "download_secret_env": "TEST_DOWNLOAD",
-                    "workspace_root": str(tmp_path),
-                    "release_roots": [str(tmp_path / "releases")],
-                    "auth": {
-                        "mode": "demo",
-                        "issuer": "test",
-                        "audience": "test",
-                        "algorithm": "HS256",
-                        "signing_secret_env": "TEST_JWT",
-                        "demo_password_env": "TEST_LOGIN",
-                    },
-                },
-                "models": {
-                    "config_version": 1,
-                    "default_key": "test",
-                    "models": [
-                        {
-                            "key": "test",
-                            "display_name": "测试模型",
-                            "model": "test",
-                            "api_key_env": "TEST_MODEL_KEY",
-                            "model_class": "openai_chat",
-                        }
-                    ],
-                },
-                "policies": {"config_version": 1},
-            }
-        )
-    )
+    config = Config(app_snapshot(tmp_path))
     nacos = NacosClient(
         NacosBootstrap(server_url="http://unused.test"),
         http_client=httpx.AsyncClient(
@@ -78,18 +87,18 @@ async def test_http_identity_native_write_seal_and_real_task_files(
     )
     app = await build_app(config, nacos, engine=storage.engine)
     services = app.state.egis_services
-    assert services.tasks.projects is services.projects
+    assert services.sessions.projects is services.projects
     assert app.state.egis_bus.coordinator.projects is services.projects
     assert isinstance(app.state.storage, ExecutionStorage)
-    assert app.state.storage is not services.tasks.storage
-    assert app.state.storage.engine is services.tasks.storage.engine is storage.engine
-    assert app.state.egis_bus.coordinator.storage is services.tasks.storage
-    assert services.agents.packages is services.packages
+    assert app.state.storage is not services.sessions.storage
+    assert app.state.storage.engine is services.sessions.storage.engine is storage.engine
+    assert app.state.egis_bus.coordinator.storage is services.sessions.storage
+    assert services.resources.tool_registry is not None
     assert isinstance(app.state.extra_agent_tools, BoundToolFactory)
     factory = app.state.extra_agent_middlewares
     assert isinstance(factory, SessionMiddlewareFactory)
     assert factory.users is services.users
-    assert factory.preferences is services.preferences
+    assert factory.personal is services.personal_definition
     assert factory.file_changes is services.workspace.file_changes
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
@@ -125,7 +134,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             assert (
                 await client.post("/agent/", json={"name": "bypass"})
             ).status_code == 403
-            # A retired/missing assembly can fail after HTTP accepted the turn.
+            # A session setup failure can occur after HTTP accepted the turn.
             # The native setup handler must still publish a terminal reply.
             admin_login = await client.post(
                 "/auth/login",
@@ -140,17 +149,27 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             controlled = await client.post(
                 "/manager/agents",
                 json={
-                    "agent_name": "retired",
-                    "agent_display_name": "已撤下装配",
-                    "payload": {
-                        "implementation": {
-                            "assembly_ref": "not-registered",
-                            "assembly_version": "1.0.0",
-                        }
-                    },
+                    "agent_name": "controlled",
+                    "agent_display_name": "受控专家",
+                    "payload": {},
                 },
             )
             assert controlled.status_code == 201
+            identifier = controlled.json()["id"]
+            catalog = (await client.get("/manager/agents")).json()
+            assert set(catalog) == {"items", "next_cursor"}
+            assert [item["id"] for item in catalog["items"]] == [identifier]
+            page = await client.get(
+                "/manager/agents", params={"type": "expert", "limit": 1}
+            )
+            assert page.status_code == 200
+            assert [item["id"] for item in page.json()["items"]] == [identifier]
+            assert page.json()["next_cursor"] is None
+            personal = (await client.get("/manager/assistant")).json()
+            assert personal["agent_type"] == "personal"
+            assert (
+                await client.get(f"/manager/agents/{personal['id']}")
+            ).status_code == 404
             pending = await client.post(
                 "/manager/tasks",
                 json={
@@ -160,6 +179,18 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             )
             assert pending.status_code == 201
             failed_task = pending.json()
+            coordinator = app.state.egis_bus.coordinator
+            bind = coordinator.bind
+            failing_sessions = {failed_task["session_id"]}
+
+            @asynccontextmanager
+            async def bind_for_test(session_id):
+                if session_id in failing_sessions:
+                    raise Forbidden("会话初始化失败")
+                async with bind(session_id) as scope:
+                    yield scope
+
+            monkeypatch.setattr(coordinator, "bind", bind_for_test)
             triggered = await client.post(
                 "/chat/",
                 json={
@@ -173,8 +204,6 @@ async def test_http_identity_native_write_seal_and_real_task_files(
                 },
             )
             assert triggered.status_code == 200
-            import asyncio
-
             from agentscope.app.message_bus import MessageBusKeys
 
             terminal = None
@@ -196,7 +225,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             team_response = await client.post(
                 "/manager/teams",
                 json={
-                    "team_name": "retired_team",
+                    "team_name": "controlled_team",
                     "team_display_name": "故障通知验收",
                     "orchestrator_config": {
                         "agent_name": "coordinator",
@@ -207,12 +236,13 @@ async def test_http_identity_native_write_seal_and_real_task_files(
                         {
                             "definition_id": controlled.json()["id"],
                             "resource_view_type": "private",
+                            "resource_version": controlled.json()["resource_version"],
                         }
                     ],
                 },
             )
             assert team_response.status_code == 201, team_response.text
-            team_task = await app.state.egis_services.tasks.create(
+            team_task = await app.state.egis_services.sessions.create(
                 admin, team_response.json()["id"], "private"
             )
             native_session = await storage.read_session_unscoped(
@@ -220,6 +250,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             )
             native_team = await storage.get_team(admin.user_id, native_session.team_id)
             worker = native_team.data.members[0]
+            failing_sessions.add(worker.session_id)
             wakeups = []
             queue_push = app.state.egis_bus.queue_push
 
@@ -237,7 +268,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             notification = await app.state.egis_bus.queue_drain(
                 MessageBusKeys.inbox(team_task["session_id"])
             )
-            assert notification and "retired" in str(notification)
+            assert notification and "controlled" in str(notification)
             assert wakeups, "native worker setup failure must wake its leader"
             client.headers["Authorization"] = "Bearer " + login.json()["access_token"]
             assert (
@@ -265,7 +296,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             initial_config = config.snapshot
             config.snapshot = config.snapshot.model_copy(
                 update={
-                    "policies": config.snapshot.policies.model_copy(
+                    "access": config.snapshot.access.model_copy(
                         update={"allow_private_self_use": False}
                     )
                 }
@@ -281,22 +312,48 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             assert (
                 await client.get(f"/sessions/{sid}/messages", params={"agent_id": aid})
             ).status_code == 200
+            project_id = task.json()["project_id"]
+            project_files = f"/manager/projects/{project_id}/files"
             upload = await client.post(
-                f"/manager/tasks/{sid}/files",
+                project_files,
                 files={"file": ("report.md", b"# Real artifact\n")},
             )
             assert upload.status_code == 201, upload.text
             assert upload.json()["area"] == "uploads"
+            duplicate = await client.post(
+                project_files, files={"file": ("report.md", b"# replacement\n")}
+            )
+            assert duplicate.status_code == 409
+            assert duplicate.json()["code"] == "upload_name_conflict"
+            file_url = f"/manager/projects/{project_id}/file"
+            file_query = {"area": "uploads", "path": "report.md"}
+            assert (
+                await client.get(file_url, params=file_query)
+            ).content == b"# Real artifact\n"
+            replaced = await client.post(
+                project_files,
+                params={"overwrite": "true"},
+                files={"file": ("report.md", b"# replacement\n")},
+            )
+            assert replaced.status_code == 201
+            assert replaced.json()["path"] == "report.md"
+            assert (
+                await client.get(file_url, params=file_query)
+            ).content == b"# replacement\n"
             app.state.egis_services.workspace.files.write(
-                alice.user_id, task.json()["project_id"], "report.md", b"# Real artifact\n"
+                alice.user_id,
+                task.json()["project_id"],
+                "report.md",
+                b"# Real artifact\n",
             )
             assert (
                 await client.post(
-                    f"/manager/tasks/{sid}/deliver", json={"path": "report.md"}
+                    f"/manager/projects/{project_id}/deliver",
+                    json={"path": "report.md"},
                 )
             ).status_code == 201
             artifact = await client.get(
-                f"/manager/tasks/{sid}/file",
+                f"/manager/projects/{project_id}/file",
                 params={"area": "artifacts", "path": "report.md"},
             )
             assert artifact.content == b"# Real artifact\n"
@@ -318,32 +375,21 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             preview = Preview()
             app.state.egis_services.workspace.preview = preview
             office = await client.post(
-                f"/manager/tasks/{sid}/files",
+                project_files,
                 files={"file": ("测试 幻灯片.pptx", b"office fixture")},
             )
             assert office.status_code == 201
             rendered = await client.get(
-                f"/manager/tasks/{sid}/preview",
+                f"/manager/projects/{project_id}/preview",
                 params={"area": "uploads", "path": office.json()["path"]},
             )
             assert rendered.status_code == 200 and rendered.content.startswith(b"%PDF-")
             assert rendered.headers["content-type"].startswith("application/pdf")
-            workspace_office = await client.post(
-                "/manager/workspace/files",
-                files={"file": ("测试 幻灯片.pptx", b"office fixture")},
-            )
-            assert workspace_office.status_code == 201
-            assert (
-                await client.get(
-                    "/manager/workspace/preview",
-                    params={"path": workspace_office.json()["path"]},
-                )
-            ).status_code == 200
-            assert preview.calls == 2
+            assert preview.calls == 1
 
             assert (
                 await client.get(
-                    f"/manager/tasks/{sid}/file",
+                    f"/manager/projects/{project_id}/file",
                     params={"area": "work", "path": "../../../../etc/passwd"},
                 )
             ).status_code == 403
@@ -357,16 +403,16 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             client.headers["Authorization"] = "Bearer " + other.json()["access_token"]
             assert (
                 await client.get(
-                    f"/manager/tasks/{sid}/preview",
+                    f"/manager/projects/{project_id}/preview",
                     params={"area": "uploads", "path": office.json()["path"]},
                 )
-            ).status_code == 403
-            assert preview.calls == 2
+            ).status_code == 404
+            assert preview.calls == 1
 
             assert (
                 await client.get(
-                    f"/manager/tasks/{sid}/file",
+                    f"/manager/projects/{project_id}/file",
                     params={"area": "work", "path": "report.md"},
                 )
-            ).status_code == 403
+            ).status_code == 404
     await nacos.http.aclose()

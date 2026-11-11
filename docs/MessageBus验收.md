@@ -1,11 +1,11 @@
 # EgisMessageBus 实现与验收
 
-实现目录：`src/egis_agentkit/message_bus/`。继承原生 `agentscope.app.message_bus.MessageBus`，实现全部抽象方法；业务 key 直接使用原生 `MessageBusKeys`。未改动原生 Dispatcher、ChatService、AgentLoop 或原生进程内 `ChatRunRegistry`。
+实现目录为 `src/egis_agentkit/extensions/message_bus/`。继承原生 `agentscope.app.message_bus.MessageBus`，实现全部抽象方法，业务 key 直接使用原生 `MessageBusKeys`。Dispatcher、ChatService、AgentLoop 和进程内 `ChatRunRegistry` 继续由 AgentScope 提供。
 
 ## 接入与生命周期
 
 ```python
-from egis_agentkit.message_bus import EgisMessageBus
+from egis_agentkit.extensions.message_bus import EgisMessageBus
 
 bus = EgisMessageBus(
     deployment_mode="cluster",             # 默认 standalone

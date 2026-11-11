@@ -2,20 +2,23 @@
 
 2026-11-03，按 `egis-agentkit-app/docs/V1执行计划.md` Task 3 实施。仅修改 framework `config/`、`hubs/`、Nacos 测试及 demo `hub_cases/`，没有修改 AgentScope 源码、App、领域 Storage/Services 或前端。
 
-## 接入接口
+当前 App 使用 [单份 agentkit.yaml](配置管理.md)。以下原始 Hub 验收内容保留为 2026-11-03 记录。
+
+## 当前配置接入
 
 ```python
-from egis_agentkit.config import (
-    NacosBootstrap, NacosClient, NacosConfigProvider, NacosError,
-    RuntimeConfig, AuthConfig, ModelsConfig, ModelSpec, PoliciesConfig,
-    ConfigSnapshot,
+from egis_agentkit.backend.nacos import (
+    AgentKitConfig,
+    NacosBootstrap,
+    NacosClient,
+    NacosConfigProvider,
+    NacosError,
 )
-from egis_agentkit.hubs import NacosSkillHub, NacosMCPHub, NacosHubManagement
 ```
 
-`NacosBootstrap` 仅接收 `server_url`、可选 `console_url`、`namespace_id`、`group`、`identity_key`、`identity_value`、`access_token`。敏感值为 `SecretStr`。客户端公共 `request(method,path,params/data/json/files)` 保留 httpx Response；只允许同源 Nacos v3 路径，不跟随重定向，不透传上游错误原文、密钥或网络异常内容。`get_config(data_id)` 读取 Client API；`publish_config(data_id,content,config_type='yaml')` 调用管理 API。`close()` 只关闭自身创建的 HTTP 客户端。
+`NacosConfigProvider.refresh()` 读取 `agentkit.yaml`，校验根键、类型、版本、默认模型及模型白名单引用，再替换内存快照。首次无可用配置时拒绝启动。断线、非法配置和需要重启的组件变化均保留上一份有效快照。重启项置 `restart_required=True`，`last_error` 提供脱敏诊断。轮询间隔由 `agentkit.backend.nacos.refresh` 提供。`close()` 取消轮询，HTTP 客户端由生命周期持有者关闭。
 
-`NacosConfigProvider.refresh()` 读取 `agentkit-runtime.yaml`、`agentkit-models.yaml`、`agentkit-policies.yaml`，先完整校验类型、统一 `config_version`、默认模型/模型白名单引用，再一次替换快照。`.snapshot` 和 refresh 返回深拷贝，业务消费者不能修改共享快照内部列表/字典。首次配置缺失不就绪；断线、非法配置、版本不齐时抛错并保留最后有效配置。固定组件 RuntimeConfig 变化时保留旧快照并设置 `.restart_required=True`；不假称活动 DB/Workspace 已热切换。`.is_connected` 表示最近一次完整刷新成功；`start(interval=10)` 首次拉取后轮询，`close()` 取消轮询，不关闭共享 client。不提供本地业务配置降级。
+## 历史 Hub 验收
 
 `NacosSkillHub` 和 `NacosMCPHub` 继承当前本地 AgentScope 原生 HubBase。默认 hub_id 为 `nacos-skills`/`nacos-mcps`。构造参数 `authorize` 是可选 async `(user_id,resource_type,resource_id,operation)->bool`；未提供时默认拒绝。资源类型为 `skill`/`mcp`，操作为 `list`/`get`/`download`。列表逐条过滤，详情和下载在上游请求前检查，猜 ID 不能绕过。`is_skill_market_visible` 仅为元数据，不产生 USE 授权。
 

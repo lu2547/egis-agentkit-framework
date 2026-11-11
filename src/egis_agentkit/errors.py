@@ -6,6 +6,13 @@ class AgentKitError(Exception):
         self.status_code = status_code
 
 
+class InvalidRequest(AgentKitError, ValueError):
+    """输入不符合当前业务限制。"""
+
+    def __init__(self, message: str):
+        super().__init__(message, 422)
+
+
 class Forbidden(AgentKitError):
     def __init__(self, message: str = "无权执行此操作"):
         super().__init__(message, 403)
@@ -19,3 +26,8 @@ class NotFound(AgentKitError):
 class Conflict(AgentKitError):
     def __init__(self, message: str = "配置已经变化，请刷新后重试"):
         super().__init__(message, 409)
+
+
+class UploadNameConflict(Conflict):
+    def __init__(self):
+        super().__init__("同名文件已存在。")

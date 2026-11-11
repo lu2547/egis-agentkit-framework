@@ -9,28 +9,37 @@ from agentscope.message import Msg
 from agentscope.permission import PermissionBehavior, PermissionDecision, PermissionMode
 from agentscope.tool import Read, Toolkit
 from agentscope.workspace import WorkspaceBase
+from test_app_http import app_snapshot
 from test_domain import expert, identities
 
-from egis_agentkit.config.snapshot import PoliciesConfig
+from egis_agentkit.backend.nacos._settings import AccessConfig
 from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.extensions.agent.factory import AgentFactories
-from egis_agentkit.extensions.compatibility.execution import ExecutionCoordinator
-from egis_agentkit.extensions.compatibility.policy import (
+from egis_agentkit.extension import ToolAccessMiddleware
+from egis_agentkit.extension._session_lock_override import ExecutionCoordinator
+from egis_agentkit.extension._session_middlewares_callback import (
+    SessionMiddlewareFactory,
+)
+from egis_agentkit.extension._tool_access_callback import (
     team_prompt_middleware,
     tool_access_middleware,
 )
-from egis_agentkit.extensions.middleware import ToolAccessMiddleware
-from egis_agentkit.service.access.authorization import PermissionService
-from egis_agentkit.service.session.service import TaskService
-from egis_agentkit.services import AgentService
+from egis_agentkit.service.access._permission import PermissionService
+from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.service._session import SessionService
+from egis_agentkit.service._user import UserService
+from egis_agentkit.service.agent._expert_definition import ExpertDefinition
+from egis_agentkit.service.agent._personal_definition import PersonalDefinition
+from egis_agentkit.service.team._collaboration import TeamCollaborationService
+from egis_agentkit.service.team._definition import TeamDefinition
+from egis_agentkit.service.workspace._changes import FileChangeService
 
 
 async def setup_task(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
-    agents = AgentService(storage)
-    personal = await agents.personal(alice)
-    writer = await agents.save(alice, expert())
-    tasks = TaskService(storage, tmp_path)
+    agents = ExpertDefinition(storage)
+    personal = await PersonalDefinition(storage).build(alice)
+    writer = await agents.build(alice, expert())
+    tasks = SessionService(storage, tmp_path)
     task = await tasks.create(
         alice, personal["id"], "private", permission_mode=PermissionMode.BYPASS
     )
@@ -38,25 +47,31 @@ async def setup_task(storage, tmp_path):
 
 
 def ref(writer):
-    return {"definition_id": writer["id"], "resource_view_type": "private"}
+    return {
+        "definition_id": writer["id"],
+        "resource_view_type": "private",
+        "resource_version": writer["resource_version"],
+    }
 
 
 @pytest.mark.asyncio
 async def test_middleware_keeps_the_policy_of_the_locked_run(storage, tmp_path):
     alice, _, _, task = await setup_task(storage, tmp_path)
-    current = PoliciesConfig(config_version=1)
-    config = SimpleNamespace(snapshot=SimpleNamespace(policies=current))
-    factory = AgentFactories(
-        storage, None, tmp_path, config_provider=config, memory=None
-    ).middleware_factory
+    config = SimpleNamespace(snapshot=app_snapshot(tmp_path))
+    factory = SessionMiddlewareFactory(
+        storage,
+        users=UserService(storage),
+        personal=PersonalDefinition(storage, workspace_root=tmp_path),
+        file_changes=FileChangeService(storage, tmp_path),
+    )
 
     async def native_allow(**kwargs):
         return PermissionDecision(PermissionBehavior.ALLOW, "native")
 
     async with ExecutionCoordinator(storage, tmp_path, config).bind(task["session_id"]):
-        config.snapshot = SimpleNamespace(policies=PoliciesConfig(
-            config_version=2, allow_personal_self_use=False,
-        ))
+        config.snapshot = app_snapshot(
+            tmp_path, access=AccessConfig(allow_personal_self_use=False)
+        )
         middlewares = await factory(
             alice.user_id, task["agent_id"], task["session_id"], WorkspaceBase()
         )
@@ -73,11 +88,11 @@ async def test_stage_explicit_invitation_keeps_parent_and_is_idempotent(
 ):
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     async with InMemoryMessageBus() as bus:
-        result = await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "request-1", [ref(writer)]
+        result = await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "request-1", [ref(writer)]
         )
-        again = await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "request-1", [ref(writer)]
+        again = await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "request-1", [ref(writer)]
         )
         assert result == again
         assert result["session_id"] == task["session_id"]
@@ -92,13 +107,13 @@ async def test_stage_explicit_invitation_keeps_parent_and_is_idempotent(
             await storage.get_session("alice", task["agent_id"], task["session_id"])
         ).team_id is None
         with pytest.raises(Conflict):
-            await tasks.collaboration.stage(
-                alice, task["session_id"], bus, "request-1", []
+            await TeamCollaborationService.stage_collaborators(
+                tasks, alice, task["session_id"], bus, "request-1", []
             )
         await bus.try_lock(MessageBusKeys.session_lock(task["session_id"]))
         with pytest.raises(Conflict):
-            await tasks.collaboration.stage(
-                alice, task["session_id"], bus, "request-2", [ref(writer)]
+            await TeamCollaborationService.stage_collaborators(
+                tasks, alice, task["session_id"], bus, "request-2", [ref(writer)]
             )
 
 
@@ -109,8 +124,8 @@ async def test_expert_cannot_lead_collaboration(storage, tmp_path):
     assert task["collaboration_allowed"] is False
     async with InMemoryMessageBus() as bus:
         with pytest.raises(Forbidden, match="个人"):
-            await tasks.collaboration.stage(
-                alice, task["session_id"], bus, "request-1", [ref(writer)]
+            await TeamCollaborationService.stage_collaborators(
+                tasks, alice, task["session_id"], bus, "request-1", [ref(writer)]
             )
 
 
@@ -118,13 +133,13 @@ async def test_expert_cannot_lead_collaboration(storage, tmp_path):
 async def test_pending_invitation_runs_on_user_input_with_bound_native_worker(
     storage, tmp_path
 ):
-    from egis_agentkit.extensions.compatibility.collaboration import apply_invitations
-    from egis_agentkit.service.team.collaboration import validate_collaborators
+    from egis_agentkit.extension._team_invite_callback import apply_invitations
+    from egis_agentkit.service.team._collaboration import validate_collaborators
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     async with InMemoryMessageBus() as bus:
-        await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "request-1", [ref(writer)]
+        await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "request-1", [ref(writer)]
         )
         async with ExecutionCoordinator(storage, tmp_path).bind(
             task["session_id"]
@@ -169,7 +184,9 @@ async def test_pending_invitation_runs_on_user_input_with_bound_native_worker(
             assert borrowed.state.permission_context.mode == PermissionMode.DEFAULT
             binding = borrowed.state.middle_context["egis_agentkit"]
             assert binding["is_initialized"]
-            assert binding["snapshot"]["root"]["agent_name"] == writer["agent_name"]
+            assert "snapshot" not in binding
+            assert binding["definition_id"] == writer["id"]
+            assert binding["resource_version"] == "1"
             assert binding["collaboration_parent_session_id"] == task["session_id"]
             async with ExecutionCoordinator(storage, tmp_path).bind(
                 member.session_id
@@ -193,8 +210,8 @@ async def test_pending_invitation_runs_on_user_input_with_bound_native_worker(
                 PermissionService(storage), alice, state.middle_context["egis_agentkit"]
             )
             await bus.queue_drain(MessageBusKeys.inbox(member.session_id))
-        await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "request-2", [ref(writer)]
+        await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "request-2", [ref(writer)]
         )
         async with ExecutionCoordinator(storage, tmp_path).bind(
             task["session_id"]
@@ -236,15 +253,15 @@ async def test_pending_invitation_runs_on_user_input_with_bound_native_worker(
 async def test_revoked_pending_or_joined_collaborator_blocks_parent_execution(
     storage, tmp_path
 ):
-    from egis_agentkit.extensions.compatibility.collaboration import apply_invitations
-    from egis_agentkit.models import Grant
+    from egis_agentkit.extension._team_invite_callback import apply_invitations
+    from egis_agentkit.storage.model import Grant
 
     users, admin, alice, _ = await identities(storage)
-    agents = AgentService(storage)
-    personal = await agents.personal(alice)
-    writer = await agents.save(admin, expert("egis-demo", "system"))
+    agents = ExpertDefinition(storage)
+    personal = await PersonalDefinition(storage).build(alice)
+    writer = await agents.build(admin, expert("egis-demo", "system"))
     permissions = PermissionService(storage)
-    grant = await permissions.grant(
+    grant = await GrantService(storage).grant(
         admin,
         Grant(
             principal_type="user",
@@ -256,10 +273,11 @@ async def test_revoked_pending_or_joined_collaborator_blocks_parent_execution(
             resource_owner_id="egis-demo",
         ),
     )
-    tasks = TaskService(storage, tmp_path)
+    tasks = SessionService(storage, tmp_path)
     task = await tasks.create(alice, personal["id"], "private")
     async with InMemoryMessageBus() as bus:
-        await tasks.collaboration.stage(
+        await TeamCollaborationService.stage_collaborators(
+            tasks,
             alice,
             task["session_id"],
             bus,
@@ -269,7 +287,7 @@ async def test_revoked_pending_or_joined_collaborator_blocks_parent_execution(
         async with ExecutionCoordinator(storage, tmp_path).bind(
             task["session_id"]
         ) as scope:
-            await permissions.revoke(admin, grant["id"])
+            await GrantService(storage).revoke(admin, grant["id"])
             native = TeamCreate(
                 storage,
                 bus,
@@ -295,17 +313,22 @@ async def test_revoked_pending_or_joined_collaborator_blocks_parent_execution(
         with pytest.raises(Forbidden):
             async with ExecutionCoordinator(storage, tmp_path).bind(task["session_id"]):
                 pytest.fail("revoked collaborator must stop execution")
-        assert len(await permissions.list_grants(admin)) == 1
+        direct = [
+            row
+            for row in await GrantService(storage).list_grants(admin)
+            if row["grant_source_type"] != "owner"
+        ]
+        assert [row["id"] for row in direct] == [grant["id"]]
         metadata = await tasks.get(alice, task["session_id"])
         assert metadata["collaborators"][0]["status"] == "pending"
-        cleared = await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "clear", []
+        cleared = await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "clear", []
         )
         assert cleared["collaborators"] == []
 
 
 @pytest.mark.asyncio
-async def test_native_worker_keeps_snapshot_and_permission_gate_blocks_roster_tools(
+async def test_native_worker_keeps_its_version_and_permission_gate_blocks_roster_tools(
     storage, tmp_path
 ):
     from agentscope.app._tool._team_say import TeamSay
@@ -313,9 +336,14 @@ async def test_native_worker_keeps_snapshot_and_permission_gate_blocks_roster_to
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     async with InMemoryMessageBus() as bus:
-        await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "one", [ref(writer)]
+        await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "one", [ref(writer)]
         )
+        changed = expert()
+        changed.id = writer["id"]
+        changed.config_version = writer["config_version"]
+        changed.payload["system_prompt"] = "新版"
+        await ExpertDefinition(storage).save(alice, changed)
         async with ExecutionCoordinator(storage, tmp_path).bind(
             task["session_id"]
         ) as scope:
@@ -340,7 +368,9 @@ async def test_native_worker_keeps_snapshot_and_permission_gate_blocks_roster_to
                 ]
             )
             agent = SimpleNamespace(toolkit=toolkit, state=scope.session_record.state)
-            middleware = tool_access_middleware(alice, scope, PermissionService(storage))
+            middleware = tool_access_middleware(
+                alice, scope, PermissionService(storage)
+            )
             team_prompt = team_prompt_middleware(scope)
 
             async def downstream(**kwargs):
@@ -381,11 +411,6 @@ async def test_native_worker_keeps_snapshot_and_permission_gate_blocks_roster_to
                 f"{writer['agent_name']}@{member.agent_id[:8]}"
                 in await team_prompt.on_system_prompt(agent, "system")
             )
-        changed = expert()
-        changed.id = writer["id"]
-        changed.config_version = writer["config_version"]
-        changed.payload["system_prompt"] = "新版"
-        await AgentService(storage).save(alice, changed)
         async with ExecutionCoordinator(storage, tmp_path).bind(
             member.session_id
         ) as scope:
@@ -411,7 +436,9 @@ async def test_collaboration_http_contract_stages_without_native_execution(
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     app = FastAPI()
     app.include_router(router, prefix="/manager")
-    app.state.egis_services = SimpleNamespace(tasks=tasks)
+    app.state.egis_services = SimpleNamespace(
+        sessions=tasks, teams=TeamDefinition(tasks.storage)
+    )
     app.dependency_overrides[current_user] = lambda: alice
 
     @app.exception_handler(AgentKitError)
@@ -448,7 +475,7 @@ async def test_collaboration_http_contract_stages_without_native_execution(
 async def test_invitation_delivery_failure_cleans_allocations_and_retries_same_request(
     storage, tmp_path
 ):
-    from egis_agentkit.extensions.compatibility.collaboration import apply_invitations
+    from egis_agentkit.extension._team_invite_callback import apply_invitations
 
     class FailedDeliveryBus(InMemoryMessageBus):
         fail = True
@@ -463,8 +490,8 @@ async def test_invitation_delivery_failure_cleans_allocations_and_retries_same_r
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     async with FailedDeliveryBus() as bus:
-        await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "one", [ref(writer)]
+        await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "one", [ref(writer)]
         )
         async with ExecutionCoordinator(storage, tmp_path).bind(
             task["session_id"]
@@ -499,12 +526,10 @@ async def test_invitation_delivery_failure_cleans_allocations_and_retries_same_r
             assert not await bus.queue_drain(
                 MessageBusKeys.inbox(bus.failed_session_id)
             )
-            from sqlalchemy import text
-
-            async with storage.engine.connect() as conn:
-                assert (
-                    await conn.execute(text("SELECT count(*) FROM ak_project_sessions"))
-                ).scalar_one() == 1
+            assert {
+                row.id
+                for row in await storage.sessions.in_project("alice", task["project_id"])
+            } == {task["session_id"]}
             await apply_invitations(
                 alice,
                 scope,
@@ -516,6 +541,10 @@ async def test_invitation_delivery_failure_cleans_allocations_and_retries_same_r
             team = await storage.get_team("alice", scope.session_record.team_id)
             joined = team.data.members[0]
             assert len(team.data.members) == 1
+            assert {
+                row.id
+                for row in await storage.sessions.in_project("alice", task["project_id"])
+            } == {task["session_id"], joined.session_id}
             assert (
                 len(await bus.queue_drain(MessageBusKeys.inbox(joined.session_id))) == 1
             )
@@ -527,7 +556,7 @@ async def test_parent_cancel_finishes_native_invite_checkpoint_without_duplicate
 ):
     import asyncio
 
-    from egis_agentkit.extensions.compatibility.collaboration import apply_invitations
+    from egis_agentkit.extension._team_invite_callback import apply_invitations
 
     class PausedWakeBus(InMemoryMessageBus):
         def __init__(self):
@@ -542,8 +571,8 @@ async def test_parent_cancel_finishes_native_invite_checkpoint_without_duplicate
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     async with PausedWakeBus() as bus:
-        await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "one", [ref(writer)]
+        await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "one", [ref(writer)]
         )
         async with ExecutionCoordinator(storage, tmp_path).bind(
             task["session_id"]
@@ -593,27 +622,27 @@ async def test_parent_cancel_finishes_native_invite_checkpoint_without_duplicate
 async def test_replacing_or_clearing_prepared_request_never_invites_removed_experts(
     storage, tmp_path
 ):
-    from egis_agentkit.extensions.compatibility.collaboration import apply_invitations
+    from egis_agentkit.extension._team_invite_callback import apply_invitations
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
-    reviewer = await AgentService(storage).save(alice, expert(name="reviewer"))
+    reviewer = await ExpertDefinition(storage).build(alice, expert(name="reviewer"))
     async with InMemoryMessageBus() as bus:
-        await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "one", [ref(writer)]
+        await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "one", [ref(writer)]
         )
-        replaced = await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "two", [ref(reviewer)]
+        replaced = await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "two", [ref(reviewer)]
         )
         assert [m["definition_id"] for m in replaced["collaborators"]] == [
             reviewer["id"]
         ]
-        cleared = await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "three", []
+        cleared = await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "three", []
         )
         assert cleared["collaborators"] == []
         # Retrying a superseded request must not reintroduce its roster.
-        retried = await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "one", [ref(writer)]
+        retried = await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "one", [ref(writer)]
         )
         assert retried["collaborators"] == []
         async with ExecutionCoordinator(storage, tmp_path).bind(
@@ -646,7 +675,7 @@ async def test_replacing_or_clearing_prepared_request_never_invites_removed_expe
 async def test_failed_native_team_creation_removes_only_new_team_and_retries(
     storage, tmp_path, monkeypatch
 ):
-    from egis_agentkit.extensions.compatibility.collaboration import apply_invitations
+    from egis_agentkit.extension._team_invite_callback import apply_invitations
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     original = storage.set_session_team_id
@@ -660,8 +689,8 @@ async def test_failed_native_team_creation_removes_only_new_team_and_retries(
         return await original(user_id, session_id, team_id)
 
     async with InMemoryMessageBus() as bus:
-        await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "one", [ref(writer)]
+        await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "one", [ref(writer)]
         )
         monkeypatch.setattr(storage, "set_session_team_id", fail_first_binding)
         async with ExecutionCoordinator(storage, tmp_path).bind(
@@ -704,12 +733,12 @@ async def test_recovery_delivers_task_when_native_membership_committed_before_in
     storage, tmp_path
 ):
     """Native membership alone cannot prove the initial task reached its inbox."""
-    from egis_agentkit.extensions.compatibility.collaboration import apply_invitations
+    from egis_agentkit.extension._team_invite_callback import apply_invitations
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     async with InMemoryMessageBus() as bus:
-        await tasks.collaboration.stage(
-            alice, task["session_id"], bus, "one", [ref(writer)]
+        await TeamCollaborationService.stage_collaborators(
+            tasks, alice, task["session_id"], bus, "one", [ref(writer)]
         )
         async with ExecutionCoordinator(storage, tmp_path).bind(
             task["session_id"]

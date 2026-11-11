@@ -1,5 +1,1 @@
-"""service workspace entry points."""
-
-from .files import WorkspaceFiles
-
-__all__ = ['WorkspaceFiles']
+"""工作区文件、变更与预览能力。"""

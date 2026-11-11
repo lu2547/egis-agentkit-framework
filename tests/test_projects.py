@@ -4,14 +4,14 @@ import asyncio
 
 import pytest
 from agentscope.app.message_bus import InMemoryMessageBus, MessageBusKeys
-from sqlalchemy import delete, insert, select
+from sqlalchemy import func, select, text, update
 from test_domain import expert, identities
 
 from egis_agentkit.errors import Conflict, NotFound
-from egis_agentkit.services import AgentService
-from egis_agentkit.service.workspace.changes import FileChangeService
-from egis_agentkit.service.project.service import ProjectService
-from egis_agentkit.service.session.service import TaskService
+from egis_agentkit.service._project import ProjectService
+from egis_agentkit.service._session import SessionService
+from egis_agentkit.service.agent._expert_definition import ExpertDefinition
+from egis_agentkit.service.workspace._changes import FileChangeService
 from egis_agentkit.storage import tables as t
 
 
@@ -83,10 +83,10 @@ async def test_chats_share_project_root_and_other_projects_remain_isolated(
     storage, tmp_path
 ):
     _, _, alice, bob = await identities(storage)
-    source = await AgentService(storage).save(alice, expert())
-    bob_source = await AgentService(storage).save(bob, expert("bob"))
+    source = await ExpertDefinition(storage).build(alice, expert())
+    bob_source = await ExpertDefinition(storage).build(bob, expert("bob"))
     projects = ProjectService(storage, tmp_path)
-    tasks = TaskService(storage, tmp_path)
+    tasks = SessionService(storage, tmp_path)
     project = await projects.create(alice, "Shared")
     separate = await projects.create(alice, "Separate")
     first = await tasks.create(alice, source["id"], "private", project_id=project["id"])
@@ -109,6 +109,19 @@ async def test_chats_share_project_root_and_other_projects_remain_isolated(
         native = await tasks.session(alice, task["session_id"])
         assert native.config.workspace_id == project["id"]
         assert native.config.cwd == str(expected_root / ".work")
+        assert native.agent_id == task["agent_id"] != source["id"]
+        assert (
+            native.state.middle_context["egis_agentkit"]["definition_id"]
+            == source["id"]
+        )
+    async with storage.engine.connect() as conn:
+        assert dict(
+            (await conn.execute(text("SELECT id, project_id FROM sessions"))).all()
+        ) == {
+            first["session_id"]: project["id"],
+            second["session_id"]: project["id"],
+            other["session_id"]: separate["id"],
+        }
     for area in ("uploads", "work", "artifacts"):
         tasks.files.write(
             "alice", first["project_id"], "shared.txt", b"shared", area=area
@@ -131,9 +144,9 @@ async def test_project_delete_removes_chats_bus_history_and_files_only_in_projec
     storage, tmp_path
 ):
     _, _, alice, _ = await identities(storage)
-    source = await AgentService(storage).save(alice, expert())
+    source = await ExpertDefinition(storage).build(alice, expert())
     projects = ProjectService(storage, tmp_path)
-    tasks = TaskService(storage, tmp_path)
+    tasks = SessionService(storage, tmp_path)
     doomed = await projects.create(alice, "Remove")
     surviving = await projects.create(alice, "Keep")
     first = await tasks.create(alice, source["id"], "private", project_id=doomed["id"])
@@ -153,7 +166,9 @@ async def test_project_delete_removes_chats_bus_history_and_files_only_in_projec
         await changes.observe("alice", pid)
         async with storage.transaction() as conn:
             await conn.execute(
-                insert(t.file_scan_errors).values(project_id=pid, message="prior error")
+                update(t.projects)
+                .where(t.projects.c.id == pid)
+                .values(scan_error="prior error", scan_error_at=func.now())
             )
     other_history = await changes.list(surviving["id"])
     await projects.delete(alice, doomed["id"], bus)
@@ -168,13 +183,7 @@ async def test_project_delete_removes_chats_bus_history_and_files_only_in_projec
         assert not await bus.is_locked(MessageBusKeys.session_lock(task["session_id"]))
     assert not tasks.files.project_root("alice", doomed["id"]).exists()
     async with storage.engine.connect() as conn:
-        for table in (
-            t.project_sessions,
-            t.file_baselines,
-            t.file_fingerprints,
-            t.file_changes,
-            t.file_scan_errors,
-        ):
+        for table in (t.file_fingerprints, t.file_changes):
             assert not (
                 await conn.execute(
                     select(table).where(table.c.project_id == doomed["id"])
@@ -196,9 +205,7 @@ async def test_project_delete_removes_chats_bus_history_and_files_only_in_projec
     async with storage.engine.connect() as conn:
         assert (
             await conn.scalar(
-                select(t.file_baselines.c.project_id).where(
-                    t.file_baselines.c.project_id == doomed["id"]
-                )
+                select(t.projects.c.id).where(t.projects.c.id == doomed["id"])
             )
             is None
         )
@@ -220,9 +227,9 @@ async def test_project_delete_removes_chats_bus_history_and_files_only_in_projec
 @pytest.mark.parametrize("blocker", ["session", "project"])
 async def test_busy_project_delete_has_no_partial_removal(storage, tmp_path, blocker):
     _, _, alice, _ = await identities(storage)
-    source = await AgentService(storage).save(alice, expert())
+    source = await ExpertDefinition(storage).build(alice, expert())
     projects = ProjectService(storage, tmp_path)
-    tasks = TaskService(storage, tmp_path)
+    tasks = SessionService(storage, tmp_path)
     first = await tasks.create(alice, source["id"], "private")
     second = await tasks.create(alice, source["id"], "private")
     pid = first["project_id"]
@@ -257,299 +264,73 @@ async def test_busy_project_delete_has_no_partial_removal(storage, tmp_path, blo
             == 1
         )
         assert not await bus.is_locked(MessageBusKeys.session_lock(task["session_id"]))
-    async with storage.engine.connect() as conn:
-        assert set(
-            (
-                await conn.execute(
-                    select(t.project_sessions.c.session_id).where(
-                        t.project_sessions.c.project_id == pid
-                    )
-                )
-            ).scalars()
-        ) == {first["session_id"], second["session_id"]}
+    assert {
+        row.id for row in await storage.sessions.in_project(alice.user_id, pid)
+    } == {
+        first["session_id"],
+        second["session_id"],
+    }
     await projects.delete(alice, pid, bus)
     assert not tasks.files.project_root("alice", pid).exists()
 
 
 @pytest.mark.asyncio
-async def test_legacy_sessions_are_adopted_idempotently_with_collision_history(
+async def test_unbound_session_is_rejected_without_creating_project_membership(
     storage, tmp_path
 ):
     _, _, alice, _ = await identities(storage)
-    source = await AgentService(storage).save(alice, expert())
-    projects = ProjectService(storage, tmp_path)
-    tasks = TaskService(storage, tmp_path)
-    legacy = [await tasks.create(alice, source["id"], "private") for _ in range(2)]
-    pid = legacy[0]["project_id"]
-    areas = ("uploads", "work", "artifacts")
-    for area in areas:
-        tasks.files.write(
-            "alice", pid, "nested/report.txt", b"current project", area=area
-        )
-    for task in legacy:
-        sid = task["session_id"]
-        native = await tasks.session(alice, sid)
-        native.state.middle_context["egis_agentkit"].pop("project_id")
-        native.config.workspace_id = sid
-        native.config.cwd = str(tasks.files.user_root("alice") / "work" / sid)
-        await storage.upsert_session(
-            "alice", native.agent_id, native.config, session_id=sid, state=native.state
-        )
-        async with storage.transaction() as conn:
-            await conn.execute(
-                delete(t.project_sessions).where(t.project_sessions.c.session_id == sid)
-            )
-            await conn.execute(
-                insert(t.file_changes),
-                [
-                    dict(
-                        project_id=sid,
-                        area=area,
-                        path="nested/report.txt",
-                        change_type="created",
-                        size=len(sid),
-                    )
-                    for area in areas
-                ],
-            )
-        for area in areas:
-            old_root = tasks.files.user_root("alice") / area / sid / "nested"
-            old_root.mkdir(parents=True)
-            (old_root / "report.txt").write_bytes(sid.encode())
-    # Model a crash after moving files but before committing native adoption.
-    tasks.files.migrate_legacy_session("alice", legacy[0]["session_id"], pid)
-    await projects.migrate_user(alice)
-    histories = await FileChangeService(storage, tmp_path).list(pid)
-    assert len(histories["items"]) == 6
-    mapped_paths = {(item["area"], item["path"]) for item in histories["items"]}
-    assert len(mapped_paths) == 6
-    for task in legacy:
-        native = await storage.read_session_unscoped(
-            "alice", task["agent_id"], task["session_id"]
-        )
-        assert native.state.middle_context["egis_agentkit"]["project_id"] == pid
-        assert native.config.workspace_id == pid
-        assert native.config.cwd == str(tasks.files.area_root("alice", pid, "work"))
-        for area in areas:
-            assert not (
-                tasks.files.user_root("alice") / area / task["session_id"]
-            ).exists()
-    for area in areas:
-        assert (
-            tasks.files.read("alice", pid, area, "nested/report.txt")[0]
-            == b"current project"
-        )
-        adopted = [
-            tasks.files.read("alice", pid, area, path)[0]
-            for recorded_area, path in mapped_paths
-            if recorded_area == area
-        ]
-        assert set(adopted) == {task["session_id"].encode() for task in legacy}
-    await projects.migrate_user(alice)
-    assert await FileChangeService(storage, tmp_path).list(pid) == histories
-    async with storage.engine.connect() as conn:
-        assert (
-            len(
-                (
-                    await conn.execute(
-                        select(t.project_sessions).where(
-                            t.project_sessions.c.project_id == pid
-                        )
-                    )
-                ).all()
-            )
-            == 2
-        )
-        for task in legacy:
-            assert not (
-                await conn.execute(
-                    select(t.file_changes).where(
-                        t.file_changes.c.project_id == task["session_id"]
-                    )
-                )
-            ).all()
-
-
-@pytest.mark.asyncio
-async def test_legacy_adoption_recovers_native_state_write_failure(
-    storage, tmp_path, monkeypatch
-):
-    _, _, alice, _ = await identities(storage)
-    tasks = TaskService(storage, tmp_path)
-    source = await AgentService(storage).save(alice, expert())
-    task = await tasks.create(alice, source["id"], "private")
-    sid, pid = task["session_id"], task["project_id"]
-    native = await tasks.session(alice, sid)
-    native.state.middle_context["egis_agentkit"].pop("project_id")
-    native.config.workspace_id = sid
-    await storage.upsert_session(
-        "alice", native.agent_id, native.config, session_id=sid, state=native.state
-    )
-    async with storage.transaction() as conn:
-        await conn.execute(
-            delete(t.project_sessions).where(t.project_sessions.c.session_id == sid)
-        )
-    legacy = tasks.files.user_root("alice") / "uploads" / sid
-    legacy.mkdir(parents=True)
-    (legacy / "input.txt").write_bytes(b"preserve me")
-    projects = ProjectService(storage, tmp_path)
-    with monkeypatch.context() as patch:
-
-        async def fail(*args, **kwargs):
-            raise RuntimeError("native write interrupted")
-
-        patch.setattr(storage, "upsert_session", fail)
-        with pytest.raises(RuntimeError, match="native write interrupted"):
-            await projects.session_project(alice, native)
-    # Retry from the persisted session, as another HTTP request would.
-    fresh = await storage.read_session_unscoped("alice", task["agent_id"], sid)
-    await projects.session_project(alice, fresh)
-    persisted = await storage.read_session_unscoped("alice", task["agent_id"], sid)
-    assert persisted.state.middle_context["egis_agentkit"]["project_id"] == pid
-    assert persisted.config.workspace_id == pid
-    assert persisted.config.cwd == str(tasks.files.area_root("alice", pid, "work"))
-    assert tasks.files.read("alice", pid, "uploads", "input.txt")[0] == b"preserve me"
-
-
-@pytest.mark.asyncio
-async def test_legacy_adoption_repairs_membership_without_persisted_native_binding(
-    storage, tmp_path
-):
-    _, _, alice, _ = await identities(storage)
-    tasks = TaskService(storage, tmp_path)
-    source = await AgentService(storage).save(alice, expert())
-    task = await tasks.create(alice, source["id"], "private")
-    sid, pid = task["session_id"], task["project_id"]
-    native = await tasks.session(alice, sid)
-    native.state.middle_context["egis_agentkit"].pop("project_id")
-    native.config.workspace_id = sid
-    native.config.cwd = "legacy-workdir"
-    await storage.upsert_session(
-        "alice", native.agent_id, native.config, session_id=sid, state=native.state
-    )
-    projects = ProjectService(storage, tmp_path)
-    await projects.session_project(alice, native)
-    persisted = await storage.read_session_unscoped("alice", task["agent_id"], sid)
-    assert persisted.state.middle_context["egis_agentkit"]["project_id"] == pid
-    assert persisted.config.workspace_id == pid
-    assert persisted.config.cwd == str(tasks.files.area_root("alice", pid, "work"))
-
-
-@pytest.mark.asyncio
-async def test_delayed_legacy_adopter_preserves_newer_state_and_cannot_resurrect_deleted_session(
-    storage, tmp_path
-):
-    from copy import deepcopy
-
-    _, _, alice, _ = await identities(storage)
-    tasks = TaskService(storage, tmp_path)
-    source = await AgentService(storage).save(alice, expert())
+    tasks = SessionService(storage, tmp_path)
+    source = await ExpertDefinition(storage).build(alice, expert())
     task = await tasks.create(alice, source["id"], "private")
     sid = task["session_id"]
     native = await tasks.session(alice, sid)
     native.state.middle_context["egis_agentkit"].pop("project_id")
-    await storage.upsert_session(
-        "alice", native.agent_id, native.config, session_id=sid, state=native.state
-    )
-    async with storage.transaction() as conn:
-        await conn.execute(
-            delete(t.project_sessions).where(t.project_sessions.c.session_id == sid)
-        )
-    stale = deepcopy(native)
-    deleted_stale = deepcopy(native)
-    projects = ProjectService(storage, tmp_path)
-    await projects.session_project(alice, native)
-    fresh = await tasks.session(alice, sid)
-    fresh.state.middle_context["newer_run"] = "keep me"
-    await storage.update_session_state("alice", fresh.agent_id, sid, fresh.state)
-    await projects.session_project(alice, stale)
-    fresh = await storage.read_session_unscoped("alice", task["agent_id"], sid)
-    assert fresh.state.middle_context["newer_run"] == "keep me"
-    await tasks.delete(alice, sid, InMemoryMessageBus())
+    await storage.update_session_state("alice", native.agent_id, sid, native.state)
+    assert [p["id"] for p in await tasks.projects.list(alice)] == [task["project_id"]]
     with pytest.raises(NotFound):
-        await projects.session_project(alice, deleted_stale)
-    assert await storage.read_session_unscoped("alice", task["agent_id"], sid) is None
+        await tasks.session(alice, sid)
 
-
-@pytest.mark.asyncio
-async def test_legacy_collision_history_mapping_uses_original_row_identity(
-    storage, tmp_path
-):
-    _, _, alice, _ = await identities(storage)
-    tasks = TaskService(storage, tmp_path)
-    source = await AgentService(storage).save(alice, expert())
-    task = await tasks.create(alice, source["id"], "private")
-    sid, pid = task["session_id"], task["project_id"]
-    native = await tasks.session(alice, sid)
-    native.state.middle_context["egis_agentkit"].pop("project_id")
-    await storage.upsert_session(
-        "alice", native.agent_id, native.config, session_id=sid, state=native.state
-    )
-    second_dir = f"a-legacy-{sid}-1"
-    async with storage.transaction() as conn:
-        await conn.execute(
-            delete(t.project_sessions).where(t.project_sessions.c.session_id == sid)
+    async with storage.engine.connect() as conn:
+        assert (
+            await conn.scalar(
+                text("SELECT project_id FROM sessions WHERE id=:sid"), {"sid": sid}
+            )
+            is None
         )
-        await conn.execute(
-            insert(t.file_changes),
-            [
-                dict(
-                    project_id=sid,
-                    area="uploads",
-                    path="a/x.txt",
-                    change_type="created",
-                    size=1,
-                ),
-                dict(
-                    project_id=sid,
-                    area="uploads",
-                    path=f"{second_dir}/x.txt",
-                    change_type="created",
-                    size=2,
-                ),
-            ],
-        )
-    tasks.files.write("alice", pid, "a", b"existing", area="uploads")
-    for folder, content in [("a", b"A"), (second_dir, b"BB")]:
-        target = tasks.files.user_root("alice") / "uploads" / sid / folder
-        target.mkdir(parents=True)
-        (target / "x.txt").write_bytes(content)
-    await ProjectService(storage, tmp_path).session_project(alice, native)
-    history = await FileChangeService(storage, tmp_path).list(pid)
-    for row in history["items"]:
-        expected = b"A" if row["size"] == 1 else b"BB"
-        assert tasks.files.read("alice", pid, row["area"], row["path"])[0] == expected
 
 
-@pytest.mark.asyncio
-async def test_legacy_adoption_holds_the_same_native_session_lock(
+async def test_project_delete_rolls_back_session_and_history_on_directory_failure(
     storage, tmp_path, monkeypatch
 ):
     _, _, alice, _ = await identities(storage)
-    tasks = TaskService(storage, tmp_path)
-    source = await AgentService(storage).save(alice, expert())
+    source = await ExpertDefinition(storage).build(alice, expert())
+    tasks = SessionService(storage, tmp_path)
     task = await tasks.create(alice, source["id"], "private")
-    native = await tasks.session(alice, task["session_id"])
-    native.state.middle_context["egis_agentkit"].pop("project_id")
-    await storage.upsert_session(
-        "alice",
-        native.agent_id,
-        native.config,
-        session_id=native.id,
-        state=native.state,
-    )
+    sid, pid = task["session_id"], task["project_id"]
     bus = InMemoryMessageBus()
-    projects = ProjectService(storage, tmp_path, bus)
-    key = MessageBusKeys.session_lock(native.id)
-    original = storage.upsert_session
+    await seed_bus(bus, sid)
+    changes = FileChangeService(storage, tmp_path)
+    await changes.observe(alice.user_id, pid)
+    tasks.files.write(alice.user_id, pid, "keep.txt", b"keep", area="uploads")
+    await changes.observe(alice.user_id, pid)
+    history = await changes.list(pid)
 
-    async def persist(*args, **kwargs):
-        assert not await bus.try_lock(key), (
-            "adoption must exclude runs and deletes through the same native lock"
-        )
-        return await original(*args, **kwargs)
+    def fail_remove(*args):
+        raise OSError("directory temporarily unavailable")
 
-    monkeypatch.setattr(storage, "upsert_session", persist)
-    await projects.session_project(alice, native)
-    assert await bus.try_lock(key)
-    await bus.unlock(key)
+    with monkeypatch.context() as context:
+        context.setattr(tasks.projects.files, "remove_project", fail_remove)
+        with pytest.raises(OSError, match="directory temporarily unavailable"):
+            await tasks.projects.delete(alice, pid, bus)
+
+    assert (await tasks.projects.get(alice, pid, allow_deleting=True))[
+        "status_type"
+    ] == "deleting"
+    assert await storage.get_session(alice.user_id, task["agent_id"], sid)
+    assert await changes.list(pid) == history
+    assert await bus.log_read(MessageBusKeys.session_events(sid))
+    assert not await bus.is_locked(MessageBusKeys.session_lock(sid))
+    await tasks.projects.delete(alice, pid, bus)
+    assert await storage.get_session(alice.user_id, task["agent_id"], sid) is None
+    assert (await changes.list(pid))["items"] == []
+    await assert_bus_removed(bus, sid)

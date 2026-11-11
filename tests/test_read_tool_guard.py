@@ -8,14 +8,14 @@ from agentscope.message import ToolCallBlock
 from agentscope.state import AgentState
 from agentscope.tool import Read, Toolkit
 
-from egis_agentkit.extensions.middleware.workspace_prompt import (
+from egis_agentkit.extension._workspace_prompt_middleware_impl import (
     WorkspacePromptMiddleware,
 )
-from egis_agentkit.extensions.workspace.local import EgisLocalWorkspaceManager
-from egis_agentkit.storage.message_bus import PostgresPrimitives
+from egis_agentkit.extension._workspace_manager_impl import EgisLocalWorkspaceManager
+from egis_agentkit.storage._message_bus import PostgresPrimitives
 
 FIXTURES = Path(__file__).parents[2] / "egis-agentkit-frontend/tests/fixtures"
-MESSAGE = "Read 工具不支持此类二进制文件读取，请先转成 Markdown，或尝试使用其他工具。"
+MESSAGE = "Read 不支持解析此类二进制文件。"
 
 
 async def tools(root):
@@ -81,7 +81,7 @@ async def test_nul_after_sniff_window_never_reaches_pg_replay(storage, tmp_path)
         chunks = await execute(toolkit, path)
         assert chunks[-1].state == "error"
         bus = PostgresPrimitives(storage.engine)
-        await bus.migrate()
+        await bus.init_schema()
         for chunk in chunks:
             await bus.log_append("binary-guard", chunk.model_dump(mode="json"))
         assert len(await bus.log_read("binary-guard")) == len(chunks)
@@ -116,7 +116,7 @@ async def test_native_pdf_text_with_nul_does_not_poison_pg_replay(storage, tmp_p
         chunks = await execute(toolkit, path)
         assert chunks[-1].state == "error"
         bus = PostgresPrimitives(storage.engine)
-        await bus.migrate()
+        await bus.init_schema()
         for chunk in chunks:
             assert "\0" not in str(chunk.content)
             await bus.log_append("pdf-nul-guard", chunk.model_dump(mode="json"))
@@ -155,13 +155,15 @@ async def test_prompt_names_read_formats_without_upload_archive_instruction(tmp_
     assert "uploads 归档路径" not in prompt
     assert "直接用原生 Read" not in prompt
     assert "Word、PPT、Excel" in prompt and "二进制" in prompt
+    assert "告知用户无法解析即可" in prompt
+    assert "先转成 Markdown" not in prompt
 
 
 @pytest.mark.asyncio
 async def test_guard_sniffs_only_one_chunk_and_never_executes_binary_read(tmp_path):
     from agentscope.tool import LocalBackend
 
-    from egis_agentkit.extensions.middleware.builtin_tool_guard import (
+    from egis_agentkit.extension._workspace_read_guard_middleware_impl import (
         ReadToolGuardMiddleware,
     )
 

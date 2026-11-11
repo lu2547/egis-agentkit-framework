@@ -13,7 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from egis_agentkit.extensions.message_bus import EgisMessageBus, LeaseLostError
+from egis_agentkit.extension._message_bus_impl import EgisMessageBus, LeaseLostError
 
 
 @pytest.fixture
@@ -42,7 +42,7 @@ async def pg_engine():
         port=5433,
         database=env["POSTGRES_DB"],
     )
-    schema = "egis_bus_test_" + uuid4().hex
+    schema = "ak_bus_test_" + uuid4().hex
     admin = create_async_engine(url, hide_parameters=True)
     async with admin.begin() as conn:
         await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
@@ -65,7 +65,7 @@ async def pg_engine():
 async def pg_buses(pg_engine):
     a = EgisMessageBus(deployment_mode="cluster", engine=pg_engine)
     b = EgisMessageBus(deployment_mode="cluster", engine=pg_engine)
-    await a.migrate()
+    await a.init_schema()
     yield a, b
     await a.aclose()
     await b.aclose()
@@ -218,7 +218,7 @@ async def test_pg_lease_loss_cancels_body_and_surfaces_error(pg_buses, pg_engine
     await entered.wait()
     async with pg_engine.begin() as conn:
         await conn.execute(
-            text("DELETE FROM egis_bus_leases WHERE key=:key"), {"key": key}
+            text("DELETE FROM ak_bus_leases WHERE key=:key"), {"key": key}
         )
     with pytest.raises(LeaseLostError):
         await asyncio.wait_for(task, 2)
@@ -248,13 +248,13 @@ async def test_pg_expiry_sweeper_does_not_starve_after_first_batch(
     a, _ = pg_buses
     async with pg_engine.begin() as conn:
         await conn.execute(
-            text("""INSERT INTO egis_bus_keys(kind,key,seq,expires_at)
+            text("""INSERT INTO ak_bus_keys(kind,key,seq,expires_at)
             SELECT 'queue', :prefix || n::text, 1, clock_timestamp()-interval '1 second'
             FROM generate_series(1,501) AS n"""),
             {"prefix": key},
         )
         await conn.execute(
-            text("""INSERT INTO egis_bus_entries(kind,key,seq,payload)
+            text("""INSERT INTO ak_bus_entries(kind,key,seq,payload)
             SELECT 'queue', :prefix || n::text, 1, '{}'::jsonb
             FROM generate_series(1,501) AS n"""),
             {"prefix": key},
@@ -264,7 +264,7 @@ async def test_pg_expiry_sweeper_does_not_starve_after_first_batch(
     async with pg_engine.connect() as conn:
         assert (
             await conn.scalar(
-                text("SELECT count(*) FROM egis_bus_entries WHERE key LIKE :prefix"),
+                text("SELECT count(*) FROM ak_bus_entries WHERE key LIKE :prefix"),
                 {"prefix": key + "%"},
             )
             == 0

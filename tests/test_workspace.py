@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from egis_agentkit.errors import Forbidden
-from egis_agentkit.service.workspace.files import WorkspaceFiles
+from egis_agentkit.errors import Forbidden, NotFound
+from egis_agentkit.storage._workspace import WorkspaceFiles
 
 
 def test_preview_rejects_cross_user_and_symlink_escape(tmp_path):
@@ -50,21 +50,23 @@ def test_project_uploads_are_visible_and_do_not_become_deliveries(tmp_path):
     assert len(files.list("alice", "s1", "artifacts")) == 1
 
 
-def test_legacy_upload_copy_is_not_discovered_and_versions_are_preserved(tmp_path):
+def test_user_upload_does_not_hide_project_output_and_versions_are_preserved(tmp_path):
     files = WorkspaceFiles(tmp_path)
-    files.write_user("alice", "uploads/input.txt", b"original upload")
+    archive = files.user_root("alice") / "uploads" / "input.txt"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"original upload")
     files.write("alice", "s1", "input.txt", b"original upload")
     files.write("alice", "s1", "report.md", b"first")
     files.discover_deliveries("alice", "s1")
     files.area_root("alice", "s1", "work").joinpath("report.md").write_bytes(b"updated")
     files.discover_deliveries("alice", "s1")
     artifacts = files.list("alice", "s1", "artifacts")
-    assert len(artifacts) == 2
+    assert len(artifacts) == 3
     assert {
         files.read("alice", "s1", "artifacts", r["path"])[0] for r in artifacts
-    } == {b"first", b"updated"}
+    } == {b"original upload", b"first", b"updated"}
     files.discover_deliveries("alice", "s1")
-    assert len(files.list("alice", "s1", "artifacts")) == 2
+    assert len(files.list("alice", "s1", "artifacts")) == 3
 
 
 def test_remove_project_unlinks_symlinks_without_touching_other_data(tmp_path):
@@ -112,10 +114,12 @@ def test_discovery_preserves_newer_artifact_and_requires_explicit_code_delivery(
 
 @pytest.mark.asyncio
 async def test_shared_native_workspace_initializes_each_project_directory(tmp_path):
-    from egis_agentkit.extensions.workspace.local import EgisLocalWorkspaceManager
+    from egis_agentkit.extension._workspace_manager_impl import EgisLocalWorkspaceManager
 
     manager = EgisLocalWorkspaceManager(tmp_path)
     try:
+        with pytest.raises(NotFound):
+            await manager.get_workspace("alice", "agent", "s1")
         first = await manager.get_workspace("alice", "agent", "s1", workspace_id="p1")
         second = await manager.get_workspace("alice", "agent", "s2", workspace_id="p2")
         assert first is second

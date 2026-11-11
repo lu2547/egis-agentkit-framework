@@ -4,10 +4,9 @@ import pytest
 from agentscope.app.storage import AsyncSQLAlchemyStorage, ChatModelConfig
 from agentscope.credential import CredentialFactory
 
-from egis_agentkit.config.snapshot import ConfigSnapshot, ModelSpec
+from egis_agentkit.backend.nacos._settings import AgentKitConfig, ModelSpec
 from egis_agentkit.errors import Forbidden, NotFound
-from egis_agentkit.service.model import ModelService
-
+from egis_agentkit.service._model import ModelService
 
 API_KEY_ENV = "MODEL_COMPONENTS_API_KEY"
 ALICE = SimpleNamespace(user_id="alice")
@@ -29,26 +28,33 @@ def model_spec(key="a", **changes):
 
 
 def snapshot(*, version=1, default_key="a", specs=None, **policies):
-    return ConfigSnapshot.model_validate(
+    return AgentKitConfig.model_validate(
         {
-            "config_version": version,
-            "runtime": {
-                "config_version": version,
-                "workspace_root": "/tmp/model-components",
-                "release_roots": [],
-                "auth": {
+            "revision": version,
+            "workspace": {
+                "runtime": {"root": "/tmp/model-components"},
+                "upload": {"max_bytes": 20_971_520},
+            },
+            "user": {
+                "identity": {
                     "mode": "demo",
                     "issuer": "test",
                     "audience": "test",
                     "algorithm": "HS256",
                 },
             },
-            "models": {
-                "config_version": version,
-                "default_key": default_key,
-                "models": specs if specs is not None else [model_spec(), model_spec("b")],
+            "model": {
+                "catalog": {
+                    "models": specs
+                    if specs is not None
+                    else [model_spec(), model_spec("b")],
+                },
+                "selection": {
+                    "default_key": default_key,
+                    "allowed_keys": policies.get("allowed_model_keys", []),
+                    "allow_override": policies.get("allow_model_override", True),
+                },
             },
-            "policies": {"config_version": version, **policies},
         }
     )
 
@@ -96,16 +102,14 @@ async def test_resolve_uses_one_snapshot_per_call_and_observes_refresh(native_st
             self.reads += 1
             if self.reads == 1:
                 return snapshot(allowed_model_keys=["a"])
-            return snapshot(
-                version=2, default_key="b", allowed_model_keys=["b"]
-            )
+            return snapshot(version=2, default_key="b", allowed_model_keys=["b"])
 
     config = RefreshingConfig()
     service = ModelService(native_storage, config)
     old = await service.resolve(ALICE)
     assert config.reads == 1
     assert old.model == "model-a"
-    assert old.credential_id == "7fc32743080956852c9c21f8321fa74e"
+    assert old.credential_id == "b184ad4217c4eb44b3c458f1280d72e7"
 
     refreshed = await service.resolve(ALICE)
     assert config.reads == 2
@@ -119,7 +123,11 @@ async def test_credentials_are_stable_upserted_and_isolated_by_user(native_stora
     repeated = await service.resolve(ALICE, "a")
     other = await service.resolve(BOB)
     assert isinstance(first, ChatModelConfig)
-    assert first.credential_id == repeated.credential_id == "7fc32743080956852c9c21f8321fa74e"
+    assert (
+        first.credential_id
+        == repeated.credential_id
+        == "b184ad4217c4eb44b3c458f1280d72e7"
+    )
     assert other.credential_id != first.credential_id
     assert len(await native_storage.list_credentials("alice")) == 1
     assert len(await native_storage.list_credentials("bob")) == 1
@@ -134,7 +142,9 @@ async def test_credentials_are_stable_upserted_and_isolated_by_user(native_stora
     assert first.parameters == {"temperature": 0.2, "max_tokens": 128}
 
 
-@pytest.mark.parametrize("change", ["key", "version", "endpoint", "parameters", "model"])
+@pytest.mark.parametrize(
+    "change", ["key", "version", "endpoint", "parameters", "model"]
+)
 async def test_rotation_keeps_pending_confirmation_credentials(
     native_storage, monkeypatch, change
 ):
@@ -161,7 +171,9 @@ async def test_rotation_keeps_pending_confirmation_credentials(
     assert current.credential_id != pending.credential_id
     assert (await service.resolve(ALICE)).credential_id == current.credential_id
     assert len(await native_storage.list_credentials("alice")) == 2
-    assert (await native_storage.get_credential("alice", pending.credential_id)).data == old_data
+    assert (
+        await native_storage.get_credential("alice", pending.credential_id)
+    ).data == old_data
     record = await native_storage.get_credential("alice", current.credential_id)
     assert record.data["api_key"] == (
         "rotated-test-key" if change == "key" else "first-test-key"
@@ -178,7 +190,9 @@ async def test_rotation_keeps_pending_confirmation_credentials(
 
 
 @pytest.mark.parametrize("value", [None, ""])
-async def test_missing_credentials_fail_without_writing(native_storage, monkeypatch, value):
+async def test_missing_credentials_fail_without_writing(
+    native_storage, monkeypatch, value
+):
     if value is None:
         monkeypatch.delenv(API_KEY_ENV)
     else:
@@ -205,7 +219,9 @@ async def test_selection_rejects_before_credential_resolution(
     native_storage, monkeypatch, policies, key, is_override, error, message
 ):
     monkeypatch.delenv(API_KEY_ENV)
-    service = ModelService(native_storage, SimpleNamespace(snapshot=snapshot(**policies)))
+    service = ModelService(
+        native_storage, SimpleNamespace(snapshot=snapshot(**policies))
+    )
     with pytest.raises(error, match=message):
         await service.resolve(ALICE, key, is_override=is_override)
     assert await native_storage.list_credentials("alice") == []
@@ -224,7 +240,9 @@ async def test_selection_rejects_before_credential_resolution(
 async def test_selection_preserves_default_and_explicit_key_rules(
     native_storage, policies, key, is_override, expected
 ):
-    service = ModelService(native_storage, SimpleNamespace(snapshot=snapshot(**policies)))
+    service = ModelService(
+        native_storage, SimpleNamespace(snapshot=snapshot(**policies))
+    )
     result = await service.resolve(ALICE, key, is_override=is_override)
     assert result.model == expected
 
@@ -232,81 +250,27 @@ async def test_selection_preserves_default_and_explicit_key_rules(
 @pytest.mark.parametrize(
     ("model_class", "expected"),
     [
-        ("OpenAIChatModel", "openai_chat"),
-        ("OpenAIResponseModel", "openai_response"),
+        ("openai_response", "openai_response"),
         ("openai_chat", "openai_chat"),
         ("custom_chat", "custom_chat"),
     ],
 )
-async def test_model_class_aliases_preserve_native_and_custom_names(
+async def test_model_class_preserves_native_and_custom_names(
     native_storage, model_class, expected
 ):
-    config = SimpleNamespace(snapshot=snapshot(specs=[model_spec(model_class=model_class)]))
+    config = SimpleNamespace(
+        snapshot=snapshot(specs=[model_spec(model_class=model_class)])
+    )
     result = await ModelService(native_storage, config).resolve(ALICE)
     assert result.model_class == expected
 
 
-async def test_explicit_provider_receives_selected_spec_and_snapshot_version(monkeypatch):
-    monkeypatch.delenv(API_KEY_ENV)
-
-    class ExplicitProvider:
-        async def resolve(self, user, spec, config_version):
-            return ChatModelConfig(
-                type=spec.credential_type,
-                credential_id=f"{user.user_id}-{config_version}",
-                model=spec.model,
-                model_class="custom_chat",
-                parameters=spec.parameters,
-            )
-
-    config = SimpleNamespace(snapshot=snapshot(version=3, default_key="b"))
-    service = ModelService(None, config, provider=ExplicitProvider())
-    result = await service.resolve(ALICE)
-    assert result.credential_id == "alice-3"
-    assert result.model == "model-b"
-    assert result.model_class == "custom_chat"
-    assert result.parameters == {"temperature": 0.2, "max_tokens": 128}
-
-
-async def test_exported_components_can_be_explicitly_composed(native_storage):
-    from egis_agentkit.service.model import ModelCatalog, ModelProvider, ModelSelection
-
-    class NamedCatalog(ModelCatalog):
-        def get(self, snapshot, key):
-            return super().get(snapshot, key).model_copy(update={"model": "catalog-model"})
-
-        def list(self, snapshot):
-            result = super().list(snapshot)
-            result["items"] = result["items"][:1]
-            return result
-
-    class ChooseB(ModelSelection):
-        def select(self, snapshot, model_key=None, *, is_override=False):
-            return super().select(snapshot, model_key or "b", is_override=is_override)
-
+async def test_resolve_without_provider_base_url(native_storage):
     service = ModelService(
-        None,
-        SimpleNamespace(snapshot=snapshot()),
-        catalog=NamedCatalog(),
-        provider=ModelProvider(native_storage),
-        selection=ChooseB(),
+        native_storage,
+        SimpleNamespace(snapshot=snapshot(specs=[model_spec(base_url=None)])),
     )
-    assert service.list()["items"] == [{"key": "a", "display_name": "模型 A"}]
     result = await service.resolve(ALICE)
-    assert result.model == "catalog-model"
-    record = await native_storage.get_credential("alice", result.credential_id)
-    assert record.data["name"] == "模型 B"
-    assert record.data["base_url"] == "https://models.example.test/v1"
-
-
-async def test_provider_resolves_without_catalog_or_config_provider(native_storage):
-    from egis_agentkit.service.model import ModelProvider
-
-    provider = ModelProvider(native_storage)
-    result = await provider.resolve(ALICE, model_spec(base_url=None), config_version=1)
     assert result.model == "model-a"
-    assert result.model_class == "openai_chat"
-    assert result.parameters == {"temperature": 0.2, "max_tokens": 128}
     record = await native_storage.get_credential("alice", result.credential_id)
     assert record.data["base_url"] is None
-    assert record.data["api_key"] == "first-test-key"

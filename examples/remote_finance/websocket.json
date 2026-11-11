@@ -1,0 +1,16 @@
+{
+  "agent_type": "remote",
+  "agent_name": "finance-websocket",
+  "agent_display_name": "财务专家 · websocket",
+  "payload": {
+    "description": "汇总报销金额并回答当前会话的追问。",
+    "remote_config": {
+      "transport": "websocket",
+      "protocol_version": "v1",
+      "endpoint": "ws://127.0.0.1:8120/ws/v1/runs",
+      "credential_ref": "EGIS_REMOTE_AGENT_FINANCE_TOKEN",
+      "timeout_seconds": 5,
+      "retries": 1
+    }
+  }
+}

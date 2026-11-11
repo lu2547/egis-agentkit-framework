@@ -2,14 +2,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from test_domain import identities
-from test_resources import Registry, archive, put_asset, service
+from test_domain import COMPANY, identities
+from test_resources import archive, put_asset
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.models import Definition, Grant
-from egis_agentkit.services import AgentService, PermissionService
-from egis_agentkit.service.resource.service import skill_archive_digest
-from egis_agentkit.service.access.snapshot import SnapshotService
+from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.service.resource._catalog import ResourceService
+from egis_agentkit.service.resource._skill import skill_archive_digest
+from egis_agentkit.service.agent._expert_definition import ExpertDefinition
+from egis_agentkit.service.agent._personal_definition import PersonalDefinition
+from egis_agentkit.storage.model import Definition, Grant
 
 
 @pytest.mark.asyncio
@@ -17,11 +19,11 @@ async def test_bound_agent_cache_shared_across_users_and_isolated_by_definition(
     storage, tmp_path
 ):
     _, admin, alice, bob = await identities(storage)
-    resources, http = await service(storage, tmp_path, Registry())
+    resources = ResourceService(storage, tmp_path)
     await put_asset(storage, checksum=skill_archive_digest(archive()))
-    agents = AgentService(storage)
+    agents = ExpertDefinition(storage)
 
-    async def create(name, implementation=None):
+    async def create(name):
         data = Definition(
             owner_type="system",
             owner_id="sys",
@@ -36,15 +38,14 @@ async def test_bound_agent_cache_shared_across_users_and_isolated_by_definition(
                         "resource_view_type": "system",
                     }
                 ],
-                "implementation": implementation,
             },
         )
-        row = await agents.save(admin, data)
-        await PermissionService(storage).grant(
+        row = await agents.build(admin, data)
+        await GrantService(storage).grant(
             admin,
             Grant(
-                principal_type="all_users",
-                principal_id="*",
+                principal_type=COMPANY.principal_type,
+                principal_id=COMPANY.principal_id,
                 resource_type="agent",
                 resource_id=row["id"],
                 resource_view_type="system",
@@ -52,82 +53,76 @@ async def test_bound_agent_cache_shared_across_users_and_isolated_by_definition(
                 resource_owner_id="sys",
             ),
         )
-        snapshot = await SnapshotService(storage).capture(row["id"], "system")
+        snapshot = await storage.definitions.read_view(row["id"], "system")
         return row, snapshot
 
-    first, snap = await create(
-        "first", {"assembly_ref": "demo", "assembly_version": "1.2.3"}
-    )
+    first, snap = await create("first")
     second, snap2 = await create("second")
 
     def scope(user, row, snapshot):
         return SimpleNamespace(
             user_id=user.user_id,
             definition=row,
-            snapshot=snapshot,
-            binding={"agent_node_key": snapshot["root_key"]},
+            root_definition=snapshot,
+            binding={"agent_definition_id": snapshot["id"]},
         )
 
-    async with http:
-        a = await resources.materialize_skill(
-            alice, "report", "1.0.0", authorization_scope=scope(alice, first, snap)
-        )
-        first_path = Path(a.dir)
-        before = (first_path / "SKILL.md").stat().st_ino
-        b = await resources.materialize_skill(
-            bob, "report", "1.0.0", authorization_scope=scope(bob, first, snap)
-        )
-        assert Path(b.dir) == first_path
-        assert (first_path / "SKILL.md").stat().st_ino == before
-        assert (
-            first_path.parent
-            == tmp_path / "common" / first["id"] / "1.2.3" / "skills" / "report"
-        )
-        c = await resources.materialize_skill(
-            alice, "report", "1.0.0", authorization_scope=scope(alice, second, snap2)
-        )
-        assert (
-            Path(c.dir).parent
-            == tmp_path / "common" / second["id"] / "config-1" / "skills" / "report"
-        )
-        assert c.dir != a.dir
+    a = await resources.materialize_skill(
+        alice, "report", "1.0.0", authorization_scope=scope(alice, first, snap)
+    )
+    first_path = Path(a.dir)
+    before = (first_path / "SKILL.md").stat().st_ino
+    b = await resources.materialize_skill(
+        bob, "report", "1.0.0", authorization_scope=scope(bob, first, snap)
+    )
+    assert Path(b.dir) == first_path
+    assert (first_path / "SKILL.md").stat().st_ino == before
+    assert (
+        first_path.parent
+        == tmp_path / "common" / first["id"] / "config-1" / "skills" / "report"
+    )
+    c = await resources.materialize_skill(
+        alice, "report", "1.0.0", authorization_scope=scope(alice, second, snap2)
+    )
+    assert (
+        Path(c.dir).parent
+        == tmp_path / "common" / second["id"] / "config-1" / "skills" / "report"
+    )
+    assert c.dir != a.dir
 
 
 @pytest.mark.asyncio
 async def test_private_skill_personal_and_unscoped_use_user_cache(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
-    resources, http = await service(storage, tmp_path, Registry())
+    resources = ResourceService(storage, tmp_path)
     await put_asset(
         storage,
         owner_type="user",
         owner_id="alice",
         checksum=skill_archive_digest(archive()),
     )
-    async with http:
-        result = await resources.materialize_skill(alice, "report", "1.0.0")
-        assert (
-            Path(result.dir).parent == tmp_path / "user" / "alice" / "skills" / "report"
+    result = await resources.materialize_skill(alice, "report", "1.0.0")
+    assert Path(result.dir).parent == tmp_path / "user" / "alice" / "skills" / "report"
+    await resources.installations.install(alice, "skill", "report", "1.0.0")
+    personal = await PersonalDefinition(storage).build(alice)
+    snapshot = await storage.definitions.read_view(personal["id"], "private")
+    scope = SimpleNamespace(
+        user_id="alice",
+        definition=personal,
+        root_definition=snapshot,
+        binding={"agent_definition_id": snapshot["id"]},
+    )
+    assert (
+        await resources.materialize_skill(
+            alice, "report", "1.0.0", authorization_scope=scope
         )
-        await resources.install(alice, "skill", "report", "1.0.0")
-        personal = await AgentService(storage).personal(alice)
-        snapshot = await SnapshotService(storage).capture(personal["id"], "private")
-        scope = SimpleNamespace(
-            user_id="alice",
-            definition=personal,
-            snapshot=snapshot,
-            binding={"agent_node_key": snapshot["root_key"]},
-        )
-        assert (
-            await resources.materialize_skill(
-                alice, "report", "1.0.0", authorization_scope=scope
-            )
-        ).dir == result.dir
+    ).dir == result.dir
 
 
 @pytest.mark.asyncio
 async def test_skill_cache_rejects_symlinked_user_ancestor(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
-    resources, http = await service(storage, tmp_path, Registry())
+    resources = ResourceService(storage, tmp_path)
     await put_asset(
         storage,
         owner_type="user",
@@ -137,9 +132,8 @@ async def test_skill_cache_rejects_symlinked_user_ancestor(storage, tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (tmp_path / "user").symlink_to(outside, target_is_directory=True)
-    async with http:
-        with pytest.raises(Forbidden):
-            await resources.materialize_skill(alice, "report", "1.0.0")
+    with pytest.raises(Forbidden):
+        await resources.materialize_skill(alice, "report", "1.0.0")
     assert not list(outside.iterdir())
 
 
@@ -150,11 +144,11 @@ async def test_skill_cache_rejects_symlinked_user_ancestor(storage, tmp_path):
 async def test_persisted_unsafe_asset_paths_are_rejected(
     storage, tmp_path, rid, version
 ):
-    from egis_agentkit.models import Asset
     from egis_agentkit.storage import tables as t
+    from egis_agentkit.storage.model import Asset
 
     _, _, alice, _ = await identities(storage)
-    resources, http = await service(storage, tmp_path, Registry())
+    resources = ResourceService(storage, tmp_path)
     asset = Asset(
         resource_type="skill",
         resource_id=rid,
@@ -168,9 +162,8 @@ async def test_persisted_unsafe_asset_paths_are_rejected(
                 **asset.model_dump(), created_by="alice", updated_by="alice"
             )
         )
-    async with http:
-        with pytest.raises((ValueError, Forbidden)):
-            await resources.materialize_skill(alice, rid, version)
+    with pytest.raises((ValueError, Forbidden)):
+        await resources.materialize_skill(alice, rid, version)
     assert not (tmp_path / "user").exists() and not (tmp_path / "common").exists()
 
 
@@ -180,9 +173,7 @@ async def test_persisted_unsafe_asset_paths_are_rejected(
     [
         ("id", "../escape"),
         ("config_version", "../escape"),
-        ("assembly_version", "../escape"),
         ("id", ".."),
-        ("assembly_version", "a\\b"),
     ],
 )
 async def test_unsafe_agent_cache_segments_are_rejected(
@@ -191,9 +182,9 @@ async def test_unsafe_agent_cache_segments_are_rejected(
     from copy import deepcopy
 
     _, admin, alice, _ = await identities(storage)
-    resources, http = await service(storage, tmp_path, Registry())
+    resources = ResourceService(storage, tmp_path)
     await put_asset(storage, checksum=skill_archive_digest(archive()))
-    row = await AgentService(storage).save(
+    row = await ExpertDefinition(storage).build(
         admin,
         Definition(
             owner_type="system",
@@ -212,7 +203,7 @@ async def test_unsafe_agent_cache_segments_are_rejected(
             },
         ),
     )
-    await PermissionService(storage).grant(
+    await GrantService(storage).grant(
         admin,
         Grant(
             principal_type="user",
@@ -224,26 +215,19 @@ async def test_unsafe_agent_cache_segments_are_rejected(
             resource_owner_id="sys",
         ),
     )
-    snapshot = await SnapshotService(storage).capture(row["id"], "system")
+    snapshot = await storage.definitions.read_view(row["id"], "system")
     definition = deepcopy(row)
-    if field == "assembly_version":
-        definition["payload"]["implementation"] = {
-            "assembly_ref": "demo",
-            "assembly_version": value,
-        }
-    else:
-        definition[field] = value
+    definition[field] = value
     scope = SimpleNamespace(
         user_id="alice",
         definition=definition,
-        snapshot=snapshot,
-        binding={"agent_node_key": snapshot["root_key"]},
+        root_definition=snapshot,
+        binding={"agent_definition_id": snapshot["id"]},
     )
-    async with http:
-        with pytest.raises((ValueError, Forbidden)):
-            await resources.materialize_skill(
-                alice, "report", "1.0.0", authorization_scope=scope
-            )
+    with pytest.raises((ValueError, Forbidden)):
+        await resources.materialize_skill(
+            alice, "report", "1.0.0", authorization_scope=scope
+        )
     assert not (tmp_path / "common").exists()
 
 
@@ -252,9 +236,9 @@ async def test_bound_agent_cache_rejects_symlinked_definition_ancestor(
     storage, tmp_path
 ):
     _, admin, alice, _ = await identities(storage)
-    resources, http = await service(storage, tmp_path, Registry())
+    resources = ResourceService(storage, tmp_path)
     await put_asset(storage, checksum=skill_archive_digest(archive()))
-    row = await AgentService(storage).save(
+    row = await ExpertDefinition(storage).build(
         admin,
         Definition(
             owner_type="system",
@@ -273,7 +257,7 @@ async def test_bound_agent_cache_rejects_symlinked_definition_ancestor(
             },
         ),
     )
-    await PermissionService(storage).grant(
+    await GrantService(storage).grant(
         admin,
         Grant(
             principal_type="user",
@@ -285,29 +269,27 @@ async def test_bound_agent_cache_rejects_symlinked_definition_ancestor(
             resource_owner_id="sys",
         ),
     )
-    snapshot = await SnapshotService(storage).capture(row["id"], "system")
+    snapshot = await storage.definitions.read_view(row["id"], "system")
     scope = SimpleNamespace(
         user_id="alice",
         definition=row,
-        snapshot=snapshot,
-        binding={"agent_node_key": snapshot["root_key"]},
+        root_definition=snapshot,
+        binding={"agent_definition_id": snapshot["id"]},
     )
     outside = tmp_path / "outside"
     outside.mkdir()
     (tmp_path / "common").mkdir()
     (tmp_path / "common" / row["id"]).symlink_to(outside, target_is_directory=True)
-    async with http:
-        with pytest.raises(Forbidden):
-            await resources.materialize_skill(
-                alice, "report", "1.0.0", authorization_scope=scope
-            )
+    with pytest.raises(Forbidden):
+        await resources.materialize_skill(
+            alice, "report", "1.0.0", authorization_scope=scope
+        )
     assert not list(outside.iterdir())
 
 
 def cache_service_for_race(tmp_path):
-    from egis_agentkit.service.resource.service import ResourceService
-
-    service = ResourceService(None, None, None, None, tmp_path)
+    storage = SimpleNamespace(assets=None, engine=None, mcp_credentials=None)
+    service = ResourceService(storage, tmp_path)
     asset = {
         "resource_type": "skill",
         "resource_id": "report",
@@ -345,7 +327,7 @@ def test_two_instances_concurrently_materialize_one_verified_cache(
     import threading
     from concurrent.futures import ThreadPoolExecutor
 
-    from egis_agentkit.service.resource import service as module
+    from egis_agentkit.service.resource import _catalog as module
 
     barrier = threading.Barrier(2)
     real_rename = os.rename
@@ -387,7 +369,7 @@ async def test_competing_invalid_cache_winner_is_rejected(
     import errno
 
     from egis_agentkit.errors import Conflict
-    from egis_agentkit.service.resource import service as module
+    from egis_agentkit.service.resource import _catalog as module
 
     service = cache_service_for_race(tmp_path)
     outside = tmp_path / "outside"

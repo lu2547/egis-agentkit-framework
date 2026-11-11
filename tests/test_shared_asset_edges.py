@@ -1,25 +1,27 @@
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import update
-from test_domain import expert, identities
-from test_resources import Registry, service
+from test_domain import COMPANY, expert, identities
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.models import Asset
-from egis_agentkit.services import AgentService, PermissionService, ShareService
-from egis_agentkit.service.access.snapshot import SnapshotService
+from egis_agentkit.service.access._permission import PermissionService
+from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.service.resource._catalog import ResourceService
+from egis_agentkit.service.access._share import ShareService
+from egis_agentkit.service.agent._expert_definition import ExpertDefinition
 from egis_agentkit.storage import tables as t
+from egis_agentkit.storage.model import Asset
 
 
 async def prepare(storage, kind):
     users, admin, alice, bob = await identities(storage)
-    async with storage.transaction() as conn:
-        for version, digest in [("1.0.0", "a" * 64), ("2.0.0", "b" * 64)]:
+    async def publish(version, revision, digest):
+        async with storage.transaction() as conn:
             asset = Asset(
                 resource_type=kind,
                 resource_id="bob-asset",
                 resource_version=version,
+                publication_revision=revision,
                 owner_type="user",
                 owner_id="bob",
                 checksum_sha256=digest,
@@ -29,9 +31,11 @@ async def prepare(storage, kind):
                     **asset.model_dump(), created_by="bob", updated_by="bob"
                 )
             )
+    await publish("1.0.0", 1, "a" * 64)
     shares = ShareService(storage)
-    review = await shares.submit(bob, kind, "bob-asset", "1.0.0")
+    review = await shares.submit(bob, kind, "bob-asset", target=COMPANY)
     await shares.decide(admin, review["review_id"], True, "")
+    await publish("2.0.0", 2, "b" * 64)
     return users, admin, alice, bob, shares
 
 
@@ -51,25 +55,26 @@ async def test_new_binding_rejects_unreviewed_version(storage, kind):
     value = expert()
     value.payload["bindings"] = [binding(kind, "2.0.0")]
     with pytest.raises(Forbidden):
-        await AgentService(storage).save(alice, value)
+        await ExpertDefinition(storage).build(alice, value)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["skill", "mcp"])
-async def test_fresh_snapshot_rejects_legacy_unreviewed_binding(storage, kind):
+async def test_execution_rejects_stored_unreviewed_binding(storage, kind):
     _, _, alice, _, _ = await prepare(storage, kind)
     value = expert()
     value.payload["bindings"] = [binding(kind, "1.0.0")]
-    row = await AgentService(storage).save(alice, value)
-    payload = {**row["payload"], "bindings": [binding(kind, "2.0.0")]}
-    async with storage.transaction() as conn:
-        await conn.execute(
-            update(t.definitions)
-            .where(t.definitions.c.id == row["id"])
-            .values(payload=payload)
+    row = await ExpertDefinition(storage).build(alice, value)
+    value.payload["bindings"] = [binding(kind, "2.0.0")]
+    async with storage.definition_write() as write:
+        saved = await write.definitions.update_definition(
+            row["id"], value.model_dump(mode="json"), actor=alice.user_id
         )
+    snapshot = await storage.definitions.read_view(
+        saved["id"], "private", version=saved["resource_version"]
+    )
     with pytest.raises(Forbidden):
-        await SnapshotService(storage).capture(row["id"], "private")
+        await PermissionService(storage).require_execution(alice, snapshot)
 
 
 @pytest.mark.asyncio
@@ -80,48 +85,47 @@ async def test_approved_parent_preserves_old_asset_after_new_share(
     users, admin, alice, bob, shares = await prepare(storage, kind)
     value = expert()
     value.payload["bindings"] = [binding(kind, "1.0.0")]
-    row = await AgentService(storage).save(alice, value)
-    parent = await shares.submit(alice, "agent", row["id"])
+    row = await ExpertDefinition(storage).build(alice, value)
+    parent = await shares.submit(
+        alice, "agent", row["id"], target=COMPANY
+    )
     await shares.decide(admin, parent["review_id"], True, "")
-    later = await shares.submit(bob, kind, "bob-asset", "2.0.0")
+    later = await shares.submit(bob, kind, "bob-asset")
     await shares.decide(admin, later["review_id"], True, "")
     charlie = await users.sync_identity("charlie", "Charlie")
-    snapshot = await SnapshotService(storage).capture(row["id"], "shared")
-    asset_key = snapshot["nodes"][snapshot["root_key"]]["edges"][0]
-    assert snapshot["nodes"][asset_key]["data"]["resource_version"] == "1.0.0"
-    await PermissionService(storage).validate_snapshot(charlie, snapshot)
-    resources, http = await service(storage, tmp_path, Registry())
-    async with http:
-        asset = await resources._asset(kind, "bob-asset", "1.0.0")
-        scope = SimpleNamespace(
-            user_id="charlie",
-            snapshot=snapshot,
-            definition=snapshot["root"],
-            binding={"agent_node_key": snapshot["root_key"]},
-        )
-        assert await resources._usable(charlie, asset, scope)
-    with pytest.raises(Forbidden):
-        await SnapshotService(storage).capture(row["id"], "private")
+    await users.update_user(
+        admin, charlie.model_copy(update={"group_ids": [COMPANY.principal_id]})
+    )
+    charlie = await users.get(charlie.user_id)
+    permissions = PermissionService(storage)
+    decision = await permissions.require(charlie, "agent", row["id"], "shared")
+    snapshot = await storage.definitions.read_view(
+        row["id"],
+        "shared",
+        version=decision.resource_version,
+        **decision.source_options,
+    )
+    assert snapshot["payload"]["bindings"][0]["resource_version"] == "1.0.0"
+    await permissions.require_execution(charlie, snapshot)
+    resources = ResourceService(storage, tmp_path)
+    asset = await resources._asset(kind, "bob-asset", "1.0.0")
+    scope = SimpleNamespace(
+        user_id="charlie",
+        root_definition=snapshot,
+        definition=snapshot,
+        binding={"agent_definition_id": snapshot["id"]},
+    )
+    assert await resources._usable(charlie, asset, scope)
+    assert await storage.definitions.read_view(row["id"], "private")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "field,value", [("checksum_sha256", "c" * 64), ("owner_id", "charlie")]
-)
-async def test_fresh_shared_edge_rejects_changed_approved_asset_identity(
-    storage, field, value
-):
-    _, _, alice, _, _ = await prepare(storage, "skill")
-    async with storage.transaction() as conn:
-        await conn.execute(
-            update(t.assets)
-            .where(
-                t.assets.c.resource_id == "bob-asset",
-                t.assets.c.resource_version == "1.0.0",
-            )
-            .values(**{field: value})
-        )
+async def test_revoked_shared_asset_version_cannot_be_bound(storage):
+    _, admin, alice, _, _ = await prepare(storage, "skill")
+    grants = GrantService(storage)
+    (grant,) = await grants.list_grants(admin)
+    await grants.revoke(admin, grant["id"])
     candidate = expert()
     candidate.payload["bindings"] = [binding("skill", "1.0.0")]
     with pytest.raises(Forbidden):
-        await AgentService(storage).save(alice, candidate)
+        await ExpertDefinition(storage).build(alice, candidate)

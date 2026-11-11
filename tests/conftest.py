@@ -35,12 +35,7 @@ async def storage():
         connect_args={"server_settings": {"search_path": schema}},
     )
     result = AgentKitStorage(str(url), engine)
-    await result.migrate_enterprise()
-    # Explicit native provisioning in this isolated test schema.
-    from agentscope.app.storage import AsyncSQLAlchemyStorage
-
-    async with AsyncSQLAlchemyStorage(str(url), engine=engine, create_tables=True):
-        pass
+    await result.init_schema()
     async with result:
         yield result
     await engine.dispose()

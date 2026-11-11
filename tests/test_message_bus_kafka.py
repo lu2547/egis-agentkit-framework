@@ -11,7 +11,7 @@ from aiokafka.errors import CommitFailedError
 from aiokafka.structs import TopicPartition
 from test_message_bus import pg_engine as pg_engine
 
-from egis_agentkit.extensions.message_bus import EgisMessageBus
+from egis_agentkit.extension._message_bus_impl import EgisMessageBus
 
 WAKE_QUEUE = MessageBusKeys.wakeup_queue()
 WAKE_SIGNAL = MessageBusKeys.wakeup_signal()
@@ -28,7 +28,7 @@ async def kafka_buses(pg_engine):
         buffer_size=5,
     )
     a, b = EgisMessageBus(**kwargs), EgisMessageBus(**kwargs)
-    await a.migrate()
+    await a.init_schema()
     await a.ensure_topics(partitions=4)
     await a.__aenter__()
     await b.__aenter__()
@@ -72,7 +72,7 @@ async def test_global_group_drains_once_without_broadcast_competition(kafka_buse
         await asyncio.gather(*(event.wait() for event in ready))
         for n in range(90):
             await a.queue_push(WAKE_QUEUE, {"n": n, "session_id": str(n)})
-            await a.publish(WAKE_SIGNAL, {})  # compatibility signal must not broadcast
+            await a.publish(WAKE_SIGNAL, {})  # native wakeup signal must not broadcast
         async with asyncio.timeout(15):
             while sum(map(len, results)) < 90:
                 await asyncio.sleep(0.02)

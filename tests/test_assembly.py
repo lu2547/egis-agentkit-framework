@@ -1,74 +1,86 @@
 import pytest
 import pytest_asyncio
 from agentscope.app.storage import AgentData, AgentRecord, SessionConfig
-from agentscope.state import AgentState
+from agentscope.message import ToolCallBlock, ToolCallState
 from test_domain import expert, identities
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.services import AgentService
-from egis_agentkit.extensions.compatibility.execution import ExecutionCoordinator, execution_scope
+from egis_agentkit.extension._session_lock_override import (
+    ExecutionCoordinator,
+    execution_scope,
+)
+from egis_agentkit.service._session import SessionService
+from egis_agentkit.service.agent._expert_definition import ExpertDefinition
 
 
 @pytest_asyncio.fixture
 async def runtime_storage(storage):
-    from egis_agentkit.extensions.compatibility.storage import ExecutionStorage
+    from egis_agentkit.extension._session_storage_override import ExecutionStorage
 
     async with ExecutionStorage("postgresql+asyncpg://unused", storage.engine) as projected:
         yield projected
 
 
 @pytest.mark.asyncio
-async def test_context_precedes_agent_read_and_is_reset(storage, runtime_storage, tmp_path):
+async def test_session_resolves_pinned_definition_on_every_turn(storage, runtime_storage, tmp_path):
     _, _, alice, _ = await identities(storage)
-    agents = AgentService(storage)
-    source = await agents.save(alice, expert())
-    from egis_agentkit.service.access.snapshot import SnapshotService
-
-    snapshot = await SnapshotService(storage).capture(source["id"], "private")
-    native = AgentRecord(
-        user_id="alice", data=AgentData(name="writer", system_prompt="placeholder")
-    )
+    agents = ExpertDefinition(storage)
+    source = await agents.build(alice, expert())
+    tasks = SessionService(storage, tmp_path)
+    task = await tasks.create(alice, source["id"], "private")
+    session_id, agent_id = task["session_id"], task["agent_id"]
+    native = await storage.get_agent("alice", agent_id)
+    assert native.data.system_prompt == ""
+    native.data.system_prompt = "placeholder"
     await storage.upsert_agent("alice", native)
-    state = AgentState(
-        middle_context={
-            "egis_agentkit": {
-                "is_initialized": True,
-                "definition_id": source["id"],
-                "resource_view_type": "private",
-                "root_resource_type": "agent",
-                "agent_node_key": snapshot["root_key"],
-                "snapshot": snapshot,
-                "is_team": False,
-            }
-        }
-    )
-    session = await storage.upsert_session(
-        "alice", native.id, SessionConfig(workspace_id="workspace"), state=state
-    )
     coordinator = ExecutionCoordinator(storage, tmp_path)
-    async with coordinator.bind(session.id):
-        assert execution_scope.get().session_id == session.id
+    async with coordinator.bind(session_id):
+        assert execution_scope.get().session_id == session_id
         assert (
-            await runtime_storage.get_agent("alice", native.id)
+            await runtime_storage.get_agent("alice", agent_id)
         ).data.system_prompt == "旧版"
-        current = await runtime_storage.get_session("alice", native.id, session.id)
-        assert (
-            current.state.middle_context["egis_agentkit"]["snapshot"]["root"]["id"]
-            == source["id"]
-        )
+        current = await runtime_storage.get_session("alice", agent_id, session_id)
+        binding = current.state.middle_context["egis_agentkit"]
+        assert "snapshot" not in binding
+        assert binding["definition_id"] == source["id"]
+        assert binding["resource_version"] == "1"
         changed = expert()
         changed.id = source["id"]
         changed.payload["system_prompt"] = "新版"
         await agents.save(alice, changed)
         assert (
-            await runtime_storage.get_agent("alice", native.id)
+            await runtime_storage.get_agent("alice", agent_id)
+        ).data.system_prompt == "旧版"
+        current.state.append_context(
+            source["agent_name"],
+            [ToolCallBlock(id="approval", name="Read", input="{}", state=ToolCallState.ASKING)],
+        )
+        await storage.update_session_state("alice", agent_id, session_id, current.state)
+    assert execution_scope.get() is None
+    assert (await tasks.get(alice, session_id))["is_waiting"]
+    async with coordinator.bind(session_id) as scope:
+        assert (
+            await runtime_storage.get_agent("alice", agent_id)
+        ).data.system_prompt == "旧版"
+        scope.session_record.state.context.clear()
+        await storage.update_session_state(
+            "alice", agent_id, session_id, scope.session_record.state
+        )
+    async with coordinator.bind(session_id):
+        assert (
+            await runtime_storage.get_agent("alice", agent_id)
         ).data.system_prompt == "旧版"
     assert execution_scope.get() is None
-    async with coordinator.bind(session.id):
+    latest = await tasks.create(alice, source["id"], "private")
+    async with coordinator.bind(latest["session_id"]):
         assert (
-            await runtime_storage.get_agent("alice", native.id)
+            await runtime_storage.get_agent("alice", latest["agent_id"])
         ).data.system_prompt == "新版"
-    assert execution_scope.get() is None
+    pinned = await tasks.create(alice, source["id"], "private", resource_version="1")
+    async with coordinator.bind(pinned["session_id"]):
+        assert (
+            await runtime_storage.get_agent("alice", pinned["agent_id"])
+        ).data.system_prompt == "旧版"
 
 
 @pytest.mark.asyncio

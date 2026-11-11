@@ -3,41 +3,17 @@ from agentscope.app.message_bus import MessageBusKeys
 from test_domain import expert, identities
 
 from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.services import AgentService
-from egis_agentkit.service.session.service import TaskService
-from egis_agentkit.service.workspace.files import WorkspaceFiles
-
-
-def test_user_workspace_is_scoped_and_rejects_symlinks(tmp_path):
-    files = WorkspaceFiles(tmp_path)
-    target = files.write_user("alice", "uploads/nested/a.txt", b"hello")
-    assert target.read_bytes() == b"hello"
-    assert [x["path"] for x in files.list_user("alice", "")] == [
-        "artifacts",
-        "uploads",
-        "work",
-    ]
-    assert (
-        files.list_user("alice", "uploads/nested")[0]["path"] == "uploads/nested/a.txt"
-    )
-    assert files.read_user("alice", "uploads/nested/a.txt")[0] == b"hello"
-    with pytest.raises(Forbidden):
-        files.read_user("alice", "../bob/uploads/a.txt")
-    with pytest.raises(Forbidden):
-        files.read_user("alice", "private/a.txt")
-    (files.user_root("alice") / "uploads" / "link").symlink_to(
-        tmp_path, target_is_directory=True
-    )
-    with pytest.raises(Forbidden):
-        files.read_user("alice", "uploads/link/a.txt")
-    assert not files.list_user("bob", "uploads")
+from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.service._session import SessionService
+from egis_agentkit.service.agent._expert_definition import ExpertDefinition
+from egis_agentkit.storage._workspace import WorkspaceFiles
 
 
 @pytest.mark.asyncio
 async def test_task_naming_and_delete_keeps_project_files(storage, tmp_path):
     _, _, alice, bob = await identities(storage)
-    source = await AgentService(storage).save(alice, expert())
-    service = TaskService(storage, tmp_path)
+    source = await ExpertDefinition(storage).build(alice, expert())
+    service = SessionService(storage, tmp_path)
     task = await service.create(alice, source["id"], "private")
     explicit = await service.create(alice, source["id"], "private", name="My title")
     record = await service.session(alice, task["session_id"])
@@ -51,12 +27,15 @@ async def test_task_naming_and_delete_keeps_project_files(storage, tmp_path):
     from agentscope.app.message_bus import InMemoryMessageBus
 
     await service.delete(alice, task["session_id"], InMemoryMessageBus())
-    assert service.files.read("alice", task["project_id"], "work", "keep.txt")[0] == b"keep"
+    assert (
+        service.files.read("alice", task["project_id"], "work", "keep.txt")[0]
+        == b"keep"
+    )
     assert len(await service.list(alice)) == 1
 
 
 @pytest.mark.asyncio
-async def test_workspace_http_routes_and_task_upload_persist(storage, tmp_path):
+async def test_workspace_http_routes_and_project_upload_persist(storage, tmp_path):
     import httpx
     from egis_agentkit_app.manager_router import router
     from egis_agentkit_app.security import current_user
@@ -64,21 +43,13 @@ async def test_workspace_http_routes_and_task_upload_persist(storage, tmp_path):
     from fastapi.responses import JSONResponse
 
     from egis_agentkit.errors import AgentKitError
-    from egis_agentkit.service.project.service import ProjectService
+    from egis_agentkit.service._project import ProjectService
 
     _, _, alice, bob = await identities(storage)
-    source = await AgentService(storage).save(alice, expert())
     projects = ProjectService(storage, tmp_path)
-    tasks = TaskService(storage, tmp_path)
-    first = await tasks.create(alice, source["id"], "private")
-    same_project = await tasks.create(alice, source["id"], "private")
-    isolated_project = await projects.create(alice, "Isolated")
-    isolated = await tasks.create(
-        alice, source["id"], "private", project_id=isolated_project["id"]
-    )
-    sid = first["session_id"]
-    isolated_sid = isolated["session_id"]
-    project_id = first["project_id"]
+    tasks = SessionService(storage, tmp_path)
+    project_id = (await projects.create(alice, "Main"))["id"]
+    isolated_id = (await projects.create(alice, "Isolated"))["id"]
     app = FastAPI()
     app.include_router(router)
 
@@ -86,89 +57,66 @@ async def test_workspace_http_routes_and_task_upload_persist(storage, tmp_path):
     async def domain_error(request, exc):
         return JSONResponse({"detail": str(exc)}, status_code=exc.status_code)
 
-    from egis_agentkit.service.workspace.changes import FileChangeService
+    from egis_agentkit.service.workspace._changes import FileChangeService
 
     changes = FileChangeService(storage, tmp_path)
     from types import SimpleNamespace
 
-    from egis_agentkit.service.workspace.preview import DocumentPreviewService
-    from egis_agentkit.service.workspace.service import WorkspaceService
+    from egis_agentkit.service.workspace._files import WorkspaceService
+    from egis_agentkit.service.workspace._preview import OfficeToPdfConverter
 
     files = WorkspaceFiles(tmp_path)
     app.state.egis_services = SimpleNamespace(
-        workspace=WorkspaceService(files, projects, tasks, changes, DocumentPreviewService())
+        workspace=WorkspaceService(
+            files, projects, tasks, changes, OfficeToPdfConverter()
+        )
     )
     app.dependency_overrides[current_user] = lambda: alice
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        upload = await client.post(
-            "/manager/workspace/files",
-            files={"file": ("x.txt", b"abc")},
-            data={"path": "folder"},
+        project_upload = await client.post(
+            f"/manager/projects/{project_id}/files",
+            files={"file": ("task.txt", b"original")},
         )
-        assert upload.status_code == 201
-        assert upload.json()["path"] == "uploads/folder/x.txt"
-        query_upload = await client.post(
-            "/manager/workspace/files?path=uploads/sub", files={"file": ("q.txt", b"q")}
-        )
-        assert query_upload.json()["path"] == "uploads/sub/q.txt"
-        listed = await client.get(
-            "/manager/workspace/files", params={"path": "uploads/folder"}
-        )
-        assert listed.json()["items"][0]["path"] == "uploads/folder/x.txt"
-        assert (
-            await client.get(
-                "/manager/workspace/file", params={"path": "uploads/folder/x.txt"}
-            )
-        ).content == b"abc"
-        task_upload = await client.post(
-            f"/manager/tasks/{sid}/files", files={"file": ("task.txt", b"original")}
-        )
-        assert task_upload.status_code == 201
-        history = await client.get(f"/manager/tasks/{sid}/file-changes")
+        assert project_upload.status_code == 201
+        history = await client.get(f"/manager/projects/{project_id}/file-changes")
         assert history.status_code == 200
         assert [
             (item["path"], item["change_type"]) for item in history.json()["items"]
         ] == [("task.txt", "created")]
         assert history.json()["items"][0]["area"] == "uploads"
-        assert task_upload.json()["area"] == "uploads"
+        assert project_upload.json()["area"] == "uploads"
         assert (
             await client.get(
-                f"/manager/tasks/{sid}/file", params={"area": "uploads", "path": "task.txt"}
-            )
-        ).content == b"original"
-        assert (
-            await client.get(f"/manager/tasks/{sid}/files", params={"area": "work"})
-        ).json()["items"] == []
-        assert (
-            await client.get(
-                f"/manager/tasks/{same_project['session_id']}/file",
+                f"/manager/projects/{project_id}/file",
                 params={"area": "uploads", "path": "task.txt"},
             )
         ).content == b"original"
-        shared_history = await client.get(
-            f"/manager/tasks/{same_project['session_id']}/file-changes"
-        )
-        assert shared_history.json()["items"] == history.json()["items"]
         assert (
-            await client.get(f"/manager/tasks/{isolated_sid}/files", params={"area": "uploads"})
+            await client.get(
+                f"/manager/projects/{project_id}/files", params={"area": "work"}
+            )
         ).json()["items"] == []
-        files.write(
-            "alice", project_id, "report.md", b"finished report"
-        )
+        assert (
+            await client.get(
+                f"/manager/projects/{isolated_id}/files", params={"area": "uploads"}
+            )
+        ).json()["items"] == []
+        files.write("alice", project_id, "report.md", b"finished report")
         delivered = await client.get(
-            f"/manager/tasks/{sid}/files", params={"area": "artifacts"}
+            f"/manager/projects/{project_id}/files", params={"area": "artifacts"}
         )
         assert [item["path"] for item in delivered.json()["items"]] == ["report.md"]
         assert (
-            await client.get(f"/manager/tasks/{isolated_sid}/files", params={"area": "artifacts"})
+            await client.get(
+                f"/manager/projects/{isolated_id}/files", params={"area": "artifacts"}
+            )
         ).json()["items"] == []
-        files.write(
-            "alice", project_id, "nested/summary.md", b"nested delivery"
-        )
+        files.write("alice", project_id, "nested/summary.md", b"nested delivery")
         nested = await client.get(
-            f"/manager/tasks/{sid}/files", params={"area": "artifacts", "recursive": True}
+            f"/manager/projects/{project_id}/files",
+            params={"area": "artifacts", "recursive": True},
         )
         assert [(item["path"], item["area"]) for item in nested.json()["items"]] == [
             ("nested/summary.md", "artifacts"),
@@ -176,23 +124,28 @@ async def test_workspace_http_routes_and_task_upload_persist(storage, tmp_path):
         ]
         assert all(not item["is_directory"] for item in nested.json()["items"])
         app.dependency_overrides[current_user] = lambda: bob
-        assert (await client.get(f"/manager/tasks/{sid}/files")).status_code == 403
+        assert (
+            await client.get(f"/manager/projects/{project_id}/files")
+        ).status_code == 404
         assert (
             await client.post(
-                f"/manager/tasks/{sid}/files", files={"file": ("denied.txt", b"no")}
+                f"/manager/projects/{project_id}/files",
+                files={"file": ("denied.txt", b"no")},
             )
-        ).status_code == 403
-        assert not (changes.files.project_root("alice", project_id) / "denied.txt").exists()
+        ).status_code == 404
+        assert not (
+            changes.files.project_root("alice", project_id) / "denied.txt"
+        ).exists()
 
 
 @pytest.mark.asyncio
 async def test_team_delete_rejects_member_run_then_cascades(storage, tmp_path):
-    from egis_agentkit.extensions.message_bus import EgisMessageBus
-    from egis_agentkit.service.team.definition import TeamService
+    from egis_agentkit.extension._message_bus_impl import EgisMessageBus
+    from egis_agentkit.service.team._definition import TeamDefinition
 
     _, _, alice, _ = await identities(storage)
-    member = await AgentService(storage).save(alice, expert())
-    team = await TeamService(storage).save(
+    member = await ExpertDefinition(storage).build(alice, expert())
+    team = await TeamDefinition(storage).save(
         alice,
         {
             "team_name": "writers",
@@ -207,12 +160,12 @@ async def test_team_delete_rejects_member_run_then_cascades(storage, tmp_path):
             ],
         },
     )
-    service = TaskService(storage, tmp_path)
+    service = SessionService(storage, tmp_path)
     task = await service.create(alice, team["id"], "private")
     session = await service.session(alice, task["session_id"])
     native_team = await storage.get_team(alice.user_id, session.team_id)
     worker = native_team.data.members[0]
-    from egis_agentkit.service.workspace.changes import FileChangeService
+    from egis_agentkit.service.workspace._changes import FileChangeService
 
     changes = FileChangeService(storage, tmp_path)
     project_id = task["project_id"]
@@ -223,7 +176,7 @@ async def test_team_delete_rejects_member_run_then_cascades(storage, tmp_path):
     history = await changes.list(project_id)
     bus = EgisMessageBus(deployment_mode="cluster", engine=storage.engine)
     other = EgisMessageBus(deployment_mode="cluster", engine=storage.engine)
-    await bus.migrate()
+    await bus.init_schema()
     key = MessageBusKeys.session_lock(worker.session_id)
     assert await other.try_lock(key)
     with pytest.raises(Conflict):
@@ -254,8 +207,8 @@ async def test_task_dto_reads_persisted_native_plan(storage, tmp_path):
     from agentscope.state import Task
 
     _, _, alice, _ = await identities(storage)
-    source = await AgentService(storage).save(alice, expert())
-    service = TaskService(storage, tmp_path)
+    source = await ExpertDefinition(storage).build(alice, expert())
+    service = SessionService(storage, tmp_path)
     task = await service.create(alice, source["id"], "private")
     assert task["plan"] == []
     session = await service.session(alice, task["session_id"])
@@ -278,14 +231,12 @@ async def test_task_dto_reads_persisted_native_plan(storage, tmp_path):
 
 @pytest.mark.asyncio
 async def test_owner_can_delete_after_system_agent_grant_revoked(storage, tmp_path):
-    from egis_agentkit.extensions.message_bus import EgisMessageBus
-    from egis_agentkit.models import Grant
-    from egis_agentkit.services import PermissionService
+    from egis_agentkit.extension._message_bus_impl import EgisMessageBus
+    from egis_agentkit.storage.model import Grant
 
     users, admin, alice, bob = await identities(storage)
-    source = await AgentService(storage).save(admin, expert("sys", "system"))
-    permissions = PermissionService(storage)
-    grant = await permissions.grant(
+    source = await ExpertDefinition(storage).build(admin, expert("sys", "system"))
+    grant = await GrantService(storage).grant(
         admin,
         Grant(
             principal_type="user",
@@ -297,10 +248,10 @@ async def test_owner_can_delete_after_system_agent_grant_revoked(storage, tmp_pa
             resource_owner_id="sys",
         ),
     )
-    service = TaskService(storage, tmp_path)
+    service = SessionService(storage, tmp_path)
     task = await service.create(alice, source["id"], "system")
     service.files.write(alice.user_id, task["project_id"], "keep.txt", b"keep")
-    await permissions.revoke(admin, grant["id"])
+    await GrantService(storage).revoke(admin, grant["id"])
     bus = EgisMessageBus()
     with pytest.raises(Forbidden):
         await service.get(alice, task["session_id"])
@@ -311,9 +262,10 @@ async def test_owner_can_delete_after_system_agent_grant_revoked(storage, tmp_pa
         await service.delete(alice, task["session_id"], bus)
     await users.update_user(admin, alice)
     await service.delete(alice, task["session_id"], bus)
-    assert service.files.read(
-        alice.user_id, task["project_id"], "work", "keep.txt"
-    )[0] == b"keep"
+    assert (
+        service.files.read(alice.user_id, task["project_id"], "work", "keep.txt")[0]
+        == b"keep"
+    )
     assert (
         await storage.get_session(alice.user_id, task["agent_id"], task["session_id"])
         is None

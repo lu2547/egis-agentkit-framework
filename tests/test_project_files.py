@@ -1,10 +1,8 @@
-import os
-
 import pytest
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.service.workspace.changes import FileChangeService
-from egis_agentkit.service.workspace.files import WorkspaceFiles
+from egis_agentkit.service.workspace._changes import FileChangeService
+from egis_agentkit.storage._workspace import WorkspaceFiles
 
 
 def test_project_layout_keeps_uploads_flat_and_reserved_areas_separate(tmp_path):
@@ -62,8 +60,6 @@ def test_project_removal_retains_other_projects_and_does_not_follow_links(tmp_pa
     outside.mkdir()
     (outside / "secret").write_bytes(b"secret")
     (files.project_root("alice", "first") / "link").symlink_to(outside)
-    files.remove_session("alice", "first")
-    assert files.project_root("alice", "first").exists()
     files.remove_project("alice", "first")
     assert not files.project_root("alice", "first").exists()
     assert files.read("alice", "second", "work", "keep.txt")[0] == b"keep"
@@ -71,43 +67,6 @@ def test_project_removal_retains_other_projects_and_does_not_follow_links(tmp_pa
     files.discover_deliveries("alice", "first")
     assert files.list("alice", "first", "uploads") == []
     assert not files.project_root("alice", "first").exists()
-
-
-def test_legacy_migration_merges_collisions_and_never_follows_symlinks(tmp_path):
-    files = WorkspaceFiles(tmp_path)
-    legacy = files.user_root("alice")
-    for area in ("uploads", "work", "artifacts"):
-        old = legacy / area / "session"
-        old.mkdir(parents=True)
-        (old / "same.txt").write_bytes(area.encode())
-        files.write("alice", "project", "same.txt", b"existing", area=area)
-    (legacy / "uploads/archive.txt").write_bytes(b"archive")
-    reserved = legacy / "uploads/session/.work"
-    reserved.mkdir()
-    (reserved / "input.txt").write_bytes(b"reserved input")
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (outside / "secret").write_bytes(b"secret")
-    (legacy / "work/session/link").symlink_to(outside)
-    # Migration is independent of preview/download limits.
-    files.max_bytes = 2
-    mapping = files.migrate_legacy_session("alice", "session", "project")
-    for area in ("uploads", "work", "artifacts"):
-        assert mapping[(area, "same.txt")] == (area, "same-legacy-session-1.txt")
-        assert (
-            files.area_root("alice", "project", area) / "same.txt"
-        ).read_bytes() == b"existing"
-        assert (
-            files.area_root("alice", "project", area) / "same-legacy-session-1.txt"
-        ).read_bytes() == area.encode()
-        assert not (legacy / area / "session").exists()
-    assert (
-        mapping[("uploads", ".work/input.txt")][1] == ".work-legacy-session-1/input.txt"
-    )
-    assert not (files.project_root("alice", "project") / ".work/link").exists()
-    assert (outside / "secret").read_bytes() == b"secret"
-    assert (legacy / "uploads/archive.txt").read_bytes() == b"archive"
-    assert files.migrate_legacy_session("alice", "session", "project") == mapping
 
 
 def test_delivery_discovery_excludes_project_inputs_but_keeps_work_outputs(tmp_path):
@@ -122,96 +81,14 @@ def test_delivery_discovery_excludes_project_inputs_but_keeps_work_outputs(tmp_p
     ]
 
 
-@pytest.mark.parametrize("interrupted_step", ["journal", "unlink"])
-def test_legacy_migration_retries_without_duplicates_after_interruption(
-    tmp_path, monkeypatch, interrupted_step
-):
-    files = WorkspaceFiles(tmp_path)
-    legacy = files.user_root("alice") / "uploads/session"
-    legacy.mkdir(parents=True)
-    (legacy / "input.txt").write_bytes(b"input")
-    files.write("alice", "project", "input.txt", b"existing", area="uploads")
-    operation = "fsync" if interrupted_step == "journal" else "unlink"
-    original = getattr(os, operation)
-
-    def interrupt(*args, **kwargs):
-        # The target directory is durable before its journal entry is opened.
-        if (
-            operation == "fsync"
-            and files.area_root("alice", "project", "work")
-            .joinpath(".legacy-migrations/session.jsonl")
-            .exists()
-        ) or (operation == "unlink" and args[0] == "input.txt"):
-            raise RuntimeError("interrupted")
-        return original(*args, **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(os, operation, interrupt)
-        with pytest.raises(RuntimeError, match="interrupted"):
-            files.migrate_legacy_session("alice", "session", "project")
-    assert (legacy / "input.txt").read_bytes() == b"input"
-    mapping = files.migrate_legacy_session("alice", "session", "project")
-    assert mapping == {
-        ("uploads", "input.txt"): ("uploads", "input-legacy-session-1.txt")
-    }
-    assert [item["path"] for item in files.list("alice", "project", "uploads")] == [
-        "input-legacy-session-1.txt",
-        "input.txt",
-    ]
-    assert files.migrate_legacy_session("alice", "session", "project") == mapping
-
-
-def test_legacy_migration_does_not_follow_source_or_destination_links(tmp_path):
-    files = WorkspaceFiles(tmp_path)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (outside / "secret").write_bytes(b"secret")
-    legacy = files.user_root("alice") / "uploads"
-    legacy.mkdir(parents=True)
-    (legacy / "linked-session").symlink_to(outside)
-    assert files.migrate_legacy_session("alice", "linked-session", "project") == {}
-    assert not files.project_root("alice", "project").exists()
-    source = legacy / "session"
-    source.mkdir()
-    (source / "folder").mkdir()
-    (source / "folder/input.txt").write_bytes(b"input")
-    project = files.project_root("alice", "project")
-    project.mkdir(parents=True)
-    (project / "folder").symlink_to(outside)
-    mapping = files.migrate_legacy_session("alice", "session", "project")
-    assert mapping[("uploads", "folder/input.txt")] == (
-        "uploads",
-        "folder-legacy-session-1/input.txt",
-    )
-    assert (outside / "secret").read_bytes() == b"secret"
-    assert list(outside.iterdir()) == [outside / "secret"]
-
-
-def test_legacy_migration_recovers_partial_journal_and_long_name_collisions(tmp_path):
-    files = WorkspaceFiles(tmp_path)
-    legacy = files.user_root("alice") / "uploads/session"
-    legacy.mkdir(parents=True)
-    filename = "x" * 247 + ".txt"
-    (legacy / filename).write_bytes(b"input")
-    files.write("alice", "project", filename, b"existing", area="uploads")
-    journal = files.area_root("alice", "project", "work") / ".legacy-migrations/session.jsonl"
-    journal.parent.mkdir(parents=True)
-    journal.write_bytes(b'["uploads", "unfinished')
-    mapping = files.migrate_legacy_session("alice", "session", "project")
-    renamed = mapping[("uploads", filename)][1]
-    assert len(renamed.encode()) <= 255
-    assert renamed.endswith("-legacy-session-1.txt")
-    assert files.read("alice", "project", "uploads", renamed)[0] == b"input"
-    assert files.read("alice", "project", "uploads", filename)[0] == b"existing"
-    assert files.migrate_legacy_session("alice", "session", "project") == mapping
-
-
 @pytest.mark.asyncio
 async def test_native_workspace_uses_project_scope_for_shared_sessions(tmp_path):
     from types import SimpleNamespace
 
-    from egis_agentkit.extensions.compatibility.execution import execution_scope
-    from egis_agentkit.extensions.workspace.local import EgisLocalWorkspaceManager
+    from egis_agentkit.extension._session_lock_override import execution_scope
+    from egis_agentkit.extension._workspace_manager_impl import (
+        EgisLocalWorkspaceManager,
+    )
 
     manager = EgisLocalWorkspaceManager(tmp_path)
     scope = execution_scope.set(
@@ -308,9 +185,7 @@ async def test_late_observation_skips_deleted_and_deleting_projects(
     assert service.files.read("alice", "deleting", "work", "keep.txt")[0] == b"existing"
     async with storage.engine.connect() as conn:
         for table in (
-            t.file_baselines,
             t.file_fingerprints,
             t.file_changes,
-            t.file_scan_errors,
         ):
             assert not (await conn.execute(select(table))).all()

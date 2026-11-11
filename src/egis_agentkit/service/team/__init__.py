@@ -1,5 +1,1 @@
-"""service team entry points."""
-
-from .service import TeamService
-
-__all__ = ['TeamService']
+"""专家团的定义维护与原生协作。"""

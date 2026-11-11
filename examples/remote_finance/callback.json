@@ -1,0 +1,18 @@
+{
+  "agent_type": "remote",
+  "agent_name": "finance-callback",
+  "agent_display_name": "财务专家 · callback",
+  "payload": {
+    "description": "汇总报销金额并回答当前会话的追问。",
+    "remote_config": {
+      "transport": "http_callback",
+      "protocol_version": "v1",
+      "endpoint": "http://127.0.0.1:8120/callback/v1/runs",
+      "credential_ref": "EGIS_REMOTE_AGENT_FINANCE_TOKEN",
+      "timeout_seconds": 5,
+      "retries": 1,
+      "callback_secret_ref": "EGIS_REMOTE_AGENT_FINANCE_CALLBACK_SECRET",
+      "cancel_endpoint": "http://127.0.0.1:8120/v1/cancel"
+    }
+  }
+}

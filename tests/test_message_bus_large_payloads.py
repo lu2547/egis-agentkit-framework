@@ -16,8 +16,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import StatementError
 from test_message_bus import pg_engine as pg_engine
 
-from egis_agentkit.extensions.message_bus import EgisMessageBus
-from egis_agentkit.integration.kafka import KafkaTransport
+from egis_agentkit.extension._message_bus_impl import EgisMessageBus
+from egis_agentkit.backend._kafka import KafkaTransport
 
 
 class LimitedBroker:
@@ -71,7 +71,7 @@ async def limited_buses(pg_engine):
     buses = [
         EgisMessageBus(deployment_mode="cluster", engine=pg_engine) for _ in range(2)
     ]
-    await buses[0].migrate()
+    await buses[0].init_schema()
     for bus in buses:
         transport = KafkaTransport(bus._pg, **bus._kafka_args)
         bus._transport = transport
@@ -136,7 +136,7 @@ async def test_small_broadcast_stays_inline_without_payload_storage(limited_buse
     }
     async with a._pg.engine.connect() as conn:
         assert (
-            await conn.scalar(text("SELECT count(*) FROM egis_bus_broadcast_payloads"))
+            await conn.scalar(text("SELECT count(*) FROM ak_bus_broadcast_payloads"))
             == 0
         )
 
@@ -203,7 +203,7 @@ async def test_oversized_broadcast_is_rejected_before_pg_or_kafka_write(limited_
     assert broker.records == []
     async with a._pg.engine.connect() as conn:
         assert (
-            await conn.scalar(text("SELECT count(*) FROM egis_bus_broadcast_payloads"))
+            await conn.scalar(text("SELECT count(*) FROM ak_bus_broadcast_payloads"))
             == 0
         )
 
@@ -233,7 +233,7 @@ async def test_missing_large_payload_fails_subscriber_instead_of_skipping(
 
 async def test_payload_expiry_is_individual_and_sweeps_without_tombstones(pg_engine):
     bus = EgisMessageBus(deployment_mode="cluster", engine=pg_engine)
-    await bus.migrate()
+    await bus.init_schema()
     expired = await bus._pg.broadcast_store("topic", "key", {"n": 1}, ttl_secs=0.05)
     live = await bus._pg.broadcast_store("topic", "key", {"n": 2}, ttl_secs=30)
     assert await bus._pg.broadcast_read("topic", "key", expired) == {"n": 1}
@@ -248,10 +248,10 @@ async def test_payload_expiry_is_individual_and_sweeps_without_tombstones(pg_eng
     await bus._pg.sweep_expired()
     async with pg_engine.connect() as conn:
         assert (
-            await conn.scalar(text("SELECT count(*) FROM egis_bus_broadcast_payloads"))
+            await conn.scalar(text("SELECT count(*) FROM ak_bus_broadcast_payloads"))
             == 1
         )
-        assert await conn.scalar(text("SELECT count(*) FROM egis_bus_keys")) == 0
+        assert await conn.scalar(text("SELECT count(*) FROM ak_bus_keys")) == 0
 
 
 async def test_send_failure_is_visible_and_preserves_possible_accepted_reference(
@@ -265,7 +265,7 @@ async def test_send_failure_is_visible_and_preserves_possible_accepted_reference
     # until TTL cleanup, so a possibly accepted reference remains resolvable.
     async with a._pg.engine.connect() as conn:
         assert (
-            await conn.scalar(text("SELECT count(*) FROM egis_bus_broadcast_payloads"))
+            await conn.scalar(text("SELECT count(*) FROM ak_bus_broadcast_payloads"))
             == 1
         )
 
@@ -290,3 +290,28 @@ async def test_payload_storage_error_does_not_expose_sql_parameters(
         await a.publish("failure", {"image": secret + "A" * 1_357_803})
     assert secret not in "".join(traceback.format_exception(failure.value))
     assert broker.records == []
+
+
+async def test_kafka_uses_configured_cluster_and_broadcast_byte_limit():
+    from egis_agentkit.backend.nacos._settings import KafkaConfig
+
+    settings = KafkaConfig.model_validate(
+        {
+            "connection": {
+                "deployment_mode": "cluster",
+                "topic_prefix": "settings-check",
+                "consumer_group": "settings-group",
+            },
+            "transport": {"buffer_size": 5},
+            "broadcast": {"max_bytes": 64, "inline_max_bytes": 32},
+        }
+    )
+    bus = EgisMessageBus(engine=object(), kafka=settings)
+    transport = KafkaTransport(bus._pg, **bus._kafka_args)
+    transport.producer = LimitedBroker()
+    assert transport.topic == "settings-check.triggers"
+    assert transport.group == "settings-group"
+    assert transport.capacity == 5
+    with pytest.raises(ValueError, match="exceeds 64 bytes"):
+        await transport.publish("scope", {"text": "x" * 64})
+    assert transport.producer.records == []

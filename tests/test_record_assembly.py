@@ -2,12 +2,14 @@ from agentscope.app.storage import AgentRecord, TeamMember, TeamRecord
 
 
 def test_agent_factory_prepares_invitable_team_record_and_projects_pinned_data():
-    from egis_agentkit.service.agent.assembly import AgentRecordFactory
+    from types import SimpleNamespace
 
-    agent = AgentRecordFactory.create(
+    from egis_agentkit.extension._session_lock_override import projected_agent
+    from egis_agentkit.service.agent._definition_base import AgentDefinitionBase
+
+    agent = AgentDefinitionBase.make_record(
         "alice",
-        name="expert",
-        system_prompt="latest",
+        {"agent_name": "expert"},
         source="team",
         record_id="agent-a",
         invite_description="Expert analyst",
@@ -17,16 +19,21 @@ def test_agent_factory_prepares_invitable_team_record_and_projects_pinned_data()
     assert agent.data.chat_config.invite_config.invitable
     assert agent.data.chat_config.invite_config.invite_description == "Expert analyst"
 
-    projected = AgentRecordFactory.project(agent, name="pinned", system_prompt="old")
+    projected = projected_agent(
+        agent,
+        SimpleNamespace(
+            definition={"agent_name": "pinned", "payload": {"system_prompt": "old"}}
+        ),
+    )
     assert (projected.id, projected.data.id) == (agent.id, agent.data.id)
     assert (projected.data.name, projected.data.system_prompt) == ("pinned", "old")
     assert not projected.data.chat_config.invite_config.invitable
-    assert (agent.data.name, agent.data.system_prompt) == ("expert", "latest")
+    assert (agent.data.name, agent.data.system_prompt) == ("expert", "")
     assert agent.data.chat_config.invite_config.invitable
 
 
 def test_team_factory_keeps_leader_and_worker_session_relationships():
-    from egis_agentkit.service.team.assembly import TeamRecordFactory
+    from egis_agentkit.service.team._definition import TeamDefinition
 
     workers = [
         TeamMember(
@@ -36,7 +43,7 @@ def test_team_factory_keeps_leader_and_worker_session_relationships():
             owner_id="bob", agent_id="agent-c", session_id="worker-b", role="invited"
         ),
     ]
-    team = TeamRecordFactory.create(
+    team = TeamDefinition.make_record(
         "alice",
         leader_agent_id="agent-a",
         leader_session_id="leader",

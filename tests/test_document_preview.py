@@ -6,14 +6,14 @@ import pytest
 from pypdf import PdfReader
 
 from egis_agentkit.errors import AgentKitError
-from egis_agentkit.service.workspace.preview import DocumentPreviewService
+from egis_agentkit.service.workspace._preview import OfficeToPdfConverter
 
 FIXTURES = Path(__file__).parents[2] / "egis-agentkit-frontend/tests/fixtures"
 
 
 @pytest.mark.asyncio
 async def test_converter_preserves_office_pages_and_cleans_up():
-    service = DocumentPreviewService()
+    service = OfficeToPdfConverter()
     if not service.binary:
         pytest.skip("LibreOffice executable is not installed")
     result = await service.convert(
@@ -26,7 +26,7 @@ async def test_converter_preserves_office_pages_and_cleans_up():
 
 @pytest.mark.asyncio
 async def test_converter_rejects_unsupported_and_oversized_input_before_execution():
-    service = DocumentPreviewService(binary="/not-used", max_bytes=4)
+    service = OfficeToPdfConverter(binary="/not-used", max_bytes=4)
     with pytest.raises(AgentKitError) as unsupported:
         await service.convert(b"a", "script.exe")
     assert unsupported.value.status_code == 415
@@ -40,7 +40,7 @@ async def test_converter_has_a_bound_on_process_execution(tmp_path):
     binary = tmp_path / "slow-converter"
     binary.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n")
     binary.chmod(0o700)
-    service = DocumentPreviewService(binary=str(binary), timeout=0.05)
+    service = OfficeToPdfConverter(binary=str(binary), timeout=0.05)
     with pytest.raises(AgentKitError) as timeout:
         await asyncio.wait_for(service.convert(b"input", "slides.pptx"), 5)
     assert timeout.value.status_code == 504
@@ -49,7 +49,7 @@ async def test_converter_has_a_bound_on_process_execution(tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name", ["preview.docx", "preview.xlsx"])
 async def test_converter_supports_word_and_excel(name):
-    service = DocumentPreviewService()
+    service = OfficeToPdfConverter()
     if not service.binary:
         pytest.skip("LibreOffice executable is not installed")
     result = await service.convert((FIXTURES / name).read_bytes(), name)

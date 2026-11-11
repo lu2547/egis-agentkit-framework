@@ -1,10 +1,13 @@
 # ReMe 长期记忆
 
-在部署环境安装 `egis-agentkit-framework[memory]`，在 Nacos 的 `agentkit-runtime.yaml` 中设置：
+在部署环境安装 `egis-agentkit-framework[memory]`，在 Nacos 的 `agentkit.yaml` 中设置：
 
 ```yaml
-memory:
-  is_enabled: true
+agentkit:
+  agent:
+    personal:
+      memory:
+        isEnabled: true
 ```
 
 默认关闭；开启但缺少 `reme-ai` 时应用构建立即报错。当前固定 ReMe 0.4.0.6：本地 AgentScope 的内置任务配置与 0.4.2.1 不兼容（缺少 `dream_topics_step`）。升级时须先验证 AgentScope 原生中间件启动及真实写入和检索。

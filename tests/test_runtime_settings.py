@@ -5,26 +5,37 @@ from agentscope.app.message_bus import MessageBusKeys
 from agentscope.permission import PermissionMode
 from test_domain import expert, identities
 
-from egis_agentkit.config.snapshot import PoliciesConfig
+from egis_agentkit.backend.nacos._settings import (
+    AccessConfig,
+    ProjectConfig,
+    SessionConfig,
+    SessionPermissionsConfig,
+)
 from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.extensions.message_bus import EgisMessageBus
-from egis_agentkit.services import AgentService
-from egis_agentkit.service.session.service import TaskService
+from egis_agentkit.extension._message_bus_impl import EgisMessageBus
+from egis_agentkit.service._session import SessionService
+from egis_agentkit.service.agent._expert_definition import ExpertDefinition
 
 
 @pytest.mark.asyncio
 async def test_modes_are_persisted_policy_checked_and_locked(storage, tmp_path):
     _, _, alice, bob = await identities(storage)
-    source = await AgentService(storage).save(alice, expert())
+    source = await ExpertDefinition(storage).build(alice, expert())
     config = SimpleNamespace(
         snapshot=SimpleNamespace(
-            policies=PoliciesConfig(
-                config_version=1,
-                allowed_permission_modes=["default", "accept_edits", "explore"],
-            )
+            access=AccessConfig(),
+            project=ProjectConfig(),
+            session=SessionConfig(
+                permissions=SessionPermissionsConfig(
+                    default_mode="default",
+                    allowed_modes=["default", "accept_edits", "explore"],
+                )
+            ),
         )
     )
-    service = TaskService(storage, tmp_path, config_provider=config)
+    service = SessionService(storage, tmp_path, config_provider=config)
+    default_task = await service.create(alice, source["id"], "private")
+    assert default_task["permission_mode"] == "default"
     task = await service.create(
         alice, source["id"], "private", permission_mode=PermissionMode.EXPLORE
     )
@@ -35,7 +46,7 @@ async def test_modes_are_persisted_policy_checked_and_locked(storage, tmp_path):
         )
     bus = EgisMessageBus(deployment_mode="cluster", engine=storage.engine)
     other = EgisMessageBus(deployment_mode="cluster", engine=storage.engine)
-    await bus.migrate()
+    await bus.init_schema()
     key = MessageBusKeys.session_lock(task["session_id"])
     assert await other.try_lock(key)
     with pytest.raises(Conflict):
@@ -58,8 +69,11 @@ async def test_modes_are_persisted_policy_checked_and_locked(storage, tmp_path):
     assert (
         await service.session(alice, task["session_id"])
     ).state.permission_context.mode == PermissionMode.ACCEPT_EDITS
-    config.snapshot.policies = PoliciesConfig(
-        config_version=1, allowed_permission_modes=["default", "bypass"]
+    config.snapshot.session = SessionConfig(
+        permissions=SessionPermissionsConfig(
+            default_mode="default",
+            allowed_modes=["default", "bypass"],
+        )
     )
     enabled = await service.update_settings(
         alice, task["session_id"], bus, permission_mode=PermissionMode.BYPASS
@@ -73,41 +87,53 @@ async def test_modes_are_persisted_policy_checked_and_locked(storage, tmp_path):
 async def test_model_update_resolves_and_persists_native_config(
     storage, tmp_path, monkeypatch
 ):
-    from egis_agentkit.config.snapshot import ModelsConfig
-    from egis_agentkit.service.model.service import ModelService
+    from egis_agentkit.backend.nacos._settings import AgentKitConfig
+    from egis_agentkit.service._model import ModelService
 
     _, _, alice, _ = await identities(storage)
-    source = await AgentService(storage).save(alice, expert())
+    source = await ExpertDefinition(storage).build(alice, expert())
     monkeypatch.setenv("TEST_SETTINGS_MODEL_KEY", "test-only-credential")
-    models = ModelsConfig.model_validate(
-        {
-            "config_version": 1,
-            "default_key": "a",
-            "models": [
-                {
-                    "key": "a",
-                    "display_name": "A",
-                    "model": "model-a",
-                    "api_key_env": "TEST_SETTINGS_MODEL_KEY",
+
+    def settings(allow_override=True):
+        return AgentKitConfig.model_validate(
+            {
+                "revision": 1,
+                "workspace": {
+                    "runtime": {"root": str(tmp_path)},
+                    "upload": {"max_bytes": 20_971_520},
                 },
-                {
-                    "key": "b",
-                    "display_name": "B",
-                    "model": "model-b",
-                    "api_key_env": "TEST_SETTINGS_MODEL_KEY",
+                "user": {
+                    "identity": {
+                        "mode": "demo",
+                        "issuer": "test",
+                        "audience": "test",
+                        "algorithm": "HS256",
+                    }
                 },
-            ],
-        }
-    )
-    config = SimpleNamespace(
-        snapshot=SimpleNamespace(
-            config_version=1, models=models, policies=PoliciesConfig(config_version=1)
+                "model": {
+                    "catalog": {
+                        "models": [
+                            {
+                                "key": key,
+                                "display_name": key.upper(),
+                                "model": f"model-{key}",
+                                "api_key_env": "TEST_SETTINGS_MODEL_KEY",
+                            }
+                            for key in ("a", "b")
+                        ]
+                    },
+                    "selection": {"default_key": "a", "allow_override": allow_override},
+                },
+            }
         )
-    )
-    service = TaskService(
+
+    config = SimpleNamespace(snapshot=settings())
+    service = SessionService(
         storage, tmp_path, models=ModelService(storage, config), config_provider=config
     )
-    task = await service.create(alice, source["id"], "private")
+    task = await service.create(
+        alice, source["id"], "private", permission_mode=PermissionMode.DEFAULT
+    )
     bus = EgisMessageBus()
     updated = await service.update_settings(
         alice, task["session_id"], bus, model_key="b"
@@ -116,9 +142,7 @@ async def test_model_update_resolves_and_persists_native_config(
     assert updated["model_key"] == "b"
     assert session.config.chat_model_config.model == "model-b"
     assert session.state.permission_context.mode == PermissionMode.DEFAULT
-    config.snapshot.policies = PoliciesConfig(
-        config_version=1, allow_model_override=False
-    )
+    config.snapshot = settings(allow_override=False)
     with pytest.raises(Forbidden):
         await service.update_settings(alice, task["session_id"], bus, model_key="a")
 
@@ -126,29 +150,42 @@ async def test_model_update_resolves_and_persists_native_config(
 @pytest.mark.asyncio
 async def test_runtime_options_and_settings_http(storage, tmp_path):
     from types import SimpleNamespace
+
     import httpx
-    from fastapi import FastAPI
     from egis_agentkit_app.manager_router import router
     from egis_agentkit_app.security import current_user
+    from fastapi import FastAPI
 
     _, _, alice, _ = await identities(storage)
-    source = await AgentService(storage).save(alice, expert())
-    service = TaskService(storage, tmp_path)
+    source = await ExpertDefinition(storage).build(alice, expert())
+    service = SessionService(storage, tmp_path)
     task = await service.create(alice, source["id"], "private")
     app = FastAPI()
     app.include_router(router)
-    app.state.egis_services = SimpleNamespace(tasks=service)
+    app.state.egis_services = SimpleNamespace(sessions=service)
     app.state.egis_bus = EgisMessageBus()
     app.dependency_overrides[current_user] = lambda: alice
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         options = (await client.get("/manager/runtime-options")).json()
-        assert options["default_permission_mode"] == "default"
+        assert options["default_permission_mode"] == "bypass"
+        assert task["permission_mode"] == "bypass"
         assert {m["value"]: m["is_enabled"] for m in options["permission_modes"]}[
             "bypass"
         ] is True
         assert "dont_ask" not in {m["value"] for m in options["permission_modes"]}
+        created = await client.post(
+            "/manager/tasks",
+            json={
+                "definition_id": source["id"],
+                "resource_view_type": "private",
+                "resource_version": "1",
+            },
+        )
+        assert created.status_code == 201
+        assert created.json()["resource_version"] == "1"
+        assert created.json()["permission_mode"] == "bypass"
         result = await client.patch(
             f"/manager/tasks/{task['session_id']}/settings",
             json={"permission_mode": "explore"},
@@ -164,23 +201,54 @@ async def test_runtime_options_and_settings_http(storage, tmp_path):
         ).status_code == 422
 
 
-def test_full_access_default_and_retired_dont_ask_is_rejected(tmp_path):
-    defaults = PoliciesConfig(config_version=1)
-    assert PermissionMode.BYPASS in defaults.allowed_permission_modes
-    assert PermissionMode.DONT_ASK not in defaults.allowed_permission_modes
-    service = TaskService(None, tmp_path)
+def test_full_access_default_and_unsupported_dont_ask_is_rejected(tmp_path):
+    defaults = SessionPermissionsConfig()
+    assert PermissionMode.BYPASS in defaults.allowed_modes
+    assert PermissionMode.DONT_ASK not in defaults.allowed_modes
+    service = SessionService(None, tmp_path)
     assert service.require_mode("bypass") == PermissionMode.BYPASS
     with pytest.raises(Forbidden):
         service.require_mode("dont_ask")
     service.config = SimpleNamespace(
         snapshot=SimpleNamespace(
-            policies=SimpleNamespace(
-                allowed_permission_modes=[
-                    PermissionMode.DEFAULT,
-                    PermissionMode.DONT_ASK,
-                ]
+            session=SimpleNamespace(
+                permissions=SimpleNamespace(
+                    allowed_modes=[PermissionMode.DEFAULT, PermissionMode.DONT_ASK]
+                )
             )
         )
     )
     with pytest.raises(Forbidden):
         service.require_mode("dont_ask")
+
+
+@pytest.mark.asyncio
+async def test_configured_session_naming_and_listing_limits(storage, tmp_path):
+    from test_app_http import app_snapshot
+
+    _, _, alice, _ = await identities(storage)
+    source = await ExpertDefinition(storage).build(alice, expert())
+    config = SimpleNamespace(
+        snapshot=app_snapshot(
+            tmp_path,
+            session={
+                "naming": {
+                    "default_name": "讨论",
+                    "max_length": 3,
+                    "create_max_length": 4,
+                },
+                "listing": {"max_sessions": 1},
+            },
+        )
+    )
+    service = SessionService(storage, tmp_path, config_provider=config)
+    assert (await service.create(alice, source["id"], "private"))["name"] == "讨论"
+    second = await service.create(alice, source["id"], "private", name="标题")
+    assert [item["session_id"] for item in await service.list(alice)] == [
+        second["session_id"]
+    ]
+    with pytest.raises(ValueError, match="4"):
+        await service.create(alice, source["id"], "private", name="12345")
+    async with EgisMessageBus() as bus:
+        with pytest.raises(ValueError, match="3"):
+            await service.rename(alice, second["session_id"], bus, "1234")

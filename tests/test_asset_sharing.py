@@ -1,11 +1,10 @@
 import pytest
-from sqlalchemy import select, update
-from test_domain import identities
-from test_resources import Registry, service
+from sqlalchemy import select
+from test_domain import COMPANY, identities
 
 from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.models import Asset
-from egis_agentkit.services import ShareService
+from egis_agentkit.service.access._share import ShareService
+from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.storage import tables as t
 
 
@@ -15,7 +14,7 @@ async def test_private_asset_requires_review_and_approval_grants_exact_version(
     storage, tmp_path, kind
 ):
     _, admin, alice, bob = await identities(storage)
-    resources, http = await service(storage, tmp_path, Registry())
+    resources = ResourceService(storage, tmp_path)
     shares = ShareService(storage)
     data = {"resource_id": "private-asset", "resource_version": "1.0.0"}
     data.update(
@@ -25,112 +24,93 @@ async def test_private_asset_requires_review_and_approval_grants_exact_version(
             "config": {"transport": "streamable_http", "url": "http://example.com/mcp"}
         }
     )
-    async with http:
-        own = await (
-            resources.save_skill(alice, data)
-            if kind == "skill"
-            else resources.save_mcp(alice, data)
-        )
-        assert own["is_usable"]
-        assert await resources.list(bob, kind) == []
-        with pytest.raises(Forbidden):
-            await shares.submit(bob, kind, data["resource_id"], "1.0.0")
-        review = await shares.submit(alice, kind, data["resource_id"], "1.0.0")
-        asset = await resources._asset(kind, data["resource_id"], "1.0.0")
-        assert review["snapshot"]["asset"] == {k: asset[k] for k in Asset.model_fields}
-        assert review["source_versions"] == {data["resource_id"]: "1.0.0"}
-        assert await resources.list(bob, kind) == []
-        approved = await shares.decide(admin, review["review_id"], True, "")
-        assert approved["is_current"] and approved["shared_version"] == 1
-        assert (await shares.decide(admin, review["review_id"], True, ""))[
-            "shared_version"
-        ] == 1
-        assert (await resources.detail(bob, kind, data["resource_id"], "1.0.0"))[
-            "is_usable"
-        ]
-        async with storage.engine.connect() as conn:
-            grants = (await conn.execute(select(t.grants))).mappings().all()
-        assert len(grants) == 1
-        assert (
-            grants[0]["principal_type"] == "all_users"
-            and grants[0]["grant_source_type"] == "share"
-        )
-        assert grants[0]["source_review_id"] == review["review_id"]
-        newer = {**data, "resource_version": "1.1.0"}
-        await (
-            resources.save_skill(alice, newer)
-            if kind == "skill"
-            else resources.save_mcp(alice, newer)
-        )
-        with pytest.raises(Forbidden):
-            await resources.detail(bob, kind, data["resource_id"], "1.1.0")
+    own = await (
+        resources.save_skill(alice, data)
+        if kind == "skill"
+        else resources.save_mcp(alice, data)
+    )
+    assert own["is_usable"]
+    assert await resources.list(bob, kind) == []
+    with pytest.raises(Forbidden):
+        await shares.submit(bob, kind, data["resource_id"], target=COMPANY)
+    review = await shares.submit(alice, kind, data["resource_id"], target=COMPANY)
+    assert review["resource_version"] == "1.0.0"
+    assert "snapshot" not in review
+    assert await resources.list(bob, kind) == []
+    approved = await shares.decide(admin, review["review_id"], True, "")
+    assert approved["is_current"] and approved["resource_version"] == "1.0.0"
+    assert await shares.decide(admin, review["review_id"], True, "") == approved
+    assert (await resources.detail(bob, kind, data["resource_id"], "1.0.0"))[
+        "is_usable"
+    ]
+    async with storage.engine.connect() as conn:
+        grants = (await conn.execute(select(t.grants))).mappings().all()
+    assert {(row["grant_source_type"], row["principal_type"]) for row in grants} == {
+        ("owner", "user"),
+        ("share", "group"),
+    }
+    shared = next(row for row in grants if row["grant_source_type"] == "share")
+    assert shared["source_review_id"] == review["review_id"]
+    assert "resource_version" not in shared
+    newer = {**data, "resource_version": "1.1.0", "base_version": "1.0.0"}
+    await (
+        resources.save_skill(alice, newer)
+        if kind == "skill"
+        else resources.save_mcp(alice, newer)
+    )
+    with pytest.raises(Forbidden):
+        await resources.detail(bob, kind, data["resource_id"], "1.1.0")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "change", [{"is_enabled": False}, {"checksum_sha256": "a" * 64}]
-)
-async def test_approval_rejects_disabled_or_changed_asset(storage, change):
+async def test_approval_rejects_disabled_asset_version(storage, tmp_path):
     _, admin, alice, _ = await identities(storage)
-    asset = Asset(
-        resource_type="skill",
-        resource_id="report",
-        resource_version="1.0.0",
-        owner_type="user",
-        owner_id="alice",
-        checksum_sha256="b" * 64,
+    resources = ResourceService(storage, tmp_path)
+    await resources.save_skill(
+        alice,
+        {"resource_id": "report", "resource_version": "1.0.0", "markdown": "# Report"},
     )
-    async with storage.transaction() as conn:
-        await conn.execute(
-            t.assets.insert().values(
-                **asset.model_dump(), created_by="alice", updated_by="alice"
-            )
-        )
     shares = ShareService(storage)
-    review = await shares.submit(alice, "skill", "report", "1.0.0")
-    async with storage.transaction() as conn:
-        await conn.execute(
-            update(t.assets).where(t.assets.c.resource_id == "report").values(**change)
-        )
+    review = await shares.submit(alice, "skill", "report", target=COMPANY)
+    await resources.set_asset_enabled(alice, "skill", "report", "1.0.0", False)
     with pytest.raises(Conflict):
         await shares.decide(admin, review["review_id"], True, "")
 
 
 @pytest.mark.asyncio
-async def test_asset_submission_requires_enabled_exact_version_and_reapproval_replaces_current(
-    storage, tmp_path
-):
+async def test_asset_update_moves_one_shared_publication(storage, tmp_path):
     _, admin, alice, bob = await identities(storage)
-    resources, http = await service(storage, tmp_path, Registry())
+    resources = ResourceService(storage, tmp_path)
     shares = ShareService(storage)
     data = {"resource_id": "versions", "resource_version": "1.0.0", "markdown": "# One"}
-    async with http:
-        await resources.save_skill(alice, data)
-        with pytest.raises(Conflict):
-            await shares.submit(alice, "skill", "versions")
-        first = await shares.submit(alice, "skill", "versions", "1.0.0")
-        await shares.decide(admin, first["review_id"], True, "")
-        await resources.save_skill(
-            alice, {**data, "resource_version": "2.0.0", "markdown": "# Two"}
-        )
-        second = await shares.submit(alice, "skill", "versions", "2.0.0")
-        assert (await shares.decide(admin, second["review_id"], True, ""))[
-            "shared_version"
-        ] == 2
-        assert (await resources.detail(bob, "skill", "versions", "2.0.0"))["is_usable"]
-        with pytest.raises(Forbidden):
-            await resources.detail(bob, "skill", "versions", "1.0.0")
-        async with storage.engine.connect() as conn:
-            grants = (await conn.execute(select(t.grants))).mappings().all()
-        assert len(grants) == 1 and grants[0]["source_review_id"] == second["review_id"]
-        async with storage.transaction() as conn:
-            await conn.execute(
-                update(t.assets)
-                .where(
-                    t.assets.c.resource_id == "versions",
-                    t.assets.c.resource_version == "2.0.0",
-                )
-                .values(is_enabled=False)
-            )
-        with pytest.raises(Conflict):
-            await shares.submit(alice, "skill", "versions", "2.0.0")
+    await resources.save_skill(alice, data)
+    with pytest.raises(Conflict):
+        await shares.submit(alice, "skill", "versions")
+    first = await shares.submit(alice, "skill", "versions", target=COMPANY)
+    await shares.decide(admin, first["review_id"], True, "")
+    await resources.save_skill(
+        alice,
+        {
+            **data,
+            "resource_version": "2.0.0",
+            "base_version": "1.0.0",
+            "markdown": "# Two",
+        },
+    )
+    second = await shares.submit(alice, "skill", "versions")
+    assert (await shares.decide(admin, second["review_id"], True, ""))[
+        "resource_version"
+    ] == "2.0.0"
+    assert (await resources.detail(bob, "skill", "versions", "2.0.0"))["is_usable"]
+    with pytest.raises(Forbidden):
+        await resources.detail(bob, "skill", "versions", "1.0.0")
+    async with storage.engine.connect() as conn:
+        grants = (await conn.execute(select(t.grants))).mappings().all()
+    assert {
+        row["source_review_id"] for row in grants if row["grant_source_type"] == "share"
+    } == {first["review_id"]}
+    await resources.set_asset_enabled(alice, "skill", "versions", "2.0.0", False)
+    with pytest.raises(Forbidden):
+        await resources.detail(bob, "skill", "versions", "2.0.0")
+    with pytest.raises(Conflict):
+        await shares.submit(alice, "skill", "versions", target=COMPANY)

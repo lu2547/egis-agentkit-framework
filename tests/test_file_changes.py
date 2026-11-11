@@ -2,9 +2,10 @@ import pytest
 from test_domain import expert, identities
 
 from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.services import AgentService
-from egis_agentkit.service.workspace.changes import FileChangeService
-from egis_agentkit.service.session.service import TaskService
+from egis_agentkit.service._project import ProjectService
+from egis_agentkit.service._session import SessionService
+from egis_agentkit.service.agent._expert_definition import ExpertDefinition
+from egis_agentkit.service.workspace._changes import FileChangeService
 
 
 class Bus:
@@ -21,8 +22,8 @@ class Bus:
 @pytest.mark.asyncio
 async def test_rename_owner_lock_and_persistence(storage, tmp_path):
     _, _, alice, bob = await identities(storage)
-    source = await AgentService(storage).save(alice, expert())
-    service = TaskService(storage, tmp_path)
+    source = await ExpertDefinition(storage).build(alice, expert())
+    service = SessionService(storage, tmp_path)
     task = await service.create(alice, source["id"], "private")
     sid = task["session_id"]
     with pytest.raises(Forbidden):
@@ -33,7 +34,7 @@ async def test_rename_owner_lock_and_persistence(storage, tmp_path):
     assert renamed["name"] == "新名称"
     session = await storage.read_session_unscoped("alice", task["agent_id"], sid)
     assert session.config.naming.auto is False
-    assert (await TaskService(storage, tmp_path).get(alice, sid))["name"] == "新名称"
+    assert (await SessionService(storage, tmp_path).get(alice, sid))["name"] == "新名称"
     with pytest.raises(Conflict):
         await service.rename(alice, sid, Bus(), "   ")
 
@@ -41,23 +42,26 @@ async def test_rename_owner_lock_and_persistence(storage, tmp_path):
 @pytest.mark.asyncio
 async def test_baseline_same_size_delete_and_symlink_isolation(storage, tmp_path):
     service = FileChangeService(storage, tmp_path)
-    root = service.files.area_root("alice", "session", "work")
-    root.mkdir(parents=True)
+    _, _, alice, _ = await identities(storage)
+    project_id = (await ProjectService(storage, tmp_path).create(alice, "Project"))[
+        "id"
+    ]
+    root = service.files.area_root("alice", project_id, "work")
     (root / "existing.txt").write_text("first")
     outside = tmp_path / "outside"
     outside.write_text("secret")
     (root / "link").symlink_to(outside)
-    await service.observe("alice", "session")
-    assert (await service.list("session"))["items"] == []
+    await service.observe("alice", project_id)
+    assert (await service.list(project_id))["items"] == []
     (root / "existing.txt").write_text("other")
     (root / "new.txt").write_text("new")
-    await service.observe("alice", "session")
+    await service.observe("alice", project_id)
     (root / "existing.txt").unlink()
-    await FileChangeService(storage, tmp_path).observe("alice", "session")
-    result = await service.list("session", limit=2)
+    await FileChangeService(storage, tmp_path).observe("alice", project_id)
+    result = await service.list(project_id, limit=2)
     assert [item["change_type"] for item in result["items"]] == ["deleted", "created"]
     assert result["next_cursor"] is not None
-    remainder = await service.list("session", result["next_cursor"])
+    remainder = await service.list(project_id, result["next_cursor"])
     assert [
         (i["path"], i["change_type"], i["size"], i["previous_size"])
         for i in remainder["items"]
@@ -70,10 +74,13 @@ async def test_failed_scan_preserves_baseline_and_reports_error(
     storage, tmp_path, monkeypatch
 ):
     service = FileChangeService(storage, tmp_path)
-    root = service.files.area_root("alice", "session", "work")
-    root.mkdir(parents=True)
+    _, _, alice, _ = await identities(storage)
+    project_id = (await ProjectService(storage, tmp_path).create(alice, "Project"))[
+        "id"
+    ]
+    root = service.files.area_root("alice", project_id, "work")
     (root / "file").write_text("one")
-    await service.observe("alice", "session")
+    await service.observe("alice", project_id)
     (root / "file").write_text("two")
     original = service.scan
 
@@ -81,28 +88,57 @@ async def test_failed_scan_preserves_baseline_and_reports_error(
         raise Conflict("scan limit")
 
     monkeypatch.setattr(service, "scan", fail)
-    await service.observe_safe("alice", "session")
-    assert (await service.list("session"))["scan_error"]["message"] == "scan limit"
-    assert (await service.list("session"))["items"] == []
+    await service.observe_safe("alice", project_id)
+    assert (await service.list(project_id))["scan_error"]["message"] == "scan limit"
+    assert (await service.list(project_id))["items"] == []
     monkeypatch.setattr(service, "scan", original)
-    await service.observe_safe("alice", "session")
-    result = await service.list("session")
+    await service.observe_safe("alice", project_id)
+    result = await service.list(project_id)
     assert result["scan_error"] is None
     assert result["items"][0]["change_type"] == "modified"
+
+
+async def test_file_history_reads_current_page_limits(storage, tmp_path):
+    from types import SimpleNamespace
+
+    from egis_agentkit.backend.nacos._settings import WorkspaceChangesConfig
+    from egis_agentkit.errors import AgentKitError
+
+    _, _, alice, _ = await identities(storage)
+    project_id = (await ProjectService(storage, tmp_path).create(alice, "Paged"))["id"]
+    service = FileChangeService(storage, tmp_path)
+    await service.observe(alice.user_id, project_id)
+    for path in ("first.txt", "second.txt"):
+        service.files.write(alice.user_id, project_id, path, b"file")
+    await service.observe(alice.user_id, project_id)
+    service.config = SimpleNamespace(
+        snapshot=SimpleNamespace(
+            workspace=SimpleNamespace(
+                changes=WorkspaceChangesConfig(default_page_size=1, max_page_size=2),
+            )
+        )
+    )
+
+    page = await service.list(project_id)
+    assert len(page["items"]) == 1
+    assert page["next_cursor"] is not None
+    assert len((await service.list(project_id, page["next_cursor"]))["items"]) == 1
+    with pytest.raises(AgentKitError) as error:
+        await service.list(project_id, limit=3)
+    assert error.value.status_code == 422
 
 
 @pytest.mark.asyncio
 async def test_task_delete_keeps_project_files_and_observation_records(
     storage, tmp_path
 ):
-    from sqlalchemy import insert, select
+    from sqlalchemy import func, select, update
 
     from egis_agentkit.storage import tables as t
-    from egis_agentkit.service.project.service import ProjectService
 
     _, _, alice, _ = await identities(storage)
-    source = await AgentService(storage).save(alice, expert())
-    tasks = TaskService(storage, tmp_path)
+    source = await ExpertDefinition(storage).build(alice, expert())
+    tasks = SessionService(storage, tmp_path)
     first = await tasks.create(alice, source["id"], "private")
     second = await tasks.create(alice, source["id"], "private")
     other_project = await ProjectService(storage, tmp_path).create(alice, "Other")
@@ -121,9 +157,9 @@ async def test_task_delete_keeps_project_files_and_observation_records(
         await changes.observe(alice.user_id, pid)
         async with storage.engine.begin() as conn:
             await conn.execute(
-                insert(t.file_scan_errors).values(
-                    project_id=pid, message="old scan error"
-                )
+                update(t.projects)
+                .where(t.projects.c.id == pid)
+                .values(scan_error="old scan error", scan_error_at=func.now())
             )
     history = await changes.list(project_id)
     from agentscope.app.message_bus import InMemoryMessageBus, MessageBusKeys
@@ -157,18 +193,21 @@ async def test_task_delete_keeps_project_files_and_observation_records(
     assert len(await bus.queue_drain(MessageBusKeys.inbox(second["session_id"]))) == 1
     for area in ("work", "artifacts", "uploads"):
         for pid in (project_id, other["project_id"]):
-            assert tasks.files.read(alice.user_id, pid, area, "file.txt")[0] == b"project file"
+            assert (
+                tasks.files.read(alice.user_id, pid, area, "file.txt")[0]
+                == b"project file"
+            )
     async with storage.engine.connect() as conn:
         for table in (
-            t.file_baselines,
             t.file_fingerprints,
             t.file_changes,
-            t.file_scan_errors,
         ):
             for pid in (project_id, other["project_id"]):
-                assert (await conn.execute(select(table).where(table.c.project_id == pid))).all()
-        members = (await conn.execute(select(t.project_sessions.c.session_id))).scalars().all()
-        assert first["session_id"] not in members
-        assert second["session_id"] in members
-        assert other["session_id"] in members
+                assert (
+                    await conn.execute(select(table).where(table.c.project_id == pid))
+                ).all()
+    members = await storage.sessions.in_project(alice.user_id, project_id)
+    assert {row.id for row in members} == {second["session_id"]}
+    members = await storage.sessions.in_project(alice.user_id, other["project_id"])
+    assert {row.id for row in members} == {other["session_id"]}
     assert (await tasks.get(alice, second["session_id"]))["project_id"] == project_id

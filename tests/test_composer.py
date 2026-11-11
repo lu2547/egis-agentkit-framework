@@ -1,6 +1,5 @@
 """Composer pages expose only currently callable options, without catalog hydration."""
 
-from importlib import import_module
 from types import SimpleNamespace
 
 import pytest
@@ -8,19 +7,23 @@ from agentscope.app.storage import SkillRecord
 from test_domain import expert, identities
 from test_resources import put_asset
 
-from egis_agentkit.service.agent.definition import AgentService
-from egis_agentkit.service.resource.service import ResourceService
-from egis_agentkit.service.workspace.files import WorkspaceFiles
+from egis_agentkit.service._composer import ComposerService
+from egis_agentkit.service._session import SessionService
+from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.service.agent._expert_definition import ExpertDefinition
+from egis_agentkit.service.agent._personal_definition import PersonalDefinition
+from egis_agentkit.service.agent._query import AgentQuery
+from egis_agentkit.service.resource._catalog import ResourceService
+from egis_agentkit.storage._workspace import WorkspaceFiles
 
 
-def composer(storage, tmp_path, *, tasks=None, projects=None):
-    cls = getattr(
-        import_module("egis_agentkit.service.session.composer"), "ComposerService"
-    )
-    resources = ResourceService(storage, None, None, None, tmp_path)
+def composer(storage, tmp_path, *, tasks=None, projects=None, config=None):
+    resources = ResourceService(storage, tmp_path)
     files = WorkspaceFiles(tmp_path)
-    workspace = SimpleNamespace(files=files, tasks=tasks, projects=projects)
-    return cls(storage, AgentService(storage), resources, workspace), files
+    workspace = SimpleNamespace(files=files, sessions=tasks, projects=projects)
+    return ComposerService(
+        storage, AgentQuery(storage), resources, workspace, config_provider=config
+    ), files
 
 
 @pytest.mark.asyncio
@@ -32,11 +35,11 @@ async def test_expert_pages_are_authorized_searchable_and_cursor_scoped(
     for index in range(23):
         row = expert(name=f"writer{index:02}")
         row.id = f"expert{index:02}"
-        await service.agents.save(alice, row)
-    await service.agents.personal(alice)
+        await ExpertDefinition(storage).build(alice, row)
+    await PersonalDefinition(storage).build(alice)
     denied = expert("demo", "system", "denied")
     denied.id = "a-denied"
-    await service.agents.save(admin, denied)
+    await ExpertDefinition(storage).build(admin, denied)
     first = await service.options(alice, "experts")
     assert len(first["items"]) == 10
     assert first["next_cursor"]
@@ -91,6 +94,48 @@ async def test_context_pages_include_uploads_and_artifacts_but_no_work_scripts(
 
 
 @pytest.mark.asyncio
+async def test_context_prefers_readable_deliveries_and_searches_labels_and_paths(
+    storage, tmp_path
+):
+    from contextlib import asynccontextmanager
+
+    _, _, alice, _ = await identities(storage)
+
+    @asynccontextmanager
+    async def guard(user, project_id):
+        yield
+
+    service, files = composer(storage, tmp_path, projects=SimpleNamespace(guard=guard))
+    delivery = "面向 AI-Coding 的知识中心建设.pptx"
+    generated = "scratch/ai_coding_knowledge_center_20261107_223808-a964f31821cf.pdf"
+    upload = "原始_资料-1234abcd.csv"
+    files.write("alice", "project", delivery, b"slides", area="artifacts")
+    files.write("alice", "project", generated, b"pdf", area="artifacts")
+    files.write("alice", "project", upload, b"data", area="uploads")
+
+    page = await service.options(alice, "context", project_id="project", limit=2)
+    assert [(row["display_name"], row["reference"]) for row in page["items"]] == [
+        (delivery, f"artifacts/{delivery}"),
+        (upload, upload),
+    ]
+    rest = await service.options(
+        alice, "context", project_id="project", cursor=page["next_cursor"], limit=2
+    )
+    expected = [("ai coding knowledge center.pdf", f"artifacts/{generated}")]
+    assert [
+        (row["display_name"], row["reference"]) for row in rest["items"]
+    ] == expected
+    assert rest["next_cursor"] is None
+    for query in ("ai coding knowledge center", "20261107_223808"):
+        result = await service.options(
+            alice, "context", project_id="project", query=query
+        )
+        assert [
+            (row["display_name"], row["reference"]) for row in result["items"]
+        ] == expected
+
+
+@pytest.mark.asyncio
 async def test_only_enabled_installed_authorized_skills_are_offered(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
     service, _ = composer(storage, tmp_path)
@@ -115,6 +160,8 @@ async def test_only_enabled_installed_authorized_skills_are_offered(storage, tmp
                     name=rid,
                     description="demo",
                     markdown="",
+                    hub_id=service.resources.skill_hub.hub_id,
+                    card_id=rid,
                     version="1.0.0",
                     enabled=enabled,
                 ),
@@ -131,34 +178,16 @@ async def test_only_enabled_installed_authorized_skills_are_offered(storage, tmp
 @pytest.mark.asyncio
 async def test_existing_nonpersonal_session_cannot_offer_invites(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
-
-    async def session(user, sid):
-        return SimpleNamespace(
-            origin=SimpleNamespace(type="user"),
-            state=SimpleNamespace(
-                middle_context={
-                    "egis_agentkit": {
-                        "is_team": False,
-                        "project_id": "project",
-                        "snapshot": {
-                            "root": {
-                                "definition_type": "agent",
-                                "agent_type": "expert",
-                            },
-                            "root_key": "root",
-                            "nodes": {"root": {"data": {"agent_type": "expert"}}},
-                        },
-                    }
-                }
-            ),
-        )
-
-    service, _ = composer(storage, tmp_path, tasks=SimpleNamespace(session=session))
-    await service.agents.save(alice, expert())
-    assert (await service.options(alice, "experts", session_id="session"))[
+    tasks = SessionService(storage, tmp_path)
+    source = await ExpertDefinition(storage).build(alice, expert())
+    task = await tasks.create(alice, source["id"], "private")
+    service, _ = composer(storage, tmp_path, tasks=tasks)
+    assert (await service.options(alice, "experts", session_id=task["session_id"]))[
         "items"
     ] == []
-    assert (await service.options(alice, "skills", session_id="session"))["items"] == []
+    assert (await service.options(alice, "skills", session_id=task["session_id"]))[
+        "items"
+    ] == []
 
 
 @pytest.mark.asyncio
@@ -168,14 +197,12 @@ async def test_expert_with_unavailable_dependency_is_not_callable(
 ):
     from sqlalchemy import update
 
-    from egis_agentkit.models import Grant
-    from egis_agentkit.service.access.authorization import PermissionService
     from egis_agentkit.storage import tables as t
+    from egis_agentkit.storage.model import Grant
 
     _, admin, alice, _ = await identities(storage)
     service, _ = composer(storage, tmp_path)
     await put_asset(storage)
-    permissions = PermissionService(storage)
     grant = Grant(
         principal_type="user",
         principal_id="alice",
@@ -185,7 +212,7 @@ async def test_expert_with_unavailable_dependency_is_not_callable(
         resource_owner_type="system",
         resource_owner_id="demo",
     )
-    await permissions.grant(admin, grant)
+    await GrantService(storage).grant(admin, grant)
     definition = expert()
     definition.payload["bindings"] = [
         {
@@ -195,10 +222,10 @@ async def test_expert_with_unavailable_dependency_is_not_callable(
             "resource_view_type": "system",
         }
     ]
-    await service.agents.save(alice, definition)
+    await ExpertDefinition(storage).build(alice, definition)
     assert len((await service.options(alice, "experts"))["items"]) == 1
     if unavailable == "revoked":
-        await permissions.revoke(admin, grant.id)
+        await GrantService(storage).revoke(admin, grant.id)
     else:
         async with storage.transaction() as conn:
             await conn.execute(
@@ -252,28 +279,49 @@ async def test_context_metadata_pages_do_not_scan_aggregate_file_content(
 @pytest.mark.asyncio
 async def test_nonuser_personal_session_does_not_offer_invites(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
-    root = {"definition_type": "agent", "agent_type": "personal"}
+    tasks = SessionService(storage, tmp_path)
+    source = await PersonalDefinition(storage).build(alice)
+    task = await tasks.create(alice, source["id"], "private")
 
     async def session(user, sid):
+        record = await tasks.session(user, sid)
         return SimpleNamespace(
             origin=SimpleNamespace(type="scheduled"),
-            state=SimpleNamespace(
-                middle_context={
-                    "egis_agentkit": {
-                        "is_team": False,
-                        "project_id": "project",
-                        "snapshot": {
-                            "root": root,
-                            "root_key": "root",
-                            "nodes": {"root": {"data": root}},
-                        },
-                    }
-                }
-            ),
+            state=record.state,
         )
 
     service, _ = composer(storage, tmp_path, tasks=SimpleNamespace(session=session))
-    await service.agents.save(alice, expert())
-    assert (await service.options(alice, "experts", session_id="session"))[
+    await ExpertDefinition(storage).build(alice, expert())
+    assert (await service.options(alice, "experts", session_id=task["session_id"]))[
         "items"
     ] == []
+
+
+@pytest.mark.asyncio
+async def test_composer_uses_configured_option_bounds(storage, tmp_path):
+    from test_app_http import app_snapshot
+
+    _, _, alice, _ = await identities(storage)
+    config = SimpleNamespace(
+        snapshot=app_snapshot(
+            tmp_path,
+            session={
+                "composer": {
+                    "default_page_size": 1,
+                    "max_page_size": 2,
+                    "candidate_batch_size": 1,
+                    "max_query_length": 4,
+                }
+            },
+        )
+    )
+    await ExpertDefinition(storage).build(alice, expert(name="first"))
+    await ExpertDefinition(storage).build(alice, expert(name="second"))
+    service, _ = composer(storage, tmp_path, config=config)
+    page = await service.options(alice, "experts")
+    assert len(page["items"]) == 1
+    assert page["next_cursor"]
+    with pytest.raises(ValueError, match="2"):
+        await service.options(alice, "experts", limit=3)
+    with pytest.raises(ValueError, match="4"):
+        await service.options(alice, "experts", query="abcde")

@@ -2,17 +2,27 @@
 
 AgentScope 的配置管理与企业增强框架。首版已实现，不修改 AgentScope service 源码。
 
-`service` 按 User、Agent、Team、Permission、Project、Workspace、Resource 等领域组织；`storage` 复用原生 SQL Storage 并增加企业表；`extensions` 实现原生扩展点；`integration` 接入 Nacos 等外部系统。App 通过具名 `AgentKitServices` 组合领域服务。聊天循环、团队通信、消息事件、HITL、SSE 和模型调用继续使用 AgentScope。旧 `services` 路径暂时保留兼容导入。
+`src/egis_agentkit/` 按五个一级目录组织。
 
-业务包的工具与中间件使用 AgentScope 原生类型，在版本目录的注册入口返回装配工厂。参考 [Demo 发布包](../../demo/agentscope-demo/agentkit_demo/releases/README.md)，由 App 管理接口注册。普通用户在页面创建的轻量专家只绑定已授权 Skill/MCP，不允许指定 Python 装配。
+| 目录 | 职责 |
+| --- | --- |
+| `service/` | Agent、Team、Access、Model、Session 等业务服务 |
+| `storage/` | 企业持久化和原生 SQL Storage 复用 |
+| `extension/` | AgentScope 扩展实现，包括中间件、工作区、远程专家和消息总线 |
+| `backend/` | PostgreSQL、Kafka、Nacos 和配置加载 |
+| `bootstrap/` | 对象创建、依赖装配和生命周期 |
+
+App 通过具名 `AgentKitServices` 调用业务服务。聊天循环、团队通信、消息事件、HITL、SSE 和模型调用继续使用 AgentScope。
+
+专家定义可以绑定已授权的 Skill、MCP 和平台工具。第三方专家通过 HTTP 或 WebSocket 执行。
 
 主要设计文档：
 
 1. [数据结构](./docs/数据结构.md)：User/Group、三类 Agent、私有与共享、资源、执行快照。
-2. [表设计](./docs/表设计草案.md)：6 张企业增量表的字段、约束和案例，原生表复用清单。
+2. [表设计](./docs/表设计草案.md)：企业增量表的字段、约束和案例，原生表复用清单。
 3. [运行流程](./docs/运行流程.md)：启动、私有保存、系统注册、共享审核、任务/团队创建、钉版、按需加载及 HTTP 封口。
 
-专题：[权限](./docs/Definition与权限继承.md)、[Workspace](./docs/Workspace与用户资源范围.md)、[热加载](./docs/包边界与热加载.md)。[原生 create_app 分析](./docs/create_app机制.md) 与 [历史改造点](./docs/改造点草稿.md) 保留作参考，首版以当前主设计为准。
+专题：[权限](./docs/Definition与权限继承.md)、[Workspace](./docs/Workspace与用户资源范围.md)。[原生 create_app 分析](./docs/create_app机制.md) 与 [历史改造点](./docs/改造点草稿.md) 保留作参考，首版以当前主设计为准。
 
 配置管理统一使用已安装的 [Nacos](./docs/配置管理.md)，只保留连接中心所需的最小部署引导，不另建本地业务配置中心。
 

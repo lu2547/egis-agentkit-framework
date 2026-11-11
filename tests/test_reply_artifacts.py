@@ -4,7 +4,7 @@ import asyncio
 import pytest
 from test_domain import expert, identities
 
-from egis_agentkit.service.agent.definition import AgentService
+from egis_agentkit.service.agent._expert_definition import ExpertDefinition
 from test_workspace_service import make_workspace
 
 
@@ -12,7 +12,7 @@ from test_workspace_service import make_workspace
 async def test_reply_artifacts_survive_reload_without_claiming_old_project_files(storage, tmp_path):
     _, _, alice, bob = await identities(storage)
     svc = make_workspace(storage, tmp_path)
-    definition = await AgentService(storage).save(alice, expert())
+    definition = await ExpertDefinition(storage).build(alice, expert())
     first = await svc.tasks.create(alice, definition['id'], 'private')
     second = await svc.tasks.create(alice, definition['id'], 'private')
     pid, sid = first['project_id'], first['session_id']
@@ -38,7 +38,7 @@ async def test_reply_artifacts_survive_reload_without_claiming_old_project_files
 async def test_same_project_tools_serialize_attribution(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
     svc = make_workspace(storage, tmp_path)
-    definition = await AgentService(storage).save(alice, expert())
+    definition = await ExpertDefinition(storage).build(alice, expert())
     task = await svc.tasks.create(alice, definition['id'], 'private')
     pid, sid = task['project_id'], task['session_id']
     started = asyncio.Event()
@@ -56,37 +56,31 @@ async def test_same_project_tools_serialize_attribution(storage, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_reconcile_only_verified_project_session_artifacts(storage, tmp_path):
+async def test_project_artifacts_only_include_files_in_the_project(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
     svc = make_workspace(storage, tmp_path)
-    definition = await AgentService(storage).save(alice, expert())
+    definition = await ExpertDefinition(storage).build(alice, expert())
     task = await svc.tasks.create(alice, definition['id'], 'private')
     pid, sid = task['project_id'], task['session_id']
-    legacy = svc.files.user_root('alice') / 'artifacts' / sid
-    legacy.mkdir(parents=True)
-    (legacy / 'late.pptx').write_bytes(b'pptx')
-    unknown = legacy.parent / 'unknown-session'
-    unknown.mkdir()
-    (unknown / 'unowned.pptx').write_bytes(b'unknown')
+    outside_project = svc.files.user_root('alice') / 'artifacts' / sid
+    outside_project.mkdir(parents=True)
+    (outside_project / 'late.pptx').write_bytes(b'pptx')
+    svc.files.write('alice', pid, 'report.pptx', b'report', area='artifacts')
+
     items = (await svc.workspace.list_project_files(alice, pid, 'artifacts'))['items']
-    assert [r['path'] for r in items] == ['late.pptx']
-    assert (unknown / 'unowned.pptx').read_bytes() == b'unknown'
-    assert not (legacy / 'late.pptx').exists()
-    assert (await svc.workspace.session_artifacts(alice, sid))['items'] == []
+    assert [r['path'] for r in items] == ['report.pptx']
 
 
 @pytest.mark.asyncio
 async def test_failed_tool_still_records_only_its_new_output(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
     svc = make_workspace(storage, tmp_path)
-    definition = await AgentService(storage).save(alice, expert())
+    definition = await ExpertDefinition(storage).build(alice, expert())
     task = await svc.tasks.create(alice, definition['id'], 'private')
     pid, sid = task['project_id'], task['session_id']
     with pytest.raises(RuntimeError, match='native failure'):
         async with svc.changes.track_deliveries('alice', pid, sid, 'reply-one'):
-            legacy = svc.files.user_root('alice') / 'artifacts' / sid
-            legacy.mkdir(parents=True)
-            (legacy / 'recovered.pptx').write_bytes(b'pptx')
+            svc.files.write('alice', pid, 'recovered.pptx', b'pptx')
             raise RuntimeError('native failure')
     assert [(r['path'], r['reply_id']) for r in (await svc.workspace.session_artifacts(alice, sid))['items']] == [('recovered.pptx', 'reply-one')]
 
@@ -96,7 +90,7 @@ async def test_scan_failure_does_not_prevent_native_tool_execution(storage, tmp_
     from egis_agentkit.errors import Conflict
     _, _, alice, _ = await identities(storage)
     svc = make_workspace(storage, tmp_path)
-    definition = await AgentService(storage).save(alice, expert())
+    definition = await ExpertDefinition(storage).build(alice, expert())
     task = await svc.tasks.create(alice, definition['id'], 'private')
     def failed(*args):
         raise Conflict('scan limit')
