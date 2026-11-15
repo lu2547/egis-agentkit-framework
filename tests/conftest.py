@@ -1,5 +1,6 @@
 """Every integration test owns a disposable PG schema, never production rows."""
 
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,7 +17,14 @@ from egis_agentkit.storage import AgentKitStorage
 @pytest_asyncio.fixture
 async def storage(tmp_path):
     env = dotenv_values(
-        Path(__file__).resolve().parents[3] / "deploy/agentkit-infra/pg.env"
+        Path(
+            os.environ.get(
+                "AGENTKIT_TEST_PG_ENV",
+                str(
+                    Path(__file__).resolve().parents[3] / "deploy/agentkit-infra/pg.env"
+                ),
+            )
+        )
     )
     url = URL.create(
         "postgresql+asyncpg",

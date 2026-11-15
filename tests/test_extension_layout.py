@@ -24,6 +24,7 @@ def test_extension_root_exports_components_without_flat_implementations():
         "workspace",
         "http",
         "demo",
+        "knowledge",
     }
     for package in packages:
         assert (root / package / "__init__.py").is_file()

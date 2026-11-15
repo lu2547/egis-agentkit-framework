@@ -134,6 +134,8 @@ def _fixed_components(snapshot: AgentKitConfig) -> dict:
         "agentkit.user.identity": snapshot.user.identity,
         "agentkit.workspace.runtime": snapshot.workspace.runtime,
         "agentkit.skill.storage": snapshot.skill.storage,
+        "agentkit.knowledge.enabled": snapshot.knowledge.enabled,
+        "agentkit.knowledge.connection": snapshot.knowledge.connection,
         "agentkit.project.download": snapshot.project.download,
     }
 

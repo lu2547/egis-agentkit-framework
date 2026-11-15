@@ -16,6 +16,8 @@ from pydantic import (
 )
 from pydantic.alias_generators import to_camel
 
+from ._knowledge_settings import KnowledgeConfig
+
 PositiveInt = Annotated[int, Field(strict=True, gt=0)]
 NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 Seconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
@@ -626,6 +628,7 @@ class ClientConfig(ConfigModel):
 
 class AgentKitConfig(ConfigModel):
     revision: PositiveInt
+    knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     team: TeamConfig = Field(default_factory=TeamConfig)
     skill: SkillConfig = Field(default_factory=SkillConfig)

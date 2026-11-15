@@ -1,5 +1,6 @@
 """组装 AgentKit 的业务服务和运行时扩展，管理组件启动和关闭顺序。"""
 
+import os
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from agentscope.app.workspace_manager import WorkspaceManagerBase
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from egis_agentkit.client._postgres import check_postgres, create_postgres_engine
+from egis_agentkit.client.knowledge import JavaKnowledgeClient
 from egis_agentkit.client.nacos import NacosClient, NacosConfigProvider
 from egis_agentkit.client.nacos._config import LivePolicies
 from egis_agentkit.core.agent._expert_definition import ExpertDefinition
@@ -37,6 +39,7 @@ from egis_agentkit.service._user import UserService
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.knowledge import KnowledgeManager
 from egis_agentkit.service.project._document_preview import DocumentPreviewService
 from egis_agentkit.service.project._file_manager import ProjectFileManager
 from egis_agentkit.service.project._presentation_manager import (
@@ -73,6 +76,7 @@ class AgentKit:
     _skill_imports: SkillImportService
     _memory: MemoryService | None
     _owns_engine: bool
+    _knowledge_client: JavaKnowledgeClient | None = None
 
     async def check_database(self) -> None:
         await check_postgres(self._storage.engine)
@@ -84,6 +88,8 @@ class AgentKit:
                 stack.push_async_callback(self._storage.engine.dispose)
             if self._owned_client is not None:
                 stack.push_async_callback(self._owned_client.close)
+            if self._knowledge_client is not None:
+                stack.push_async_callback(self._knowledge_client.close)
             stack.push_async_callback(self._config.close)
             if self._memory is not None:
                 stack.push_async_callback(self._memory.close)
@@ -151,6 +157,14 @@ def init_agentkit(
     tasks = SessionService(
         storage, root, models, config, projects=projects, personal=personal
     )
+    knowledge_client = None
+    knowledge = None
+    if snapshot.knowledge.enabled:
+        knowledge_client = JavaKnowledgeClient(
+            snapshot.knowledge.connection,
+            secret=os.environ.get(snapshot.knowledge.connection.secret_env),
+        )
+        knowledge = KnowledgeManager(storage, config, knowledge_client, sessions=tasks)
     bus.coordinator = ExecutionCoordinator(
         storage,
         root,
@@ -185,6 +199,7 @@ def init_agentkit(
         projects=projects,
         resources=resources,
         skill_imports=skill_imports,
+        knowledge=knowledge,
         sessions=tasks,
         session_feedback=SessionFeedbackService(storage, tasks, config),
         project_files=project_files,
@@ -200,7 +215,7 @@ def init_agentkit(
         workspace=workspace_manager,
         skill_hub=resources.skill_hub,
         mcp_hub=resources.mcp_hub,
-        tools=BoundToolFactory(resources=resources, users=users),
+        tools=BoundToolFactory(resources=resources, users=users, knowledge=knowledge),
         middlewares=partial(
             tasks.build_middlewares,
             users=users,
@@ -217,4 +232,5 @@ def init_agentkit(
         _skill_imports=skill_imports,
         _memory=memory,
         _owns_engine=owns_engine,
+        _knowledge_client=knowledge_client,
     )

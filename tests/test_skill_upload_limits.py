@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from egis_agentkit.client.nacos._knowledge_settings import KnowledgeConfig
 from egis_agentkit.client.nacos._settings import ConnectorConfig, SkillArchiveConfig
 from egis_agentkit.core.skill._archive import read_archive_files
 from egis_agentkit.service.resource._catalog import ResourceService
@@ -66,6 +67,7 @@ def test_skill_archive_accepts_many_small_entries_without_count_limit():
 @pytest.mark.asyncio
 async def test_live_skill_limits_keep_expanded_cap_separate(storage, tmp_path):
     snapshot = SimpleNamespace(
+        knowledge=KnowledgeConfig(),
         connector=ConnectorConfig(),
         skill=SimpleNamespace(
             archive=SkillArchiveConfig(max_bytes=2048, max_expanded_bytes=64)

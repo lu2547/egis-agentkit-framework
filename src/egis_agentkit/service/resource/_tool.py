@@ -45,6 +45,9 @@ from jsonschema.exceptions import ValidationError
 
 from egis_agentkit.client.nacos import NacosConfigProvider
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
+from egis_agentkit.extension.knowledge._knowledge_search_tool_impl import (
+    SearchKnowledge,
+)
 from egis_agentkit.service.access._permission import is_system_default_tool
 from egis_agentkit.storage.model import (
     Asset,
@@ -68,6 +71,8 @@ class FunctionToolRegistry(_LocalRegistry):
         self.catalog = {}
         self.native = {}
         self.deployed = {}
+        if resources.config is not None and resources.config.snapshot.knowledge.enabled:
+            self._native(SearchKnowledge, "toolkit")
         for cls in (Bash, PowerShell, Read, Write, Edit, Glob, Grep):
             self._native(cls, "workspace")
         for cls in (TaskCreate, TaskList, TaskGet, TaskUpdate, ToolStop, SkillViewer):
@@ -130,6 +135,12 @@ class FunctionToolRegistry(_LocalRegistry):
             return True
         allowed_ids = configuration.tool.defaults.registered_ids
         return allowed_ids is None or asset["resource_id"] in allowed_ids
+
+    def is_default_tool_available(self, cls, scope=None) -> bool:
+        """装配额外系统工具前核对登记和配置，避免向模型暴露已被排除的工具。"""
+        key = self.native.get(cls)
+        asset = self.catalog.get(key)
+        return asset is not None and self.is_default_tool(asset.model_dump(), scope)
 
     def _add(
         self,

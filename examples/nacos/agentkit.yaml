@@ -2,6 +2,30 @@
 # 环境变量字段保存部署密钥名；实际密钥由部署系统注入。
 agentkit:
   revision: 1
+  knowledge:
+    enabled: false
+    label: 企业知识库
+    connection:
+      baseUrl: null # Java 地址包含 /knowledge；启用时必须填写
+      appId: null
+      secretEnv: AGENTKIT_KNOWLEDGE_SECRET
+      timeoutSeconds: 60.0
+      connectTimeoutSeconds: 5.0
+      maxConnections: 20
+      maxResponseBytes: 2097152
+    search:
+      topK: 5
+      threshold: 0.5
+      sort: rank
+      maxQueryChars: 4096
+      maxSources: 12
+      maxExcerptChars: 4000
+      maxAnswerChars: 16000
+    access:
+      grants: [] # 显式 principalType: user/group、principalId、kbIds；默认拒绝
+    documents:
+      publicBaseUrl: /knowledge # 浏览器带知识库 Cookie 请求的同源网关入口
+      allowedFileOrigins: [] # 原件 CDN/对象存储的 HTTP(S) origin 白名单
   agent:
     catalog:
       defaultPageSize: 50

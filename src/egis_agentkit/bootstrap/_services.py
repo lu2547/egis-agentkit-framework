@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..service.access._share import ShareService
     from ..service.agent._agent_manager import AgentManager
     from ..service.agent._personal_manager import PersonalManager
+    from ..service.knowledge import KnowledgeManager
     from ..service.project._file_manager import ProjectFileManager
     from ..service.project._presentation_manager import ProjectPresentationManager
     from ..service.project._project_manager import ProjectManager
@@ -39,3 +40,4 @@ class AgentKitServices:
     skill_imports: "SkillImportService | None" = None
     composer: "ComposerService | None" = None
     session_feedback: "SessionFeedbackService | None" = None
+    knowledge: "KnowledgeManager | None" = None
