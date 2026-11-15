@@ -47,15 +47,15 @@ async def test_access_upgrade_preserves_root_and_rejects_conflicting_versions(st
                 "ALTER TABLE ak_resource_assets DROP COLUMN is_shared_current, DROP COLUMN publication_revision"
             )
         )
-        await conn.execute(text("ALTER TABLE ak_share_reviews DROP COLUMN review_type"))
+        await conn.execute(text("ALTER TABLE ak_approve DROP COLUMN review_type"))
         await conn.execute(
             text(
-                "ALTER TABLE ak_resource_access ADD COLUMN resource_version text NOT NULL DEFAULT '1'"
+                "ALTER TABLE ak_resource_permission ADD COLUMN resource_version text NOT NULL DEFAULT '1'"
             )
         )
         await conn.execute(
             text("""
-            INSERT INTO ak_resource_access (
+            INSERT INTO ak_resource_permission (
                 id, principal_type, principal_id, resource_type, resource_id,
                 resource_version, resource_view_type, resource_owner_type,
                 resource_owner_id, grant_source_type, origin_key, granted_by, granted_at
@@ -71,7 +71,7 @@ async def test_access_upgrade_preserves_root_and_rejects_conflicting_versions(st
     async with storage.engine.begin() as conn:
         assert await check_access_upgrade(conn, schema) == "inconsistent"
         await conn.execute(
-            text("DELETE FROM ak_resource_access WHERE id='legacy-conflict'")
+            text("DELETE FROM ak_resource_permission WHERE id='legacy-conflict'")
         )
         assert await check_access_upgrade(conn, schema) == "pending"
         assert await upgrade_access_tables(conn, schema) == "upgraded"

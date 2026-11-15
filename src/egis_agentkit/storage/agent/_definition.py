@@ -288,7 +288,7 @@ class AgentDefinitionStorage:
         summary, detail, access = (
             t.agent_definition_summary,
             t.agent_definition_detail,
-            t.resource_access,
+            t.resource_permission,
         )
         own = and_(summary.c.owner_type == "user", summary.c.owner_id == user.user_id)
         system = summary.c.owner_type == "system"
@@ -321,20 +321,20 @@ class AgentDefinitionStorage:
         )
         pending = exists(
             select(literal(1)).where(
-                t.reviews.c.resource_type == "agent",
-                t.reviews.c.resource_id == summary.c.id,
-                t.reviews.c.review_type == "update",
-                t.reviews.c.review_status_type == "pending",
+                t.approvals.c.resource_type == "agent",
+                t.approvals.c.resource_id == summary.c.id,
+                t.approvals.c.review_type == "update",
+                t.approvals.c.review_status_type == "pending",
             )
         )
         latest_review = (
-            select(t.reviews.c.review_status_type)
+            select(t.approvals.c.review_status_type)
             .where(
-                t.reviews.c.resource_type == "agent",
-                t.reviews.c.resource_id == summary.c.id,
-                t.reviews.c.resource_version == cast(selected, String),
+                t.approvals.c.resource_type == "agent",
+                t.approvals.c.resource_id == summary.c.id,
+                t.approvals.c.resource_version == cast(selected, String),
             )
-            .order_by(t.reviews.c.submitted_at.desc(), t.reviews.c.review_id.desc())
+            .order_by(t.approvals.c.submitted_at.desc(), t.approvals.c.review_id.desc())
             .limit(1)
             .scalar_subquery()
         )

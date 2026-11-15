@@ -5,8 +5,8 @@ from sqlalchemy import inspect, text
 from ._access import GRANT_KEY
 
 ACCESS_TABLES = {
-    "grants": "ak_resource_access",
-    "reviews": "ak_share_reviews",
+    "grants": "ak_resource_permission",
+    "reviews": "ak_approve",
     "assets": "ak_resource_assets",
     "agent": "ak_agent_definition_summary",
     "agent_versions": "ak_agent_definition_detail",
@@ -28,6 +28,9 @@ async def _qualified_tables(connection, schema):
 
     actual = await agent_tables(connection, schema)
     actual.update(await team_tables(connection, schema))
+    from .migration._table_names import resolve_table_names
+
+    actual.update(await resolve_table_names(connection, schema))
     quote = connection.dialect.identifier_preparer.quote_identifier
     return {
         key: f"{quote(schema)}.{quote(actual.get(name, name))}"
@@ -41,6 +44,9 @@ async def _access_state(connection, schema):
 
     actual = await agent_tables(connection, schema)
     actual.update(await team_tables(connection, schema))
+    from .migration._table_names import resolve_table_names
+
+    actual.update(await resolve_table_names(connection, schema))
 
     def columns(sync):
         inspector = inspect(sync)
@@ -244,12 +250,13 @@ async def upgrade_access_tables(connection, schema):
             ADD COLUMN IF NOT EXISTS review_type varchar(16) NOT NULL DEFAULT 'share',
             ALTER COLUMN share_scope_type DROP NOT NULL,
             ALTER COLUMN principal_id DROP NOT NULL,
-            DROP CONSTRAINT IF EXISTS ck_ak_share_target
+            DROP CONSTRAINT IF EXISTS ck_ak_share_target,
+            DROP CONSTRAINT IF EXISTS ck_ak_approve_target
     """)
     )
     await connection.execute(
         text(f"""
-        ALTER TABLE {reviews} ADD CONSTRAINT ck_ak_share_target CHECK (
+        ALTER TABLE {reviews} ADD CONSTRAINT ck_ak_approve_target CHECK (
             (review_type = 'share' AND share_scope_type IS NOT NULL
              AND share_scope_type IN ('user','group') AND principal_id IS NOT NULL
              AND principal_id NOT IN ('', '*')) OR
@@ -268,14 +275,17 @@ async def upgrade_access_tables(connection, schema):
     )
     await connection.execute(
         text(f"""
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_ak_pending_share_update
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_ak_approve_pending_update
             ON {reviews} (resource_type, resource_id)
             WHERE review_type = 'update' AND review_status_type = 'pending'
     """)
     )
 
     quote = connection.dialect.identifier_preparer.quote_identifier
-    old_index = f"{quote(schema)}.uq_ak_active_grant_origin"
+    await connection.execute(
+        text(f"DROP INDEX IF EXISTS {quote(schema)}.uq_ak_active_grant_origin")
+    )
+    old_index = f"{quote(schema)}.uq_ak_resource_permission_origin"
     await connection.execute(text(f"DROP INDEX IF EXISTS {old_index}"))
     await connection.execute(
         text(f"""
@@ -300,7 +310,7 @@ async def upgrade_access_tables(connection, schema):
     await connection.execute(text(f"ALTER TABLE {grants} DROP COLUMN resource_version"))
     await connection.execute(
         text(f"""
-        CREATE UNIQUE INDEX uq_ak_active_grant_origin ON {grants} ({key})
+        CREATE UNIQUE INDEX uq_ak_resource_permission_origin ON {grants} ({key})
         WHERE revoked_at IS NULL
     """)
     )

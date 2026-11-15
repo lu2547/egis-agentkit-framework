@@ -14,7 +14,7 @@ from egis_agentkit.storage import AgentKitStorage
 
 
 @pytest_asyncio.fixture
-async def storage():
+async def storage(tmp_path):
     env = dotenv_values(
         Path(__file__).resolve().parents[3] / "deploy/agentkit-infra/pg.env"
     )
@@ -35,7 +35,13 @@ async def storage():
         hide_parameters=True,
         connect_args={"server_settings": {"search_path": schema}},
     )
-    result = AgentKitStorage(str(url), engine)
+    from egis_agentkit.client.nacos._settings import SkillArchiveConfig
+    from egis_agentkit.storage.skill._archive import SkillArchiveStorage
+
+    archives = SkillArchiveStorage(
+        tmp_path / "nas", max_bytes=SkillArchiveConfig().max_bytes
+    )
+    result = AgentKitStorage(str(url), engine, skill_archives=archives)
     await result.init_schema()
     async with result:
         yield result

@@ -133,6 +133,7 @@ def _fixed_components(snapshot: AgentKitConfig) -> dict:
         "agentkit.client.kafka": snapshot.client.kafka,
         "agentkit.user.identity": snapshot.user.identity,
         "agentkit.workspace.runtime": snapshot.workspace.runtime,
+        "agentkit.skill.storage": snapshot.skill.storage,
         "agentkit.project.download": snapshot.project.download,
     }
 

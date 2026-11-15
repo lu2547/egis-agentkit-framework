@@ -342,7 +342,7 @@ class DefinitionStorage:
         """每个资源版本只取最近一条共享审核状态。"""
         if not records:
             return {}
-        reviews = t.reviews
+        reviews = t.approvals
         recent = (
             select(
                 reviews.c.resource_id,

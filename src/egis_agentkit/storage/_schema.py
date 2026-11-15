@@ -20,6 +20,8 @@ from .migration._project import (
     migrate_session_workspaces,
 )
 from .migration._sequences import repair_sequences
+from .migration._skill_archives import LEGACY_SKILL_ARCHIVES, migrate_skill_archives
+from .migration._skill_imports import migrate_skill_import_files
 from .migration._table_names import RENAMES as TABLE_RENAMES
 from .migration._table_names import migrate_table_names
 from .migration._team import RENAMES as TEAM_RENAMES
@@ -74,6 +76,12 @@ async def init_schema(engine):
         if schema is None:
             raise ValueError("连接未选择有效的 schema")
         existing = await _existing_tables(connection, schema)
+        if LEGACY_SKILL_ARCHIVES in existing:
+            raise ValueError("技能归档需要先通过 upgrade-db 迁移到 NAS")
+        if "ak_skill_imports" in existing:
+            columns = await _table_columns(connection, schema, "ak_skill_imports")
+            if "archive" in columns:
+                raise ValueError("技能导入文件需要先通过 upgrade-db 迁移到 NAS")
         old_project_tables = {
             name for sources in TABLE_SOURCES.values() for name in sources
         }
@@ -164,7 +172,14 @@ async def _create_session_project_index(connection, schema):
     )
 
 
-async def upgrade_schema(engine, *, database=None, apply=False):
+async def upgrade_schema(
+    engine,
+    *,
+    database=None,
+    apply=False,
+    skill_archives=None,
+    skill_archive_limits=None,
+):
     """预览旧库改造。核对目标库后原子执行并保留旧项目关联供清理。"""
     from ._access_schema import check_access_upgrade, upgrade_access_tables
 
@@ -203,6 +218,10 @@ async def upgrade_schema(engine, *, database=None, apply=False):
             )
 
         states = await migrate_table_names(connection, schema)
+        if "inconsistent" in states.values():
+            if apply:
+                raise ValueError("升级数据冲突：表或附属对象无法安全合并")
+            return SchemaReport(actual_database, schema, states)
         states.update(await migrate_project_tables(connection, schema))
         states["Session Workspace 身份"] = await migrate_session_workspaces(
             connection, schema
@@ -220,6 +239,13 @@ async def upgrade_schema(engine, *, database=None, apply=False):
         states["Agent 类型"] = await _agent_upgrade_state(connection, schema)
         states["Session 绑定"] = await _session_upgrade_state(connection, schema)
         states["授权和共享版本"] = await check_access_upgrade(connection, schema)
+        states["技能文件存储"] = await migrate_skill_archives(
+            connection,
+            schema,
+            archive_store=skill_archives,
+            limits=skill_archive_limits,
+        )
+        states["技能导入文件"] = await migrate_skill_import_files(connection, schema)
         states[LEGACY_PROJECT_SESSIONS] = (
             await _check_legacy_project_links(
                 connection,
@@ -268,6 +294,17 @@ async def upgrade_schema(engine, *, database=None, apply=False):
             )
             states["工作区变更归属"] = await migrate_workspace_changes(
                 connection, schema, apply=True
+            )
+        if apply:
+            states["技能文件存储"] = await migrate_skill_archives(
+                connection,
+                schema,
+                archive_store=skill_archives,
+                limits=skill_archive_limits,
+                apply=True,
+            )
+            states["技能导入文件"] = await migrate_skill_import_files(
+                connection, schema, archive_store=skill_archives, apply=True
             )
         states.update(
             {

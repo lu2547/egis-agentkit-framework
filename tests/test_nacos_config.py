@@ -41,7 +41,8 @@ def documents(revision=1):
         "agentkit.yaml": {
             "agentkit": {
                 "revision": revision,
-                "workspace": {"runtime": sandbox_runtime("/tmp/work")}, "project": {"upload": {"maxBytes": 20_971_520}},
+                "workspace": {"runtime": sandbox_runtime("/tmp/work")},
+                "project": {"upload": {"maxBytes": 20_971_520}},
                 "user": {
                     "identity": {
                         "mode": "demo",
@@ -113,7 +114,10 @@ async def test_client_rejects_cross_origin_paths_and_scrubs_server_errors():
 
 
 @pytest.mark.asyncio
-async def test_snapshot_reads_one_document_and_updates_typed_hot_settings():
+@pytest.mark.parametrize("fixed_component", ["workspace", "skill-storage"])
+async def test_snapshot_reads_one_document_and_updates_typed_hot_settings(
+    fixed_component,
+):
     docs = documents()
     requests = []
 
@@ -146,7 +150,14 @@ async def test_snapshot_reads_one_document_and_updates_typed_hot_settings():
         assert second.project.upload.max_bytes == 40
         assert first.project.upload.max_bytes == 20_971_520
         docs.update(documents(3))
-        docs["agentkit.yaml"]["agentkit"]["workspace"]["runtime"]["root"] = "/different"
+        if fixed_component == "workspace":
+            docs["agentkit.yaml"]["agentkit"]["workspace"]["runtime"]["root"] = (
+                "/different"
+            )
+        else:
+            docs["agentkit.yaml"]["agentkit"].setdefault("skill", {})["storage"] = {
+                "root": "/different-nas"
+            }
         with pytest.raises(NacosError, match="restart"):
             await provider.refresh()
         assert provider.restart_required is True

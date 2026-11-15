@@ -125,7 +125,7 @@ async def test_failed_approval_keeps_previous_review_and_grant_current(storage):
     async with storage.transaction() as conn:
         await conn.execute(
             text(
-                "ALTER TABLE ak_share_reviews ADD CONSTRAINT test_reject_review_reason "
+                "ALTER TABLE ak_approve ADD CONSTRAINT test_reject_review_reason "
                 "CHECK (review_reason <> 'force failure')"
             )
         )

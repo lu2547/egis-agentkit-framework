@@ -68,7 +68,7 @@ class LocalSkillHub(_LocalHub, SkillHubBase):
     async def get_skill_version(self, user_id, card_id, version):
         asset = await self._asset(user_id, card_id, version)
         return SkillCard(
-            **self._fields(asset), markdown=asset["payload"].get("original_markdown")
+            **self._fields(asset), markdown=await self.resources.read_skill_markdown(asset)
         )
 
     async def download(self, user_id, card_id, version=None):

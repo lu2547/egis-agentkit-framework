@@ -31,6 +31,21 @@ Agent 当前实现见 [Agent 管理与定义](./docs/Agent管理与定义.md)，
 
 配置管理统一使用已安装的 [Nacos](./docs/配置管理.md)，只保留连接中心所需的最小部署引导，不另建本地业务配置中心。
 
+审批流程记录使用 `ak_approve`，已生效的资源授权使用 `ak_resource_permission`，两者分别记录审批过程和最终使用权限。
+
+技能包和异步导入的上传文件统一保存在 NAS 挂载目录。所有 API、导入 Worker 和运行装载节点需访问同一份存储；数据库中的资源版本和导入任务只保存相对文件路径、原始包 SHA256、字节大小等元数据，不保存 ZIP 或 `SKILL.md` 正文。资源原有的内容摘要继续用于版本内容校验。上传先完成文件写入和读回校验，再提交数据库记录；NAS 不可用时不发布版本、不创建导入任务。
+
+技能包统一使用工作区持久根目录下的 `skill-archives/`，与用户项目目录分开。启动前在 Nacos 显式配置 `agentkit.skill.storage.root` 为该子目录的绝对路径（示例：`/srv/agentkit/workspace/skill-archives`，对应工作区根目录 `/srv/agentkit/workspace`）。没有默认本地路径；修改根目录需重启 API。服务端进程必须能够读写该目录。
+
+已有数据库使用 App 的显式升级命令，先停止 API 和导入 Worker，再执行应用迁移。预览不修改数据库或 NAS，也允许尚未配置 NAS 路径；实际执行必须先配置挂载目录，并填写预览返回的目标库名：
+
+```bash
+python -m egis_agentkit_app upgrade-db
+python -m egis_agentkit_app upgrade-db --database agentscope --apply
+```
+
+升级会把既有技能归档和待处理上传文件逐包写入 NAS，核对全部版本和任务引用后，才删除 `ak_skill_archives` 及 `ak_skill_imports.archive` 二进制列。失败时数据库事务回滚、原数据保留；重试复用已完整写入的文件，不改变资源版本、任务状态和既有授权。升级完成后再启动服务。
+
 启动和真实联调见 [App](../egis-agentkit-app/README.md) 与 [实施记录](../egis-agentkit-app/docs/实施记录.md)。当前实际验收使用本地 AgentScope 2.0.11 源码；依赖范围为 `>=2.0.10,<2.1`，未单独声称已通过 2.0.10 的另一套完整验收。
 
 项目共享工作空间与删除规则见 [文件生命周期](docs/session-files.md)。

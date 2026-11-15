@@ -46,6 +46,8 @@ agentkit:
     roster:
       maxMembers: 20
   skill:
+    storage:
+      root: /srv/agentkit/workspace/skill-archives
     archive:
       maxBytes: 52428799
       maxExpandedBytes: null

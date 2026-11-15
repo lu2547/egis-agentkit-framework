@@ -32,6 +32,7 @@ def app_snapshot(tmp_path, **domains):
             "revision": 1,
             "client": {"postgres": {"connection": {"url_env": "TEST_DB_URL"}}},
             "workspace": {"runtime": sandbox_runtime(tmp_path)},
+            "skill": {"storage": {"root": str(tmp_path / "nas")}},
             "project": {
                 "upload": {"max_bytes": 20_971_520},
                 "download": {"secret_env": "TEST_DOWNLOAD"},

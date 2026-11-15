@@ -284,8 +284,8 @@ Index(
     unique=True,
     postgresql_where=assets.c.is_shared_current,
 )
-resource_access = Table(
-    "ak_resource_access",
+resource_permission = Table(
+    "ak_resource_permission",
     metadata,
     Column("id", String(64), primary_key=True),
     Column("principal_type", String(16), nullable=False),
@@ -298,8 +298,8 @@ resource_access = Table(
     Column("grant_source_type", String(16), nullable=False),
     Column("source_review_id", String(64)),
     Column("origin_key", String(192), nullable=False, server_default="manual"),
-    Column("root_grant_id", ForeignKey("ak_resource_access.id"), index=True),
-    Column("parent_grant_id", ForeignKey("ak_resource_access.id"), index=True),
+    Column("root_grant_id", ForeignKey("ak_resource_permission.id"), index=True),
+    Column("parent_grant_id", ForeignKey("ak_resource_permission.id"), index=True),
     Column("agent_id", String(64)),
     Column("team_id", String(64)),
     Column("granted_by", String(128), nullable=False),
@@ -310,23 +310,24 @@ resource_access = Table(
         "principal_type IN ('user','group') AND principal_id NOT IN ('', '*')"
     ),
     CheckConstraint(
-        "resource_view_type IN ('private','system','shared')", name="ck_ak_grant_view"
+        "resource_view_type IN ('private','system','shared')",
+        name="ck_ak_resource_permission_view",
     ),
     CheckConstraint(
         "grant_source_type IN ('owner','manual','share','dependency')",
-        name="ck_ak_grant_source",
+        name="ck_ak_resource_permission_source",
     ),
     CheckConstraint("resource_type IN ('agent','team','skill','mcp')"),
     CheckConstraint("grant_source_type != 'share' OR source_review_id IS NOT NULL"),
     CheckConstraint(
         "(grant_source_type = 'dependency') = (root_grant_id IS NOT NULL AND parent_grant_id IS NOT NULL AND agent_id IS NOT NULL)",
-        name="ck_ak_grant_dependency",
+        name="ck_ak_resource_permission_dependency",
     ),
 )
 Index(
-    "uq_ak_active_grant_origin",
+    "uq_ak_resource_permission_origin",
     *[
-        resource_access.c[c]
+        resource_permission.c[c]
         for c in [
             "principal_type",
             "principal_id",
@@ -343,17 +344,17 @@ Index(
     postgresql_where=text("revoked_at IS NULL"),
 )
 Index(
-    "ix_ak_access_resource_principal",
-    resource_access.c.resource_type,
-    resource_access.c.resource_id,
-    resource_access.c.principal_type,
-    resource_access.c.principal_id,
-    resource_access.c.resource_view_type,
-    postgresql_where=resource_access.c.revoked_at.is_(None)
-    & resource_access.c.root_grant_id.is_(None),
+    "ix_ak_resource_permission_resource_principal",
+    resource_permission.c.resource_type,
+    resource_permission.c.resource_id,
+    resource_permission.c.principal_type,
+    resource_permission.c.principal_id,
+    resource_permission.c.resource_view_type,
+    postgresql_where=resource_permission.c.revoked_at.is_(None)
+    & resource_permission.c.root_grant_id.is_(None),
 )
-reviews = Table(
-    "ak_share_reviews",
+approvals = Table(
+    "ak_approve",
     metadata,
     Column("review_id", String(64), primary_key=True),
     Column("resource_type", String(16), nullable=False),
@@ -381,19 +382,19 @@ reviews = Table(
         "AND share_scope_type IN ('user','group') AND principal_id IS NOT NULL "
         "AND principal_id NOT IN ('', '*')) OR "
         "(review_type = 'update' AND share_scope_type IS NULL AND principal_id IS NULL)",
-        name="ck_ak_share_target",
+        name="ck_ak_approve_target",
     ),
 )
 Index(
-    "ix_ak_share_resource_version",
-    reviews.c.resource_type,
-    reviews.c.resource_id,
-    reviews.c.resource_version,
+    "ix_ak_approve_resource_version",
+    approvals.c.resource_type,
+    approvals.c.resource_id,
+    approvals.c.resource_version,
 )
 Index(
-    "uq_ak_pending_share_update",
-    reviews.c.resource_type,
-    reviews.c.resource_id,
+    "uq_ak_approve_pending_update",
+    approvals.c.resource_type,
+    approvals.c.resource_id,
     unique=True,
     postgresql_where=text("review_type = 'update' AND review_status_type = 'pending'"),
 )
@@ -465,7 +466,7 @@ Index(
     file_changes.c.change_id,
 )
 
-# Upload bytes live in PostgreSQL, making jobs independent of process-local disks.
+# 上传包保存在 NAS；任务通过文件定位恢复，不依赖进程本地磁盘或数据库二进制。
 skill_imports = Table(
     "ak_skill_imports",
     metadata,
@@ -474,7 +475,7 @@ skill_imports = Table(
     Column("filename", String(255), nullable=False),
     Column("category", String(80), nullable=False),
     Column("avatar", String(64), nullable=False),
-    Column("archive", LargeBinary),
+    Column("archive_location", JSONB(none_as_null=True)),
     Column("status", String(16), nullable=False, server_default="queued"),
     Column("stage", String(32), nullable=False, server_default="queued"),
     Column("progress", BigInteger, nullable=False, server_default="0"),
@@ -514,12 +515,6 @@ reply_artifacts = Table(
 )
 
 
-skill_archives = Table(
-    "ak_skill_archives",
-    metadata,
-    Column("checksum_sha256", String(64), primary_key=True),
-    Column("archive", LargeBinary, nullable=False),
-)
 mcp_credentials = Table(
     "ak_mcp_credentials",
     metadata,

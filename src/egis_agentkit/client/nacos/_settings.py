@@ -244,7 +244,30 @@ class SkillImportConfig(ConfigModel):
     list_limit: PositiveInt = 100
 
 
+class SkillStorageConfig(ConfigModel):
+    """API 可访问的 NAS 挂载绝对目录，不设置时禁止发布和读取技能包。"""
+
+    root: NonEmptyString | None = None
+
+    @field_validator("root")
+    @classmethod
+    def validate_root(cls, value):
+        if value is None:
+            return value
+        path = PurePosixPath(value)
+        if (
+            not path.is_absolute()
+            or path in (PurePosixPath("/"), PurePosixPath("."))
+            or ".." in path.parts
+            or "\\" in value
+            or "\x00" in value
+        ):
+            raise ValueError("技能存储必须使用限定目录")
+        return value
+
+
 class SkillConfig(ConfigModel):
+    storage: SkillStorageConfig = Field(default_factory=SkillStorageConfig)
     archive: SkillArchiveConfig = Field(default_factory=SkillArchiveConfig)
     import_settings: SkillImportConfig = Field(
         default_factory=SkillImportConfig, alias="import"

@@ -7,11 +7,14 @@ import pytest
 from sqlalchemy import select
 from test_domain import identities
 
+from egis_agentkit.core.skill._archive import (
+    calculate_archive_digest,
+    read_archive_files,
+)
 from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.resource._catalog import ResourceService
-from egis_agentkit.service.resource._skill import _archive_files, skill_archive_digest
 from egis_agentkit.storage import tables as t
 from egis_agentkit.storage.model import Asset, Grant, ResourceRef
 
@@ -36,8 +39,8 @@ async def put_asset(
     checksum=None,
 ):
     content = archive()
-    files = _archive_files(content)
-    checksum = skill_archive_digest(content) if checksum is None else checksum
+    files = read_archive_files(content)
+    checksum = calculate_archive_digest(content) if checksum is None else checksum
     asset = Asset(
         resource_type="skill",
         resource_id=rid,
@@ -46,7 +49,6 @@ async def put_asset(
         owner_id=owner_id,
         checksum_sha256=checksum,
         payload={
-            "original_markdown": files["SKILL.md"].decode(),
             "files": [
                 {"path": name, "size": len(value)}
                 for name, value in sorted(files.items())
@@ -56,8 +58,8 @@ async def put_asset(
             "is_skill_market_visible": True,
         },
     )
+    asset.payload.update(storage.skill_archives.write_archive(content))
     async with storage.transaction() as conn:
-        await storage.assets.put_archive(checksum, content, conn=conn)
         await conn.execute(
             t.assets.insert().values(
                 **asset.model_dump(), created_by="test", updated_by="test"
@@ -95,7 +97,9 @@ async def test_system_skill_catalog_and_install_require_exact_version_grant(
     assert (await resources.list(alice, "skill"))[0]["is_usable"]
     installed = await resources.install(alice, "skill", "report")
     assert installed["is_installed"] and installed["is_enabled"]
-    assert (await resources.personal.list_resources(alice, "skill"))["report"]["is_enabled"]
+    assert (await resources.personal.list_resources(alice, "skill"))["report"][
+        "is_enabled"
+    ]
     assert len(await GrantService(storage).list_grants(admin)) == 1
     await resources.update_installation(alice, "skill", "report", False)
     assert (await resources.detail(alice, "skill", "report", "1.0.0"))[
@@ -153,7 +157,7 @@ async def test_materialization_preserves_files_checks_checksum_and_exact_inherit
 ):
     _, admin, alice, bob = await identities(storage)
     resources = ResourceService(storage, tmp_path)
-    await put_asset(storage, checksum=skill_archive_digest(archive()))
+    await put_asset(storage, checksum=calculate_archive_digest(archive()))
     from egis_agentkit.storage.model import AgentDefinition
 
     root = await AgentManager(storage).add_definition(
@@ -292,9 +296,13 @@ async def test_materialize_failure_never_exposes_partial_cache(storage, tmp_path
     with pytest.raises(Conflict):
         await resources.materialize_skill(alice, "report", "1.0.0")
     assert not (tmp_path / "common/skills/report").exists()
+    source = await storage.assets.get("skill", "report", "1.0.0")
+    location = storage.skill_archives.write_archive(archive(extra="../../outside.txt"))
     async with storage.transaction() as conn:
         await conn.execute(
-            t.skill_archives.update().values(archive=archive(extra="../../outside.txt"))
+            t.assets.update()
+            .where(t.assets.c.resource_type == "skill")
+            .values(payload={**source["payload"], **location})
         )
     with pytest.raises(ValueError):
         await resources.materialize_skill(alice, "report", "1.0.0")
@@ -406,7 +414,7 @@ async def test_download_skill_authorizes_exact_version_and_checks_archive(
 ):
     _, admin, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
-    await put_asset(storage, checksum=skill_archive_digest(archive()))
+    await put_asset(storage, checksum=calculate_archive_digest(archive()))
     with pytest.raises(Forbidden):
         await resources.download_skill(alice, "report", "1.0.0")
     await GrantService(storage).grant(
@@ -427,9 +435,13 @@ async def test_download_skill_authorizes_exact_version_and_checks_archive(
         .read("report/SKILL.md")
         .endswith(b"# Report")
     )
+    source = await storage.assets.get("skill", "report", "1.0.0")
+    location = storage.skill_archives.write_archive(archive(extra="changed.md"))
     async with storage.transaction() as conn:
         await conn.execute(
-            t.skill_archives.update().values(archive=archive(extra="changed.md"))
+            t.assets.update()
+            .where(t.assets.c.resource_type == "skill")
+            .values(payload={**source["payload"], **location})
         )
     with pytest.raises(Conflict):
         await resources.download_skill(alice, "report", "1.0.0")

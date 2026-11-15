@@ -83,7 +83,8 @@ async def test_demo_seed_uses_local_catalog_and_deployed_tool(storage, tmp_path)
     await seed_demo(storage, provider, resources)
 
     skill = await storage.assets.get("skill", "egis-demo-report", "1.0.0")
-    assert skill["payload"]["original_markdown"]
+    assert "original_markdown" not in skill["payload"]
+    assert await resources.read_skill_markdown(skill)
     connector = await storage.assets.get("mcp", "egis-demo-tools", "1.0.0")
     assert connector["payload"]["config"]["transport"] == "streamable_http"
     rows, _ = await storage.definitions.list_definitions_and_reviews("agent")

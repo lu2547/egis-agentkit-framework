@@ -15,3 +15,4 @@ class _LocalRegistry:
 
     async def register(self, asset, *, actor, archive=None):
         await self.assets.insert_asset(asset, actor=actor)
+        return asset

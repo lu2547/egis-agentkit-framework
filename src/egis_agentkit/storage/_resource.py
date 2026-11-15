@@ -189,22 +189,6 @@ class ResourceAssetStorage:
         )
         return bool(result.rowcount)
 
-    async def put_archive(self, checksum, archive, *, conn=None):
-        """按内容哈希写入技能归档。"""
-        conn = transaction_connection(self.engine, conn)
-        await conn.execute(
-            insert(t.skill_archives)
-            .values(checksum_sha256=checksum, archive=archive)
-            .on_conflict_do_nothing()
-        )
-
-    async def get_archive(self, checksum):
-        async with self.engine.connect() as conn:
-            return await conn.scalar(
-                select(t.skill_archives.c.archive).where(
-                    t.skill_archives.c.checksum_sha256 == checksum
-                )
-            )
 
 
 class MCPCredentialStorage:

@@ -31,6 +31,11 @@ from egis_agentkit.client.nacos._settings import (
     SkillArchiveConfig,
 )
 from egis_agentkit.core.mcp import MCPAuthorization
+from egis_agentkit.core.skill._archive import (
+    build_skill_archive,
+    calculate_files_digest,
+    read_archive_files,
+)
 from egis_agentkit.errors import AgentKitError, Conflict, Forbidden, NotFound
 from egis_agentkit.service._user import UserService, require_admin
 from egis_agentkit.service.access._grant import GrantService
@@ -46,15 +51,10 @@ from egis_agentkit.storage.model import (
     User,
 )
 from egis_agentkit.storage.model._base import publication_label, resource_available
+from egis_agentkit.storage.skill._archive import SkillArchiveStorage
 
 from ._connector import AuthorizedMCPClient, LocalMCPRegistry
-from ._skill import (
-    LocalSkillRegistry,
-    _archive_files,
-    _files_digest,
-    _skill_front,
-    _zip,
-)
+from ._skill import LocalSkillRegistry, _skill_front
 from ._tool import FunctionToolRegistry
 
 __all__ = ["SkillActivation"]
@@ -140,7 +140,14 @@ class ResourceService:
         self.permissions = PermissionService(storage, policies)
         self.grants = GrantService(storage)
         self._cache_locks = {}
-        self.skill_registry = LocalSkillRegistry(storage.assets)
+        self.skill_archives = storage.skill_archives
+        if self.skill_archives is None:
+            if config is None:
+                raise ValueError("技能 NAS 文件存储未配置")
+            self.skill_archives = SkillArchiveStorage.from_settings(
+                config.snapshot.skill, config_provider=config
+            )
+        self.skill_registry = LocalSkillRegistry(storage.assets, self.skill_archives)
         self.mcp_registry = LocalMCPRegistry(storage.assets)
         self.skill_hub = LocalSkillHub(self)
         self.mcp_hub = LocalMCPHub(self)
@@ -250,9 +257,7 @@ class ResourceService:
         await self.personal.update_resource_enabled(user, kind, identifier, enabled)
         return await self._view(user, asset)
 
-    async def remove_installation(
-        self, user: User, kind: str, identifier: str
-    ) -> None:
+    async def remove_installation(self, user: User, kind: str, identifier: str) -> None:
         """取消个人选用；即使资源授权已经撤销，也允许清理自己的关联。"""
         await self.personal.remove_resource(user, kind, identifier)
 
@@ -594,7 +599,8 @@ class ResourceService:
             (await self.personal.list_resources(user, asset["resource_type"])).get(
                 asset["resource_id"]
             )
-            if asset["resource_type"] in ("skill", "mcp") else None
+            if asset["resource_type"] in ("skill", "mcp")
+            else None
         )
         payload = {
             k: v
@@ -618,7 +624,7 @@ class ResourceService:
             if not usable and not editable and not self._tool_card_visible(user, asset):
                 raise Forbidden()
             if asset["resource_type"] == "skill":
-                payload["markdown"] = asset["payload"]["original_markdown"]
+                payload["markdown"] = await self.read_skill_markdown(asset)
                 payload["files"] = asset["payload"]["files"]
                 payload["base_version"] = asset["resource_version"]
             elif asset["resource_type"] == "mcp":
@@ -772,7 +778,6 @@ class ResourceService:
         rid = data.get("resource_id") or kind + "-" + uuid4().hex
         version = data.get("resource_version") or "1.0.0"
         self._identity(rid, version)
-        registry_type = LocalSkillRegistry if kind == "skill" else LocalMCPRegistry
         metadata = {
             "dependency_only": data.get("dependency_only") is True,
             "avatar": catalog_icon_id(
@@ -787,7 +792,6 @@ class ResourceService:
                 await progress("preparing", 35, resource_version=version)
             metadata.update(
                 category=str(data.get("category") or "other")[:80],
-                original_markdown=files["SKILL.md"].decode("utf-8"),
                 files=[
                     {"path": name, "size": len(value)}
                     for name, value in sorted(files.items())
@@ -800,7 +804,7 @@ class ResourceService:
             if sum(map(len, files.values())) > limits.expanded_bytes_limit:
                 raise ValueError("Skill exceeds upload limit")
             archive, digest = await asyncio.to_thread(
-                lambda: (_zip(files, rid), _files_digest(files))
+                lambda: (build_skill_archive(files, rid), calculate_files_digest(files))
             )
             if len(archive) > limits.max_bytes:
                 raise ValueError("Skill archive exceeds upload limit")
@@ -810,7 +814,11 @@ class ResourceService:
         if progress:
             await progress("registering", 65)
         async with self.storage.definition_write() as write:
-            registry = registry_type(write.assets)
+            registry = (
+                LocalSkillRegistry(write.assets, self.skill_archives)
+                if kind == "skill"
+                else LocalMCPRegistry(write.assets)
+            )
             await write.assets.lock_resource(kind, rid)
             existing = (
                 await registry.get_version(rid, version) if import_job_id else None
@@ -839,7 +847,9 @@ class ResourceService:
                     payload=metadata,
                     checksum_sha256=digest,
                 )
-                await registry.register(model, actor=user.user_id, archive=archive)
+                model = await registry.register(
+                    model, actor=user.user_id, archive=archive
+                )
                 asset = model.model_dump()
                 await GrantService(write).record_owner(
                     kind, rid, asset, actor=user.user_id
@@ -906,7 +916,7 @@ class ResourceService:
             content = await self.download_skill(
                 user, rid, base_version, for_edit=True, archive_limits=limits
             )
-            files = await asyncio.to_thread(_archive_files, content, limits)
+            files = await asyncio.to_thread(read_archive_files, content, limits)
             for key in ("avatar", "category", "is_skill_market_visible"):
                 data.setdefault(key, base["payload"].get(key))
         files["SKILL.md"] = markdown.encode()
@@ -928,7 +938,7 @@ class ResourceService:
         owner_id=None,
     ):
         limits = self.archive_limits
-        files = await asyncio.to_thread(_archive_files, archive, limits)
+        files = await asyncio.to_thread(read_archive_files, archive, limits)
         markdown = files["SKILL.md"].decode("utf-8")
         data = await asyncio.to_thread(
             self._skill_data,
@@ -979,6 +989,19 @@ class ResourceService:
             )
         return result
 
+    async def read_skill_markdown(self, asset):
+        """在调用方完成版本授权后，从 NAS 归档读取并校验编辑/详情所需的正文。"""
+        content = await self.skill_registry.archive(asset)
+        files = await asyncio.to_thread(
+            read_archive_files, content, self.archive_limits
+        )
+        if (
+            await asyncio.to_thread(calculate_files_digest, files)
+            != asset["checksum_sha256"]
+        ):
+            raise Conflict("技能内容摘要与版本记录不一致")
+        return files["SKILL.md"].decode("utf-8")
+
     async def download_skill(
         self,
         user,
@@ -998,11 +1021,11 @@ class ResourceService:
                 user.user_id, asset["resource_id"], version
             )
         content = await self._read_skill_archive(archive, limits.max_bytes)
-        files = await asyncio.to_thread(_archive_files, content, limits)
-        checksum = await asyncio.to_thread(_files_digest, files)
+        files = await asyncio.to_thread(read_archive_files, content, limits)
+        checksum = await asyncio.to_thread(calculate_files_digest, files)
         if checksum != asset["checksum_sha256"]:
             raise Conflict("Skill source checksum changed")
-        return await asyncio.to_thread(_zip, files, resource_id)
+        return await asyncio.to_thread(build_skill_archive, files, resource_id)
 
     @staticmethod
     async def _read_skill_archive(archive, maximum):
@@ -1070,7 +1093,7 @@ class ResourceService:
                 cached[path.relative_to(destination).as_posix()] = path.read_bytes()
             elif not path.is_dir():
                 raise Forbidden("Skill cache contains a special file")
-        if _files_digest(cached) != checksum:
+        if calculate_files_digest(cached) != checksum:
             raise Conflict("Skill cache integrity check failed")
 
     async def materialize_skill(
@@ -1091,8 +1114,8 @@ class ResourceService:
                 authorization_scope=authorization_scope,
                 archive_limits=limits,
             )
-            files = _archive_files(content, limits)
-            checksum = _files_digest(files)
+            files = read_archive_files(content, limits)
+            checksum = calculate_files_digest(files)
             base = self.workspace_root
             for part in parts:
                 base = base / part
@@ -1142,7 +1165,7 @@ class ResourceService:
                 for p in destination.rglob("*")
                 if p.is_file()
             }
-            checksum = _files_digest(files)
+            checksum = calculate_files_digest(files)
             self._validate_skill_cache(destination, checksum)
             return checksum
 

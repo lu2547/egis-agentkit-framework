@@ -40,8 +40,8 @@ class AccessStorage:
     async def list_grants(self) -> list[dict]:
         async with self.engine.connect() as conn:
             rows = await conn.execute(
-                select(t.resource_access).order_by(
-                    t.resource_access.c.granted_at.desc(), t.resource_access.c.id
+                select(t.resource_permission).order_by(
+                    t.resource_permission.c.granted_at.desc(), t.resource_permission.c.id
                 )
             )
             return [dict(row) for row in rows.mappings()]
@@ -52,11 +52,11 @@ class AccessStorage:
             async with self.engine.connect() as connection:
                 return await self.direct_grants(kind, identifier, conn=connection)
         rows = await conn.execute(
-            select(t.resource_access).where(
-                t.resource_access.c.resource_type == kind,
-                t.resource_access.c.resource_id == identifier,
-                t.resource_access.c.grant_source_type.in_(("manual", "share")),
-                t.resource_access.c.revoked_at.is_(None),
+            select(t.resource_permission).where(
+                t.resource_permission.c.resource_type == kind,
+                t.resource_permission.c.resource_id == identifier,
+                t.resource_permission.c.grant_source_type.in_(("manual", "share")),
+                t.resource_permission.c.revoked_at.is_(None),
             )
         )
         return [dict(row) for row in rows.mappings()]
@@ -113,22 +113,22 @@ class AccessStorage:
                     .where(*identity, t.assets.c.resource_version == version)
                     .values(is_shared_current=True)
                 )
-        current = update(t.reviews).where(
-            t.reviews.c.resource_type == kind,
-            t.reviews.c.resource_id == identifier,
-            t.reviews.c.is_current,
+        current = update(t.approvals).where(
+            t.approvals.c.resource_type == kind,
+            t.approvals.c.resource_id == identifier,
+            t.approvals.c.is_current,
         )
         if version is not None:
-            current = current.where(t.reviews.c.resource_version != str(version))
+            current = current.where(t.approvals.c.resource_version != str(version))
         await conn.execute(current.values(is_current=False))
         if version is None:
             await conn.execute(
-                update(t.reviews)
+                update(t.approvals)
                 .where(
-                    t.reviews.c.resource_type == kind,
-                    t.reviews.c.resource_id == identifier,
-                    t.reviews.c.review_type == "update",
-                    t.reviews.c.review_status_type == "pending",
+                    t.approvals.c.resource_type == kind,
+                    t.approvals.c.resource_id == identifier,
+                    t.approvals.c.review_type == "update",
+                    t.approvals.c.review_status_type == "pending",
                 )
                 .values(review_status_type="cancelled")
             )
@@ -139,12 +139,12 @@ class AccessStorage:
                 return await self.has_pending_update(kind, identifier, conn=connection)
         return bool(
             await conn.scalar(
-                select(t.reviews.c.review_id)
+                select(t.approvals.c.review_id)
                 .where(
-                    t.reviews.c.resource_type == kind,
-                    t.reviews.c.resource_id == identifier,
-                    t.reviews.c.review_type == "update",
-                    t.reviews.c.review_status_type == "pending",
+                    t.approvals.c.resource_type == kind,
+                    t.approvals.c.resource_id == identifier,
+                    t.approvals.c.review_type == "update",
+                    t.approvals.c.review_status_type == "pending",
                 )
                 .limit(1)
             )
@@ -172,26 +172,26 @@ class AccessStorage:
             t.groups.c.group_id.in_(group_ids), t.groups.c.is_enabled
         )
         statement = (
-            select(t.resource_access)
+            select(t.resource_permission)
             .where(
-                t.resource_access.c.revoked_at.is_(None),
+                t.resource_permission.c.revoked_at.is_(None),
                 or_(
                     and_(
-                        t.resource_access.c.principal_type == "user",
-                        t.resource_access.c.principal_id == user_id,
+                        t.resource_permission.c.principal_type == "user",
+                        t.resource_permission.c.principal_id == user_id,
                     ),
                     and_(
-                        t.resource_access.c.principal_type == "group",
-                        t.resource_access.c.principal_id.in_(enabled_groups),
+                        t.resource_permission.c.principal_type == "group",
+                        t.resource_permission.c.principal_id.in_(enabled_groups),
                     ),
                 ),
             )
-            .order_by(t.resource_access.c.granted_at.desc(), t.resource_access.c.id)
+            .order_by(t.resource_permission.c.granted_at.desc(), t.resource_permission.c.id)
         )
         if kind is not None:
-            statement = statement.where(t.resource_access.c.resource_type == kind)
+            statement = statement.where(t.resource_permission.c.resource_type == kind)
         if resource_id is not None:
-            statement = statement.where(t.resource_access.c.resource_id == resource_id)
+            statement = statement.where(t.resource_permission.c.resource_id == resource_id)
         rows = await conn.execute(statement)
         return [dict(row) for row in rows.mappings()]
 
@@ -199,15 +199,15 @@ class AccessStorage:
         self, values: dict, *, actor: str, conn: AsyncConnection | None = None
     ) -> dict:
         conn = transaction_connection(self.engine, conn)
-        statement = insert(t.resource_access).values(
+        statement = insert(t.resource_permission).values(
             **values, granted_by=actor, granted_at=utcnow()
         )
         result = await conn.execute(
             statement.on_conflict_do_update(
-                index_elements=[t.resource_access.c[key] for key in GRANT_KEY],
-                index_where=t.resource_access.c.revoked_at.is_(None),
+                index_elements=[t.resource_permission.c[key] for key in GRANT_KEY],
+                index_where=t.resource_permission.c.revoked_at.is_(None),
                 set_={"origin_key": statement.excluded.origin_key},
-            ).returning(t.resource_access)
+            ).returning(t.resource_permission)
         )
         return dict(result.mappings().one())
 
@@ -218,11 +218,11 @@ class AccessStorage:
         row = (
             (
                 await conn.execute(
-                    select(t.resource_access).where(
-                        t.resource_access.c.id == grant_id,
-                        t.resource_access.c.resource_id == resource_id,
-                        t.resource_access.c.root_grant_id.is_(None),
-                        t.resource_access.c.revoked_at.is_(None),
+                    select(t.resource_permission).where(
+                        t.resource_permission.c.id == grant_id,
+                        t.resource_permission.c.resource_id == resource_id,
+                        t.resource_permission.c.root_grant_id.is_(None),
+                        t.resource_permission.c.revoked_at.is_(None),
                     )
                 )
             )
@@ -235,11 +235,11 @@ class AccessStorage:
         """收回根授权不再使用的依赖路径。"""
         conn = transaction_connection(self.engine, conn)
         await conn.execute(
-            update(t.resource_access)
+            update(t.resource_permission)
             .where(
-                t.resource_access.c.root_grant_id == root_id,
-                t.resource_access.c.revoked_at.is_(None),
-                t.resource_access.c.id.not_in(retained_ids),
+                t.resource_permission.c.root_grant_id == root_id,
+                t.resource_permission.c.revoked_at.is_(None),
+                t.resource_permission.c.id.not_in(retained_ids),
             )
             .values(revoked_at=utcnow(), revoked_by=actor)
         )
@@ -251,11 +251,11 @@ class AccessStorage:
         row = (
             (
                 await conn.execute(
-                    select(t.resource_access)
+                    select(t.resource_permission)
                     .where(
-                        t.resource_access.c.id == grant_id,
-                        t.resource_access.c.grant_source_type.in_(("manual", "share")),
-                        t.resource_access.c.root_grant_id.is_(None),
+                        t.resource_permission.c.id == grant_id,
+                        t.resource_permission.c.grant_source_type.in_(("manual", "share")),
+                        t.resource_permission.c.root_grant_id.is_(None),
                     )
                     .with_for_update()
                 )
@@ -269,13 +269,13 @@ class AccessStorage:
             return dict(row)
         now = utcnow()
         await conn.execute(
-            update(t.resource_access)
+            update(t.resource_permission)
             .where(
                 or_(
-                    t.resource_access.c.id == grant_id,
-                    t.resource_access.c.root_grant_id == grant_id,
+                    t.resource_permission.c.id == grant_id,
+                    t.resource_permission.c.root_grant_id == grant_id,
                 ),
-                t.resource_access.c.revoked_at.is_(None),
+                t.resource_permission.c.revoked_at.is_(None),
             )
             .values(revoked_at=now, revoked_by=actor)
         )
@@ -301,35 +301,35 @@ class AccessStorage:
                 return
             await self.set_shared_version(kind, identifier, None, conn=conn)
             await conn.execute(
-                update(t.resource_access)
+                update(t.resource_permission)
                 .where(
-                    t.resource_access.c.resource_type == kind,
-                    t.resource_access.c.resource_id == identifier,
-                    t.resource_access.c.grant_source_type.in_(("manual", "share")),
-                    t.resource_access.c.revoked_at.is_(None),
+                    t.resource_permission.c.resource_type == kind,
+                    t.resource_permission.c.resource_id == identifier,
+                    t.resource_permission.c.grant_source_type.in_(("manual", "share")),
+                    t.resource_permission.c.revoked_at.is_(None),
                 )
                 .values(revoked_at=utcnow(), revoked_by=actor)
             )
             return
         await self.set_shared_version(kind, identifier, None, conn=conn)
-        matching = select(t.resource_access.c.id).where(
-            t.resource_access.c.resource_type == kind,
-            t.resource_access.c.resource_id == identifier,
-            t.resource_access.c.revoked_at.is_(None),
+        matching = select(t.resource_permission.c.id).where(
+            t.resource_permission.c.resource_type == kind,
+            t.resource_permission.c.resource_id == identifier,
+            t.resource_permission.c.revoked_at.is_(None),
         )
         branch = matching.cte("revoked_branch", recursive=True)
         branch = branch.union(
-            select(t.resource_access.c.id)
-            .join(branch, t.resource_access.c.parent_grant_id == branch.c.id)
-            .where(t.resource_access.c.revoked_at.is_(None))
+            select(t.resource_permission.c.id)
+            .join(branch, t.resource_permission.c.parent_grant_id == branch.c.id)
+            .where(t.resource_permission.c.revoked_at.is_(None))
         )
         rows = await conn.execute(
-            update(t.resource_access)
-            .where(t.resource_access.c.id.in_(select(branch.c.id)))
+            update(t.resource_permission)
+            .where(t.resource_permission.c.id.in_(select(branch.c.id)))
             .values(revoked_at=utcnow(), revoked_by=actor)
             .returning(
-                t.resource_access.c.grant_source_type,
-                t.resource_access.c.source_review_id,
+                t.resource_permission.c.grant_source_type,
+                t.resource_permission.c.source_review_id,
             )
         )
         reviews = [
@@ -337,8 +337,8 @@ class AccessStorage:
         ]
         if reviews:
             await conn.execute(
-                update(t.reviews)
-                .where(t.reviews.c.review_id.in_(reviews))
+                update(t.approvals)
+                .where(t.approvals.c.review_id.in_(reviews))
                 .values(is_current=False)
             )
 
@@ -360,21 +360,21 @@ class AccessStorage:
                     version=version,
                     conn=connection,
                 )
-        statement = select(t.reviews).where(
-            t.reviews.c.resource_id == resource_id,
-            t.reviews.c.is_current,
-            t.reviews.c.review_status_type == "approved",
+        statement = select(t.approvals).where(
+            t.approvals.c.resource_id == resource_id,
+            t.approvals.c.is_current,
+            t.approvals.c.review_status_type == "approved",
         )
         if resource_type is not None:
-            statement = statement.where(t.reviews.c.resource_type == resource_type)
+            statement = statement.where(t.approvals.c.resource_type == resource_type)
         if review_id is not None:
-            statement = statement.where(t.reviews.c.review_id == review_id)
+            statement = statement.where(t.approvals.c.review_id == review_id)
         if version is not None:
-            statement = statement.where(t.reviews.c.resource_version == str(version))
+            statement = statement.where(t.approvals.c.resource_version == str(version))
         row = (
             (
                 await conn.execute(
-                    statement.order_by(t.reviews.c.reviewed_at.desc()).limit(1)
+                    statement.order_by(t.approvals.c.reviewed_at.desc()).limit(1)
                 )
             )
             .mappings()
@@ -387,14 +387,14 @@ class AccessStorage:
     ) -> dict:
         conn = transaction_connection(self.engine, conn)
         result = await conn.execute(
-            insert(t.reviews).values(**values).returning(t.reviews)
+            insert(t.approvals).values(**values).returning(t.approvals)
         )
         return dict(result.mappings().one())
 
     async def list_reviews(self, *, owner_id: str | None = None) -> list[dict]:
-        statement = select(t.reviews).order_by(t.reviews.c.submitted_at.desc())
+        statement = select(t.approvals).order_by(t.approvals.c.submitted_at.desc())
         if owner_id is not None:
-            statement = statement.where(t.reviews.c.owner_id == owner_id)
+            statement = statement.where(t.approvals.c.owner_id == owner_id)
         async with self.engine.connect() as conn:
             rows = await conn.execute(statement)
             return [dict(row) for row in rows.mappings()]
@@ -406,8 +406,8 @@ class AccessStorage:
         row = (
             (
                 await conn.execute(
-                    select(t.reviews)
-                    .where(t.reviews.c.review_id == review_id)
+                    select(t.approvals)
+                    .where(t.approvals.c.review_id == review_id)
                     .with_for_update()
                 )
             )
@@ -421,9 +421,9 @@ class AccessStorage:
     ) -> dict:
         conn = transaction_connection(self.engine, conn)
         result = await conn.execute(
-            update(t.reviews)
-            .where(t.reviews.c.review_id == review_id)
+            update(t.approvals)
+            .where(t.approvals.c.review_id == review_id)
             .values(**values)
-            .returning(t.reviews)
+            .returning(t.approvals)
         )
         return dict(result.mappings().one())

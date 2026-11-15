@@ -88,7 +88,7 @@ async def test_agent_delete_hides_all_versions_and_preserves_history(storage):
         tables = await connection.run_sync(lambda conn: inspect(conn).get_table_names())
         assert "ak_agent_definition_summary" in tables
         assert "ak_agent_definition_detail" in tables
-        assert "ak_resource_access" in tables
+        assert "ak_resource_permission" in tables
         columns = await connection.run_sync(
             lambda conn: inspect(conn).get_columns("ak_agent_definition_summary")
         )
@@ -179,7 +179,7 @@ async def test_agent_creation_rolls_back_when_owner_access_cannot_be_saved(stora
     async with storage.transaction() as connection:
         await connection.execute(
             text(
-                "ALTER TABLE ak_resource_access ADD CONSTRAINT reject_owner_access "
+                "ALTER TABLE ak_resource_permission ADD CONSTRAINT reject_owner_access "
                 "CHECK (grant_source_type <> 'owner')"
             )
         )

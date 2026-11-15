@@ -6,9 +6,10 @@ import pytest
 from sqlalchemy import select, text
 from test_domain import identities
 
+from egis_agentkit.core.skill._archive import read_archive_files
 from egis_agentkit.errors import NotFound
 from egis_agentkit.service.resource._catalog import ResourceService
-from egis_agentkit.service.resource._skill import _archive_files, _skill_front
+from egis_agentkit.service.resource._skill import _skill_front
 
 
 def bundle(version="1.2.3"):
@@ -31,14 +32,22 @@ async def test_import_enqueue_is_durable_owner_only_and_registration_is_deferred
     _, _, alice, bob = await identities(storage)
     resources = ResourceService(storage, tmp_path)
     queue = SkillImportService(storage, resources)
+    uploaded = bundle()
     job = await queue.enqueue(
         alice,
-        io.BytesIO(bundle()),
+        io.BytesIO(uploaded),
         filename="demo.zip",
         category="writing",
         avatar="book",
     )
     assert job["status"] == "queued"
+    from egis_agentkit.storage import tables as t
+
+    assert "archive" not in t.skill_imports.c
+    assert "archive_location" not in job
+    async with storage.engine.connect() as conn:
+        location = await conn.scalar(select(t.skill_imports.c.archive_location))
+    assert resources.skill_archives.read_archive(location) == uploaded
     with pytest.raises(NotFound):
         await queue.get(bob, job["job_id"])
     assert await queue.list(bob) == []
@@ -48,11 +57,13 @@ async def test_import_enqueue_is_durable_owner_only_and_registration_is_deferred
     done = await recovery.get(alice, job["job_id"])
     assert done["status"] == "succeeded" and done["progress"] == 100
     assert done["resource_version"] == "1.2.3"
+    async with storage.engine.connect() as conn:
+        assert await conn.scalar(select(t.skill_imports.c.archive_location)) is None
     detail = await resources.detail(alice, "skill", done["resource_id"], "1.2.3")
     assert detail["payload"]["category"] == "writing"
     assert "name: demo" in detail["payload"]["markdown"]
     assert detail["payload"]["files"] == [
-        {"path": "SKILL.md", "size": len(_archive_files(bundle())["SKILL.md"])},
+        {"path": "SKILL.md", "size": len(read_archive_files(bundle())["SKILL.md"])},
         {"path": "assets/logo.bin", "size": 10},
     ]
 
@@ -88,7 +99,9 @@ async def test_import_claim_fencing_recovery_and_retry_without_duplicate_asset(
     async with storage.transaction() as conn:
         await conn.execute(
             t.skill_imports.update().values(
-                status="queued", result=None, archive=bundle()
+                status="queued",
+                result=None,
+                archive_location=storage.skill_archives.write_archive(bundle()),
             )
         )
     await first.run_once()
@@ -107,7 +120,7 @@ async def test_skill_edit_preserves_attachments_and_frontmatter_version(
         alice, bundle(), category="writing", avatar="book"
     )
     edited = (
-        _archive_files(bundle())["SKILL.md"]
+        read_archive_files(bundle())["SKILL.md"]
         .decode()
         .replace("1.2.3", "1.2.4")
         .replace("# Original", "# Edited")
@@ -122,7 +135,7 @@ async def test_skill_edit_preserves_attachments_and_frontmatter_version(
         await resources.save_skill(alice, data)
     saved = await resources.save_skill(alice, {**data, "base_version": "1.2.3"})
     content = await resources.download_skill(alice, saved["resource_id"], "1.2.4")
-    files = _archive_files(content)
+    files = read_archive_files(content)
     assert files["assets/logo.bin"] == b"attachment"
     assert files["SKILL.md"].decode() == edited
     assert b"metadata:\n  author: Demo" in files["SKILL.md"]
@@ -167,7 +180,7 @@ async def test_nested_metadata_version_is_canonical_and_export_is_exact(
     assert (await resources.detail(alice, "skill", saved["resource_id"], "6.8.0"))[
         "payload"
     ]["markdown"].encode() == original
-    exported = _archive_files(
+    exported = read_archive_files(
         await resources.download_skill(alice, saved["resource_id"], "6.8.0")
     )
     assert exported["SKILL.md"] == original
@@ -189,7 +202,7 @@ def test_manifest_delimiter_inside_metadata_does_not_truncate_frontmatter():
             "SKILL.md",
             '---\nmetadata:\n  marker: "---"\nname: custom-marker\nversion: 1.0.0\n---\n# Body',
         )
-    front = _skill_front(_archive_files(output.getvalue())["SKILL.md"].decode())
+    front = _skill_front(read_archive_files(output.getvalue())["SKILL.md"].decode())
     assert front["name"] == "custom-marker"
 
 
@@ -225,7 +238,7 @@ async def test_import_http_accepts_upload_metadata_and_routes_owner_only(
         job = response.json()
         assert job["category"] == "writing" and job["avatar"] == "book"
         assert job["status"] == "queued"
-        assert "archive" not in job and "lease_token" not in job
+        assert "archive_location" not in job and "lease_token" not in job
         assert (await client.get("/manager/skills/imports/" + job["job_id"])).json()[
             "job_id"
         ] == job["job_id"]
@@ -317,7 +330,7 @@ async def test_skill_import_and_edit_yaml_processing_stays_off_event_loop(
         {
             "resource_id": imported["resource_id"],
             "base_version": "1.2.3",
-            "markdown": _archive_files(bundle())["SKILL.md"]
+            "markdown": read_archive_files(bundle())["SKILL.md"]
             .decode()
             .replace("1.2.3", "1.2.4"),
         },

@@ -5,7 +5,6 @@ from sqlalchemy import inspect, text
 RENAMES = {
     "ak_agent_definitions": "ak_agent_definition_summary",
     "ak_agent_definition_versions": "ak_agent_definition_detail",
-    "ak_resource_grants": "ak_resource_access",
 }
 
 
@@ -26,7 +25,7 @@ async def agent_tables(connection, schema):
 
 async def migrate_agent_storage(connection, schema, *, apply=False):
     """预览只检查结构；执行在调用方事务中重命名并转换删除状态。"""
-    from ..model._tables import agent_definition_summary, resource_access
+    from ..model._tables import agent_definition_summary, resource_permission
 
     actual = await agent_tables(connection, schema)
     quote = connection.dialect.identifier_preparer.quote_identifier
@@ -79,7 +78,7 @@ async def migrate_agent_storage(connection, schema, *, apply=False):
         )
         await connection.execute(text(f"ALTER TABLE {summary} DROP COLUMN is_enabled"))
     # 建立当前查询所需索引；已有索引保留，重复执行不重建。
-    for table in (agent_definition_summary, resource_access):
+    for table in (agent_definition_summary, resource_permission):
         for index in table.indexes:
             await connection.run_sync(
                 lambda conn, index=index: index.create(conn, checkfirst=True)

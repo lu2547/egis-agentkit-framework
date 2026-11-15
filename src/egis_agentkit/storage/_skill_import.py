@@ -13,7 +13,7 @@ _STATUS_COLUMNS = tuple(
     for column in _IMPORTS.c
     if column.name
     not in {
-        "archive",
+        "archive_location",
         "lease_token",
         "lease_until",
         "created_by",

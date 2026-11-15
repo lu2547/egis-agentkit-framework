@@ -49,7 +49,7 @@ async def test_agent_upgrade_preserves_versions_access_and_deleted_state(storage
         for current, previous in (
             ("ak_agent_definition_summary", "ak_agent_definitions"),
             ("ak_agent_definition_detail", "ak_agent_definition_versions"),
-            ("ak_resource_access", "ak_resource_grants"),
+            ("ak_resource_permission", "ak_resource_grants"),
         ):
             await connection.execute(
                 text(f"ALTER TABLE {current} RENAME TO {previous}")

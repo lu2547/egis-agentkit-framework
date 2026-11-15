@@ -48,7 +48,7 @@ async def test_removing_personal_selection_preserves_resource_grants_and_other_u
     await resources.install(bob, "skill", "report")
     async with storage.engine.connect() as connection:
         grants_before = (
-            (await connection.execute(select(t.resource_access))).mappings().all()
+            (await connection.execute(select(t.resource_permission))).mappings().all()
         )
 
     await resources.remove_installation(alice, "skill", "report")
@@ -59,7 +59,7 @@ async def test_removing_personal_selection_preserves_resource_grants_and_other_u
         await resources.update_installation(alice, "skill", "report", True)
     async with storage.engine.connect() as connection:
         assert (
-            await connection.execute(select(t.resource_access))
+            await connection.execute(select(t.resource_permission))
         ).mappings().all() == grants_before
         assert await connection.scalar(select(t.assets.c.resource_id)) == "report"
     await resources.install(alice, "skill", "report")

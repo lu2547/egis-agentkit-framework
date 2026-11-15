@@ -5,13 +5,15 @@ import pytest
 from test_domain import COMPANY, identities
 from test_resources import archive, put_asset
 
+from egis_agentkit.client.nacos._settings import SkillArchiveConfig
+from egis_agentkit.core.skill._archive import calculate_archive_digest
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.agent._personal_manager import PersonalManager
 from egis_agentkit.service.resource._catalog import ResourceService
-from egis_agentkit.service.resource._skill import skill_archive_digest
 from egis_agentkit.storage.model import AgentDefinition, Grant
+from egis_agentkit.storage.skill._archive import SkillArchiveStorage
 
 
 @pytest.mark.asyncio
@@ -20,7 +22,7 @@ async def test_bound_agent_cache_shared_across_users_and_isolated_by_definition(
 ):
     _, admin, alice, bob = await identities(storage)
     resources = ResourceService(storage, tmp_path)
-    await put_asset(storage, checksum=skill_archive_digest(archive()))
+    await put_asset(storage, checksum=calculate_archive_digest(archive()))
     agents = AgentManager(storage)
 
     async def create(name):
@@ -99,7 +101,7 @@ async def test_private_skill_personal_and_unscoped_use_user_cache(storage, tmp_p
         storage,
         owner_type="user",
         owner_id="alice",
-        checksum=skill_archive_digest(archive()),
+        checksum=calculate_archive_digest(archive()),
     )
     result = await resources.materialize_skill(alice, "report", "1.0.0")
     assert Path(result.dir).parent == tmp_path / "user" / "alice" / "skills" / "report"
@@ -127,7 +129,7 @@ async def test_skill_cache_rejects_symlinked_user_ancestor(storage, tmp_path):
         storage,
         owner_type="user",
         owner_id="alice",
-        checksum=skill_archive_digest(archive()),
+        checksum=calculate_archive_digest(archive()),
     )
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -183,7 +185,7 @@ async def test_unsafe_agent_cache_segments_are_rejected(
 
     _, admin, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
-    await put_asset(storage, checksum=skill_archive_digest(archive()))
+    await put_asset(storage, checksum=calculate_archive_digest(archive()))
     row = await AgentManager(storage).add_definition(
         admin,
         AgentDefinition(
@@ -237,7 +239,7 @@ async def test_bound_agent_cache_rejects_symlinked_definition_ancestor(
 ):
     _, admin, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
-    await put_asset(storage, checksum=skill_archive_digest(archive()))
+    await put_asset(storage, checksum=calculate_archive_digest(archive()))
     row = await AgentManager(storage).add_definition(
         admin,
         AgentDefinition(
@@ -288,7 +290,14 @@ async def test_bound_agent_cache_rejects_symlinked_definition_ancestor(
 
 
 def cache_service_for_race(tmp_path):
-    storage = SimpleNamespace(assets=None, engine=None, mcp_credentials=None)
+    storage = SimpleNamespace(
+        assets=None,
+        engine=None,
+        mcp_credentials=None,
+        skill_archives=SkillArchiveStorage(
+            tmp_path / "nas", max_bytes=SkillArchiveConfig().max_bytes
+        ),
+    )
     service = ResourceService(storage, tmp_path)
     asset = {
         "resource_type": "skill",
@@ -296,7 +305,7 @@ def cache_service_for_race(tmp_path):
         "resource_version": "1.0.0",
         "owner_type": "system",
         "owner_id": "sys",
-        "checksum_sha256": skill_archive_digest(archive()),
+        "checksum_sha256": calculate_archive_digest(archive()),
         "is_enabled": True,
         "payload": {},
     }

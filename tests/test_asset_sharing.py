@@ -44,7 +44,7 @@ async def test_private_asset_requires_review_and_approval_grants_exact_version(
         "is_usable"
     ]
     async with storage.engine.connect() as conn:
-        grants = (await conn.execute(select(t.resource_access))).mappings().all()
+        grants = (await conn.execute(select(t.resource_permission))).mappings().all()
     assert {(row["grant_source_type"], row["principal_type"]) for row in grants} == {
         ("owner", "user"),
         ("share", "group"),
@@ -105,7 +105,7 @@ async def test_asset_update_moves_one_shared_publication(storage, tmp_path):
     with pytest.raises(Forbidden):
         await resources.detail(bob, "skill", "versions", "1.0.0")
     async with storage.engine.connect() as conn:
-        grants = (await conn.execute(select(t.resource_access))).mappings().all()
+        grants = (await conn.execute(select(t.resource_permission))).mappings().all()
     assert {
         row["source_review_id"] for row in grants if row["grant_source_type"] == "share"
     } == {first["review_id"]}

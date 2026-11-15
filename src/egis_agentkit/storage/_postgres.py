@@ -20,6 +20,7 @@ from ._user import UserStorage
 from .agent._resource import PersonalResourceStorage
 from .project._file_records import ProjectFileRecordStorage, lock_project_files
 from .project._project import ProjectStorage
+from .skill._archive import SkillArchiveStorage
 
 
 class DefinitionWrite:
@@ -58,8 +59,15 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
     enterprise transactions and reuse native persistence for runtime records.
     """
 
-    def __init__(self, url: str, engine: AsyncEngine):
+    def __init__(
+        self,
+        url: str,
+        engine: AsyncEngine,
+        *,
+        skill_archives: SkillArchiveStorage | None = None,
+    ):
         self.engine = engine
+        self.skill_archives = skill_archives
         self.users = UserStorage(engine)
         self.personal_resources = PersonalResourceStorage(engine)
         self.definitions = DefinitionStorage(engine)

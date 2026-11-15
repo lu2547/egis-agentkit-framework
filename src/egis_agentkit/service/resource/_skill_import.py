@@ -1,4 +1,10 @@
-"""执行技能归档上传、异步导入、租约续期和重试。"""
+"""管理 NAS 上传文件的异步技能导入，数据库只保存任务状态和文件定位。
+
+核心能力
+- enqueue：校验上传限额、完整写 NAS 后创建任务，失败不产生可领取任务。
+- process：通过 NAS 定位恢复上传内容，执行注册并保存结果。
+- claim / retry：领取、租约续期及失败重试，不把文件字节传入任务表。
+"""
 
 from __future__ import annotations
 
@@ -49,12 +55,15 @@ class SkillImportService:
         if len(category) > CATEGORY_MAX_LENGTH:
             raise ValueError("Skill category exceeds limit")
         avatar = catalog_icon_id(avatar, default="book")
-        # UploadFile has already spooled the request. Copy only the bounded ZIP;
-        # archive parsing and checksums are exclusively worker work.
+        # 1. 有界读取上传包；归档格式和内容规则仍交给异步任务校验。
         maximum = self.resources.max_skill_archive_bytes
         content = await asyncio.to_thread(stream.read, maximum + 1)
         if len(content) > maximum:
             raise ValueError("Skill archive exceeds upload limit")
+        # 2. NAS 文件完整可读后才能入队；其他 API 实例可从同一挂载目录恢复。
+        location = await asyncio.to_thread(
+            self.resources.skill_archives.write_archive, content
+        )
         job_id = uuid4().hex
         row = await self.jobs.enqueue(
             job_id=job_id,
@@ -62,7 +71,7 @@ class SkillImportService:
             filename=str(filename or "skill.zip")[:FILENAME_MAX_LENGTH],
             category=category,
             avatar=avatar,
-            archive=content,
+            archive_location=location,
             resource_id="skill-" + job_id,
             created_by=user.user_id,
             updated_by=user.user_id,
@@ -128,15 +137,20 @@ class SkillImportService:
                 if not await self._update(job, stage=stage, progress=percent, **extra):
                     raise asyncio.CancelledError
 
+            # 1. 读取受管 NAS 包，任务表不保存上传字节。
+            archive = await asyncio.to_thread(
+                self.resources.skill_archives.read_archive, job["archive_location"]
+            )
             result = await self.resources.upload_skill(
                 user,
-                job["archive"],
+                archive,
                 category=job["category"],
                 avatar=job["avatar"],
                 resource_id=job["resource_id"],
                 import_job_id=job["job_id"],
                 progress=progress,
             )
+            # 2. 注册完成后释放任务引用；失败任务保留引用供重试。
             await self._update(
                 job,
                 status="succeeded",
@@ -145,7 +159,7 @@ class SkillImportService:
                 resource_version=result["resource_version"],
                 result=result,
                 error=None,
-                archive=None,
+                archive_location=None,
                 lease_until=None,
             )
         except asyncio.CancelledError:
