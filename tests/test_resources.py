@@ -7,8 +7,9 @@ import pytest
 from sqlalchemy import select
 from test_domain import identities
 
-from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.errors import Conflict, Forbidden
+from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.service.resource._skill import _archive_files, skill_archive_digest
 from egis_agentkit.storage import tables as t
@@ -78,7 +79,7 @@ async def test_system_skill_catalog_and_install_require_exact_version_grant(
         await resources.detail(alice, "skill", "report", "1.0.0")
     assert (await resources.list(admin, "skill"))[0]["is_editable"]
     with pytest.raises(Forbidden):
-        await resources.installations.install(alice, "skill", "report", "1.0.0")
+        await resources.install(alice, "skill", "report")
     grant = await GrantService(storage).grant(
         admin,
         Grant(
@@ -92,11 +93,11 @@ async def test_system_skill_catalog_and_install_require_exact_version_grant(
         ),
     )
     assert (await resources.list(alice, "skill"))[0]["is_usable"]
-    installed = await resources.installations.install(alice, "skill", "report", "1.0.0")
+    installed = await resources.install(alice, "skill", "report")
     assert installed["is_installed"] and installed["is_enabled"]
-    assert len(await storage.list_skills("alice")) == 1
+    assert (await resources.personal.list_resources(alice, "skill"))["report"]["is_enabled"]
     assert len(await GrantService(storage).list_grants(admin)) == 1
-    await resources.installations.set_installation(alice, "skill", "report", "1.0.0", False)
+    await resources.update_installation(alice, "skill", "report", False)
     assert (await resources.detail(alice, "skill", "report", "1.0.0"))[
         "is_enabled"
     ] is False
@@ -153,12 +154,11 @@ async def test_materialization_preserves_files_checks_checksum_and_exact_inherit
     _, admin, alice, bob = await identities(storage)
     resources = ResourceService(storage, tmp_path)
     await put_asset(storage, checksum=skill_archive_digest(archive()))
-    from egis_agentkit.service.agent._expert_definition import ExpertDefinition
-    from egis_agentkit.storage.model import Definition
+    from egis_agentkit.storage.model import AgentDefinition
 
-    root = await ExpertDefinition(storage).build(
+    root = await AgentManager(storage).add_definition(
         admin,
-        Definition(
+        AgentDefinition(
             owner_type="system",
             owner_id="sys",
             agent_name="expert",
@@ -175,7 +175,7 @@ async def test_materialization_preserves_files_checks_checksum_and_exact_inherit
             },
         ),
     )
-    snapshot = await storage.definitions.read_view(root["id"], "system")
+    snapshot = await storage.definitions.get_definition_view(root["id"], "system")
     scope = SimpleNamespace(user_id="alice", root_definition=snapshot, definition=root)
     with pytest.raises(Forbidden):
         await resources.materialize_skill(alice, "report", "1.0.0")
@@ -280,7 +280,7 @@ async def test_shared_resource_uses_only_approved_asset_version(storage, tmp_pat
         await resources.detail(bob, "skill", "shared-report", "1.1.0")
     with pytest.raises(Forbidden):
         await resources.skill_hub.download("bob", "shared-report", "1.1.0")
-    installed = await resources.installations.install(bob, "skill", "shared-report", "1.0.0")
+    installed = await resources.install(bob, "skill", "shared-report")
     assert installed["is_installed"]
 
 
@@ -369,7 +369,7 @@ async def test_mcp_fails_closed_if_stored_endpoint_changes_or_checksum_missing(
     with pytest.raises(Conflict):
         await resources.mcps_for_refs(alice, [ref])
     with pytest.raises(Conflict):
-        await resources.installations.install(alice, "mcp", "pinned", "1.0.0")
+        await resources.install(alice, "mcp", "pinned")
     async with storage.transaction() as conn:
         await conn.execute(
             t.assets.update()

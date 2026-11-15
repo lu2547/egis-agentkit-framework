@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from egis_agentkit.backend.nacos._settings import ConnectorConfig, SkillArchiveConfig
+from egis_agentkit.client.nacos._settings import ConnectorConfig, SkillArchiveConfig
 from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.service.resource._skill import _archive_files
 

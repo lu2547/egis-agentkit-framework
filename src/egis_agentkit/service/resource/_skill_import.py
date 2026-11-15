@@ -7,7 +7,7 @@ import logging
 from contextlib import suppress
 from uuid import uuid4
 
-from egis_agentkit.backend.nacos._settings import (
+from egis_agentkit.client.nacos._settings import (
     SkillImportConfig,
 )
 from egis_agentkit.errors import Conflict, Forbidden, NotFound

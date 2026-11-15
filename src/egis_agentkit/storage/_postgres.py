@@ -5,19 +5,21 @@ from agentscope.app.storage import AsyncSQLAlchemyStorage
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from egis_agentkit.backend._postgres import PostgresTransaction
+from egis_agentkit.client._postgres import PostgresTransaction
 from egis_agentkit.errors import Conflict, Forbidden
 
 from ._access import AccessStorage
 from ._definition import DefinitionStorage
-from ._project import ProjectStorage
 from ._remote_agent import RemoteRunStorage
 from ._resource import MCPCredentialStorage, ResourceAssetStorage
 from ._schema import init_schema
 from ._session import SessionStorage
+from ._session_feedback import SessionFeedbackStorage
 from ._skill_import import SkillImportStorage
 from ._user import UserStorage
-from ._workspace_records import WorkspaceStorage, lock_workspace
+from .agent._resource import PersonalResourceStorage
+from .project._file_records import ProjectFileRecordStorage, lock_project_files
+from .project._project import ProjectStorage
 
 
 class DefinitionWrite:
@@ -26,6 +28,7 @@ class DefinitionWrite:
     def __init__(self, connection: AsyncConnection):
         self.engine = PostgresTransaction(connection)
         self.definitions = DefinitionStorage(self.engine)
+        self.agents = self.definitions.agents
         self.access = AccessStorage(self.engine)
         self.assets = ResourceAssetStorage(self.engine)
         self.users = UserStorage(self.engine)
@@ -58,7 +61,9 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
     def __init__(self, url: str, engine: AsyncEngine):
         self.engine = engine
         self.users = UserStorage(engine)
+        self.personal_resources = PersonalResourceStorage(engine)
         self.definitions = DefinitionStorage(engine)
+        self.agents = self.definitions.agents
         self.access = AccessStorage(engine)
         self.assets = ResourceAssetStorage(engine)
         self.mcp_credentials = MCPCredentialStorage(engine)
@@ -66,7 +71,8 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
         self.remote_runs = RemoteRunStorage(engine)
         self.projects = ProjectStorage(engine)
         self.sessions = SessionStorage(engine, self)
-        self.workspace = WorkspaceStorage(engine)
+        self.session_feedback = SessionFeedbackStorage(engine)
+        self.project_files = ProjectFileRecordStorage(engine)
         super().__init__(url, engine=engine, create_tables=False)
 
     async def init_schema(self) -> None:
@@ -108,12 +114,12 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
     async def project_cleanup(self, project_id):
         """锁住文件变更，并在一个事务内清理项目、原生会话和文件记录。"""
         async with self.engine.begin() as conn:
-            await lock_workspace(conn, project_id)
+            await lock_project_files(conn, project_id)
             transaction = PostgresTransaction(conn)
             yield (
                 ProjectStorage(transaction),
                 SessionStorage(transaction, self),
-                WorkspaceStorage(transaction),
+                ProjectFileRecordStorage(transaction),
             )
 
     @asynccontextmanager
@@ -121,7 +127,10 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
         """在同一事务清理原生会话和回复产物关系。"""
         async with self.engine.begin() as conn:
             transaction = PostgresTransaction(conn)
-            yield SessionStorage(transaction, self), WorkspaceStorage(transaction)
+            yield (
+                SessionStorage(transaction, self),
+                ProjectFileRecordStorage(transaction),
+            )
 
     async def read_session_unscoped(self, user_id, agent_id, session_id):
         record = await super().get_session(user_id, agent_id, session_id)

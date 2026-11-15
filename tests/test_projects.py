@@ -8,10 +8,10 @@ from sqlalchemy import func, select, text, update
 from test_domain import expert, identities
 
 from egis_agentkit.errors import Conflict, NotFound
-from egis_agentkit.service._project import ProjectService
 from egis_agentkit.service._session import SessionService
-from egis_agentkit.service.agent._expert_definition import ExpertDefinition
-from egis_agentkit.service.workspace._changes import FileChangeService
+from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.project._file_manager import ProjectFileManager
+from egis_agentkit.service.project._project_manager import ProjectManager
 from egis_agentkit.storage import tables as t
 
 
@@ -44,7 +44,7 @@ async def test_default_project_is_unique_and_project_access_is_owner_scoped(
     storage, tmp_path
 ):
     _, _, alice, bob = await identities(storage)
-    projects = ProjectService(storage, tmp_path)
+    projects = ProjectManager(storage, tmp_path)
     defaults = await asyncio.gather(*(projects.default(alice) for _ in range(4)))
     assert len({item["id"] for item in defaults}) == 1
     default = defaults[0]
@@ -68,7 +68,7 @@ async def test_default_project_is_unique_and_project_access_is_owner_scoped(
             await action
     renamed = await projects.rename(alice, second["id"], "  New name  ")
     assert renamed["project_name"] == "New name"
-    assert (await ProjectService(storage, tmp_path).get(alice, second["id"]))[
+    assert (await ProjectManager(storage, tmp_path).get(alice, second["id"]))[
         "project_name"
     ] == "New name"
     for invalid_name in ("   ", "x" * 129):
@@ -83,17 +83,19 @@ async def test_chats_share_project_root_and_other_projects_remain_isolated(
     storage, tmp_path
 ):
     _, _, alice, bob = await identities(storage)
-    source = await ExpertDefinition(storage).build(alice, expert())
-    bob_source = await ExpertDefinition(storage).build(bob, expert("bob"))
-    projects = ProjectService(storage, tmp_path)
+    source = await AgentManager(storage).add_definition(alice, expert())
+    bob_source = await AgentManager(storage).add_definition(bob, expert("bob"))
+    projects = ProjectManager(storage, tmp_path)
     tasks = SessionService(storage, tmp_path)
     project = await projects.create(alice, "Shared")
     separate = await projects.create(alice, "Separate")
-    first = await tasks.create(alice, source["id"], "private", project_id=project["id"])
-    second = await tasks.create(
+    first = await tasks.add_session(
         alice, source["id"], "private", project_id=project["id"]
     )
-    other = await tasks.create(
+    second = await tasks.add_session(
+        alice, source["id"], "private", project_id=project["id"]
+    )
+    other = await tasks.add_session(
         alice, source["id"], "private", project_id=separate["id"]
     )
     assert first["session_id"] != second["session_id"]
@@ -106,8 +108,10 @@ async def test_chats_share_project_root_and_other_projects_remain_isolated(
     )
     assert tasks.files.area_root("alice", project["id"], "uploads") == expected_root
     for task in (first, second):
-        native = await tasks.session(alice, task["session_id"])
-        assert native.config.workspace_id == project["id"]
+        native = await tasks.get_session_record(alice, task["session_id"])
+        from egis_agentkit.core.workspace._identity import workspace_id_for
+
+        assert native.config.workspace_id == workspace_id_for(alice.user_id)
         assert native.config.cwd == str(expected_root / ".work")
         assert native.agent_id == task["agent_id"] != source["id"]
         assert (
@@ -135,8 +139,10 @@ async def test_chats_share_project_root_and_other_projects_remain_isolated(
         item["path"] for item in tasks.files.list("alice", project["id"], "uploads")
     ] == ["shared.txt"]
     with pytest.raises(NotFound):
-        await tasks.create(bob, bob_source["id"], "private", project_id=project["id"])
-    assert await tasks.list(bob) == []
+        await tasks.add_session(
+            bob, bob_source["id"], "private", project_id=project["id"]
+        )
+    assert await tasks.list_sessions(bob) == []
 
 
 @pytest.mark.asyncio
@@ -144,18 +150,22 @@ async def test_project_delete_removes_chats_bus_history_and_files_only_in_projec
     storage, tmp_path
 ):
     _, _, alice, _ = await identities(storage)
-    source = await ExpertDefinition(storage).build(alice, expert())
-    projects = ProjectService(storage, tmp_path)
+    source = await AgentManager(storage).add_definition(alice, expert())
+    projects = ProjectManager(storage, tmp_path)
     tasks = SessionService(storage, tmp_path)
     doomed = await projects.create(alice, "Remove")
     surviving = await projects.create(alice, "Keep")
-    first = await tasks.create(alice, source["id"], "private", project_id=doomed["id"])
-    second = await tasks.create(alice, source["id"], "private", project_id=doomed["id"])
-    other = await tasks.create(
+    first = await tasks.add_session(
+        alice, source["id"], "private", project_id=doomed["id"]
+    )
+    second = await tasks.add_session(
+        alice, source["id"], "private", project_id=doomed["id"]
+    )
+    other = await tasks.add_session(
         alice, source["id"], "private", project_id=surviving["id"]
     )
     bus = InMemoryMessageBus()
-    changes = FileChangeService(storage, tmp_path)
+    changes = ProjectFileManager(storage, tmp_path)
     for task in (first, second, other):
         await seed_bus(bus, task["session_id"])
     for project in (doomed, surviving):
@@ -170,7 +180,7 @@ async def test_project_delete_removes_chats_bus_history_and_files_only_in_projec
                 .where(t.projects.c.id == pid)
                 .values(scan_error="prior error", scan_error_at=func.now())
             )
-    other_history = await changes.list(surviving["id"])
+    other_history = await changes.list_changes(surviving["id"])
     await projects.delete(alice, doomed["id"], bus)
     with pytest.raises(NotFound):
         await projects.get(alice, doomed["id"])
@@ -196,7 +206,7 @@ async def test_project_delete_removes_chats_bus_history_and_files_only_in_projec
             ).all()
     # A scan already authorized before deletion must not recreate removed state.
     await changes.observe_safe("alice", doomed["id"], discover=True)
-    assert await changes.list(doomed["id"]) == {
+    assert await changes.list_changes(doomed["id"]) == {
         "items": [],
         "next_cursor": None,
         "scan_error": None,
@@ -209,10 +219,10 @@ async def test_project_delete_removes_chats_bus_history_and_files_only_in_projec
             )
             is None
         )
-    assert await changes.list(surviving["id"]) == other_history
-    assert (await tasks.get(alice, other["session_id"]))["project_id"] == surviving[
-        "id"
-    ]
+    assert await changes.list_changes(surviving["id"]) == other_history
+    assert (await tasks.get_session(alice, other["session_id"]))[
+        "project_id"
+    ] == surviving["id"]
     assert (
         len(await bus.log_read(MessageBusKeys.session_events(other["session_id"]))) == 1
     )
@@ -227,18 +237,23 @@ async def test_project_delete_removes_chats_bus_history_and_files_only_in_projec
 @pytest.mark.parametrize("blocker", ["session", "project"])
 async def test_busy_project_delete_has_no_partial_removal(storage, tmp_path, blocker):
     _, _, alice, _ = await identities(storage)
-    source = await ExpertDefinition(storage).build(alice, expert())
-    projects = ProjectService(storage, tmp_path)
+    source = await AgentManager(storage).add_definition(alice, expert())
+    projects = ProjectManager(storage, tmp_path)
     tasks = SessionService(storage, tmp_path)
-    first = await tasks.create(alice, source["id"], "private")
-    second = await tasks.create(alice, source["id"], "private")
+    project = await projects.create(alice, "Busy")
+    first = await tasks.add_session(
+        alice, source["id"], "private", project_id=project["id"]
+    )
+    second = await tasks.add_session(
+        alice, source["id"], "private", project_id=project["id"]
+    )
     pid = first["project_id"]
     bus = InMemoryMessageBus()
-    changes = FileChangeService(storage, tmp_path)
+    changes = ProjectFileManager(storage, tmp_path)
     await changes.observe("alice", pid)
     tasks.files.write("alice", pid, "keep.txt", b"keep", area="uploads")
     await changes.observe("alice", pid)
-    history = await changes.list(pid)
+    history = await changes.list_changes(pid)
     for task in (first, second):
         await seed_bus(bus, task["session_id"])
     if blocker == "session":
@@ -250,13 +265,13 @@ async def test_busy_project_delete_has_no_partial_removal(storage, tmp_path, blo
         await bus.unlock(MessageBusKeys.session_lock(busy))
     else:
         # A separate service/connection must see the same lifetime lock.
-        async with ProjectService(storage, tmp_path).guard(alice, pid):
+        async with ProjectManager(storage, tmp_path).guard(alice, pid):
             with pytest.raises(Conflict) as error:
                 await projects.delete(alice, pid, bus)
             assert error.value.status_code == 409
     assert (await projects.get(alice, pid))["status_type"] == "active"
     assert tasks.files.read("alice", pid, "uploads", "keep.txt")[0] == b"keep"
-    assert await changes.list(pid) == history
+    assert await changes.list_changes(pid) == history
     for task in (first, second):
         assert await storage.get_session("alice", task["agent_id"], task["session_id"])
         assert (
@@ -280,15 +295,15 @@ async def test_unbound_session_is_rejected_without_creating_project_membership(
 ):
     _, _, alice, _ = await identities(storage)
     tasks = SessionService(storage, tmp_path)
-    source = await ExpertDefinition(storage).build(alice, expert())
-    task = await tasks.create(alice, source["id"], "private")
+    source = await AgentManager(storage).add_definition(alice, expert())
+    task = await tasks.add_session(alice, source["id"], "private")
     sid = task["session_id"]
-    native = await tasks.session(alice, sid)
+    native = await tasks.get_session_record(alice, sid)
     native.state.middle_context["egis_agentkit"].pop("project_id")
     await storage.update_session_state("alice", native.agent_id, sid, native.state)
     assert [p["id"] for p in await tasks.projects.list(alice)] == [task["project_id"]]
     with pytest.raises(NotFound):
-        await tasks.session(alice, sid)
+        await tasks.get_session_record(alice, sid)
 
     async with storage.engine.connect() as conn:
         assert (
@@ -303,17 +318,20 @@ async def test_project_delete_rolls_back_session_and_history_on_directory_failur
     storage, tmp_path, monkeypatch
 ):
     _, _, alice, _ = await identities(storage)
-    source = await ExpertDefinition(storage).build(alice, expert())
+    source = await AgentManager(storage).add_definition(alice, expert())
     tasks = SessionService(storage, tmp_path)
-    task = await tasks.create(alice, source["id"], "private")
+    project = await tasks.projects.create(alice, "Remove")
+    task = await tasks.add_session(
+        alice, source["id"], "private", project_id=project["id"]
+    )
     sid, pid = task["session_id"], task["project_id"]
     bus = InMemoryMessageBus()
     await seed_bus(bus, sid)
-    changes = FileChangeService(storage, tmp_path)
+    changes = ProjectFileManager(storage, tmp_path)
     await changes.observe(alice.user_id, pid)
     tasks.files.write(alice.user_id, pid, "keep.txt", b"keep", area="uploads")
     await changes.observe(alice.user_id, pid)
-    history = await changes.list(pid)
+    history = await changes.list_changes(pid)
 
     def fail_remove(*args):
         raise OSError("directory temporarily unavailable")
@@ -327,10 +345,42 @@ async def test_project_delete_rolls_back_session_and_history_on_directory_failur
         "status_type"
     ] == "deleting"
     assert await storage.get_session(alice.user_id, task["agent_id"], sid)
-    assert await changes.list(pid) == history
+    assert await changes.list_changes(pid) == history
     assert await bus.log_read(MessageBusKeys.session_events(sid))
     assert not await bus.is_locked(MessageBusKeys.session_lock(sid))
     await tasks.projects.delete(alice, pid, bus)
     assert await storage.get_session(alice.user_id, task["agent_id"], sid) is None
-    assert (await changes.list(pid))["items"] == []
+    assert (await changes.list_changes(pid))["items"] == []
     await assert_bus_removed(bus, sid)
+
+
+@pytest.mark.asyncio
+async def test_default_project_cannot_be_deleted_even_after_rename(storage, tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from egis_agentkit.errors import Forbidden
+
+    _, _, alice, _ = await identities(storage)
+    workspaces = SimpleNamespace(release_project=AsyncMock())
+    projects = ProjectManager(storage, tmp_path, workspaces=workspaces)
+    default = await projects.default(alice)
+    source = await AgentManager(storage).add_definition(alice, expert())
+    sessions = SessionService(storage, tmp_path, projects=projects)
+    session = await sessions.add_session(
+        alice, source["id"], "private", project_id=default["id"]
+    )
+    projects.files.write(
+        alice.user_id, default["id"], "keep.txt", b"keep", area="uploads"
+    )
+    await projects.rename(alice, default["id"], "日常工作")
+    with pytest.raises(Forbidden, match="默认项目不能删除"):
+        await projects.delete(alice, default["id"], InMemoryMessageBus())
+    current = await projects.default(alice)
+    assert current["id"] == default["id"] and current["status_type"] == "active"
+    assert (
+        projects.files.read(alice.user_id, default["id"], "uploads", "keep.txt")[0]
+        == b"keep"
+    )
+    assert await sessions.get_session_record(alice, session["session_id"])
+    workspaces.release_project.assert_not_awaited()

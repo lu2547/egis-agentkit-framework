@@ -4,10 +4,12 @@ import pytest
 from sqlalchemy import text
 from test_domain import expert, identities
 
-from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._grant import GrantService
-from egis_agentkit.service.agent._expert_definition import ExpertDefinition
+from egis_agentkit.service.access._permission import PermissionService
+from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.storage.model import Grant
+
+from test_domain import agent_changes
 
 
 @pytest.mark.asyncio
@@ -18,9 +20,9 @@ async def test_access_upgrade_preserves_root_and_rejects_conflicting_versions(st
     )
 
     _, admin, alice, bob = await identities(storage)
-    definitions = ExpertDefinition(storage)
+    definitions = AgentManager(storage)
     value = expert()
-    first = await definitions.build(alice, value)
+    first = await definitions.add_definition(alice, value)
     grant = await GrantService(storage).grant(
         admin,
         Grant(
@@ -33,11 +35,11 @@ async def test_access_upgrade_preserves_root_and_rejects_conflicting_versions(st
             resource_owner_id=alice.user_id,
         ),
     )
-    await definitions.save(alice, value)
+    await definitions.update_definition(alice, (value).id, agent_changes(value))
     async with storage.engine.begin() as conn:
         schema = await conn.scalar(text("SELECT current_schema()"))
         await conn.execute(
-            text("ALTER TABLE ak_agent_definitions DROP COLUMN shared_version")
+            text("ALTER TABLE ak_agent_definition_summary DROP COLUMN shared_version")
         )
         await conn.execute(
             text("ALTER TABLE ak_team_definitions DROP COLUMN shared_version")
@@ -50,12 +52,12 @@ async def test_access_upgrade_preserves_root_and_rejects_conflicting_versions(st
         await conn.execute(text("ALTER TABLE ak_share_reviews DROP COLUMN review_type"))
         await conn.execute(
             text(
-                "ALTER TABLE ak_resource_grants ADD COLUMN resource_version text NOT NULL DEFAULT '1'"
+                "ALTER TABLE ak_resource_access ADD COLUMN resource_version text NOT NULL DEFAULT '1'"
             )
         )
         await conn.execute(
             text("""
-            INSERT INTO ak_resource_grants (
+            INSERT INTO ak_resource_access (
                 id, principal_type, principal_id, resource_type, resource_id,
                 resource_version, resource_view_type, resource_owner_type,
                 resource_owner_id, grant_source_type, origin_key, granted_by, granted_at
@@ -71,7 +73,7 @@ async def test_access_upgrade_preserves_root_and_rejects_conflicting_versions(st
     async with storage.engine.begin() as conn:
         assert await check_access_upgrade(conn, schema) == "inconsistent"
         await conn.execute(
-            text("DELETE FROM ak_resource_grants WHERE id='legacy-conflict'")
+            text("DELETE FROM ak_resource_access WHERE id='legacy-conflict'")
         )
         assert await check_access_upgrade(conn, schema) == "pending"
         assert await upgrade_access_tables(conn, schema) == "upgraded"

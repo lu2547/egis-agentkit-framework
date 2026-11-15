@@ -7,7 +7,7 @@ from egis_agentkit.errors import Forbidden
 from egis_agentkit.extension._demo_report_tool_impl import deploy_demo_report_tools
 from egis_agentkit.service._user import UserService
 from egis_agentkit.service.resource._catalog import ResourceService
-from egis_agentkit.storage._workspace import WorkspaceFiles
+from egis_agentkit.storage.project._files import ProjectFileStorage
 
 
 @pytest.mark.parametrize("kind", ["skill", "mcp"])
@@ -52,7 +52,7 @@ async def test_tool_catalog_distinguishes_platform_and_agent_tools(storage, tmp_
     await users.sync_identity("alice", "小明")
     alice = await users.get("alice")
     resources = ResourceService(storage, tmp_path)
-    deploy_demo_report_tools(resources.tool_registry, WorkspaceFiles(tmp_path))
+    deploy_demo_report_tools(resources.tool_registry, ProjectFileStorage(tmp_path))
     await resources.seed_builtin_tools()
     cards = {row["resource_id"]: row for row in await resources.list(alice, "tool")}
     assert cards["Read"]["is_system_default"]
@@ -61,7 +61,7 @@ async def test_tool_catalog_distinguishes_platform_and_agent_tools(storage, tmp_
     assert not cards["CreateDemoReport"]["is_installed"]
     assert "AgentInvite" not in cards
     with pytest.raises(Forbidden):
-        await resources.installations.install(alice, "tool", "CreateDemoReport", "1.1.0")
+        await resources.install(alice, "tool", "CreateDemoReport")
 
 
 @pytest.mark.asyncio

@@ -18,7 +18,8 @@ from agentscope.app._service._mcp_render import render_mcp
 from agentscope.skill import Skill
 from packaging.version import Version
 
-from egis_agentkit.backend.nacos._settings import (
+from egis_agentkit.client._mcp_config import _verify_mcp_card, mcp_config_checksum
+from egis_agentkit.client.nacos._settings import (
     DEFAULT_SKILL_ARCHIVE_MAX_BYTES,
     SkillArchiveConfig,
 )
@@ -29,20 +30,16 @@ from egis_agentkit.service.access._permission import (
     PermissionService,
     is_system_default_tool,
 )
-from egis_agentkit.service.agent._installations import PersonalInstallations
+from egis_agentkit.service.agent._personal_manager import PersonalManager
 from egis_agentkit.storage.model import (
     Asset,
     ResourceRef,
     SkillActivation,
+    User,
 )
-from egis_agentkit.storage.model._base import publication_label
+from egis_agentkit.storage.model._base import publication_label, resource_available
 
-from ._connector import (
-    AuthorizedMCPClient,
-    LocalMCPRegistry,
-    _verify_mcp_card,
-    mcp_config_checksum,
-)
+from ._connector import AuthorizedMCPClient, LocalMCPRegistry
 from ._connector_auth import MCPAuthorizationService
 from ._skill import (
     LocalSkillRegistry,
@@ -144,8 +141,71 @@ class ResourceService:
             storage, key=credential_key, config=config
         )
         self.tool_registry = FunctionToolRegistry(self)
-        self.installations = PersonalInstallations(self)
+        self.personal = PersonalManager(
+            storage, workspace_root=workspace_root, config=config
+        )
         self.tool_registry.bind_default_configuration()
+
+    async def selected_for_personal(
+        self, user, resource_type, rows=None, *, enabled_only=False, resource_ids=None
+    ):
+        """将个人资源开关与当前独立授权结合，只在使用时解析资源版本。"""
+        settings = await self.personal.list_resources(user, resource_type)
+        identifiers = {
+            identifier
+            for identifier, row in settings.items()
+            if (not enabled_only or row["is_enabled"])
+            and (resource_ids is None or identifier in resource_ids)
+        }
+        if not identifiers:
+            return {}
+        if rows is None:
+            rows = await self._versions(resource_type, resource_ids=identifiers)
+        visible = await self._latest_visible_assets(
+            user,
+            resource_type,
+            (row for row in rows if row["resource_id"] in identifiers),
+        )
+        return {
+            identifier: asset
+            for identifier, asset in visible.items()
+            if await self._usable(user, asset)
+        }
+
+    async def _personal_asset(self, user, kind, identifier):
+        """安装入口按资源身份定位当前可独立使用的版本。"""
+        if kind not in ("skill", "mcp"):
+            raise Forbidden("工具由平台默认配置或专家绑定提供")
+        versions = await self._versions(kind, resource_ids=[identifier])
+        selected = await self._latest_visible_assets(user, kind, versions)
+        asset = selected.get(identifier)
+        if asset is None:
+            raise Forbidden("未获得此资源的独立使用权限")
+        await self._require(user, asset)
+        return asset
+
+    async def install(self, user, kind, identifier):
+        """安装由资源管理协调，只保存个人启用开关，不复制原生安装记录。"""
+        asset = await self._personal_asset(user, kind, identifier)
+        if kind == "mcp":
+            _verify_mcp_card(asset, self.mcp_hub.card(asset))
+        await self.personal.add_resource(user, kind, identifier)
+        return await self._view(user, asset)
+
+    async def update_installation(self, user, kind, identifier, enabled):
+        """调整已有个人选择，组授权及其他用户的开关保持独立。"""
+        asset = await self._personal_asset(user, kind, identifier)
+        existing = await self.personal.list_resources(user, kind)
+        if identifier not in existing:
+            raise NotFound("资源尚未安装")
+        await self.personal.update_resource_enabled(user, kind, identifier, enabled)
+        return await self._view(user, asset)
+
+    async def remove_installation(
+        self, user: User, kind: str, identifier: str
+    ) -> None:
+        """取消个人选用；即使资源授权已经撤销，也允许清理自己的关联。"""
+        await self.personal.remove_resource(user, kind, identifier)
 
     async def seed_builtin_tools(self):
         await self.tool_registry.seed()
@@ -224,7 +284,7 @@ class ResourceService:
         require_admin(user)
         self._kind(kind)
         rows = await self._versions(kind)
-        agents, _ = await self.storage.definitions.read_catalog("agent")
+        agents, _ = await self.storage.definitions.list_definitions_and_reviews("agent")
         grants = [] if kind == "tool" else await self.grants.list_grants(user)
         return [
             await self._admin_view(
@@ -233,7 +293,7 @@ class ResourceService:
                 bindings=[
                     {"id": agent["id"], "name": agent["agent_display_name"]}
                     for agent in agents
-                    if agent["is_enabled"]
+                    if resource_available(agent)
                     and any(
                         (
                             ref["resource_type"],
@@ -313,16 +373,16 @@ class ResourceService:
             raise ValueError("An exact resource version is required")
 
     @staticmethod
-    def _native_id(user, kind, rid, version):
+    def _runtime_id(user, kind, rid, version):
         return hashlib.sha256(
             f"{user.user_id}\0{kind}\0{rid}\0{version}".encode()
         ).hexdigest()
 
-    def _native_name(self, user, kind, rid, version):
+    def _runtime_name(self, user, kind, rid, version):
         return (
             re.sub("[^A-Za-z0-9_-]", "_", rid)[:40]
             + "_"
-            + self._native_id(user, kind, rid, version)[:12]
+            + self._runtime_id(user, kind, rid, version)[:12]
         )
 
     async def _asset(self, kind, rid, version, *, assets=None):
@@ -352,10 +412,15 @@ class ResourceService:
         current = scope.definition
         root = scope.root_definition
         pinned = (
-            root if root["definition_type"] == "agent"
+            root
+            if root["definition_type"] == "agent"
             else scope.member_definitions.get(current["id"])
         )
-        identity = (asset["resource_type"], asset["resource_id"], asset["resource_version"])
+        identity = (
+            asset["resource_type"],
+            asset["resource_id"],
+            asset["resource_version"],
+        )
         return pinned is not None and all(
             any(
                 (ref["resource_type"], ref["resource_id"], ref["resource_version"])
@@ -402,7 +467,7 @@ class ResourceService:
                     user, scope.root_definition, allow_pinned=True
                 )
                 return True
-            installed = await self.installations.assets(
+            installed = await self.selected_for_personal(
                 user,
                 asset["resource_type"],
                 enabled_only=True,
@@ -476,7 +541,12 @@ class ResourceService:
             raise Forbidden("此资源版本尚未共享")
         system_default = self.tool_registry.is_default_tool(asset)
         agent_tool = self.tool_registry.is_agent_tool(asset)
-        installation = await self.installations.selection(user, asset)
+        installation = (
+            (await self.personal.list_resources(user, asset["resource_type"])).get(
+                asset["resource_id"]
+            )
+            if asset["resource_type"] in ("skill", "mcp") else None
+        )
         payload = {
             k: v
             for k, v in asset["payload"].items()
@@ -540,7 +610,7 @@ class ResourceService:
             "is_installed": system_default or installation is not None,
             "is_enabled": asset["is_enabled"]
             if asset["resource_type"] == "tool"
-            else bool(installation and installation.enabled),
+            else bool(installation and installation["is_enabled"]),
             "is_skill_market_visible": bool(
                 payload.get("is_skill_market_visible", False)
             )
@@ -849,7 +919,7 @@ class ResourceService:
             await self._require(user, asset, authorization_scope)
             result.append(
                 Skill(
-                    name=self._native_name(
+                    name=self._runtime_name(
                         user, "skill", ref.resource_id, ref.resource_version
                     ),
                     description=asset["payload"].get("description", ""),
@@ -917,7 +987,7 @@ class ResourceService:
         definition = getattr(scope, "definition", None) if scope is not None else None
         if definition and definition.get("agent_type") != "personal":
             identifier = segment(definition.get("id"))
-            number = definition.get("config_version")
+            number = definition.get("version")
             if type(number) is not int or number < 1:
                 raise Forbidden("Skill cache definition version is invalid")
             version = f"config-{number}"
@@ -1004,7 +1074,7 @@ class ResourceService:
                     if staging.exists():
                         shutil.rmtree(staging)
             return Skill(
-                name=self._native_name(user, "skill", resource_id, version),
+                name=self._runtime_name(user, "skill", resource_id, version),
                 description=asset["payload"].get("description", ""),
                 dir=str(destination),
                 markdown=files["SKILL.md"].decode("utf-8"),
@@ -1040,7 +1110,7 @@ class ResourceService:
         """Restore only the exact server-pinned content, never a newer version."""
         pin = SkillActivation.model_validate(pin).model_dump()
         rid, version = pin["resource_id"], pin["resource_version"]
-        if pin["skill_name"] != self._native_name(user, "skill", rid, version):
+        if pin["skill_name"] != self._runtime_name(user, "skill", rid, version):
             raise Forbidden("已激活技能名称无效")
         asset = await self._asset("skill", rid, version)
         await self._require(user, asset, authorization_scope)
@@ -1069,7 +1139,7 @@ class ResourceService:
             return skill
         await asyncio.to_thread(self._validate_skill_cache, destination, checksum)
         return Skill(
-            name=self._native_name(user, "skill", rid, version),
+            name=self._runtime_name(user, "skill", rid, version),
             description=asset["payload"].get("description", ""),
             dir=str(destination),
             markdown=(destination / "SKILL.md").read_text("utf-8"),
@@ -1102,22 +1172,23 @@ class ResourceService:
         card = self.mcp_hub.card(asset)
         _verify_mcp_card(asset, card)
         client = render_mcp(
-            card, {}, name=self._native_name(user, "mcp", asset["resource_id"], version)
+            card,
+            {},
+            name=self._runtime_name(user, "mcp", asset["resource_id"], version),
         )
         headers = await self.mcp_authorization.headers(user, asset)
         client.mcp_config.headers = headers or None
         return AuthorizedMCPClient(**client.model_dump())
 
     async def authorize_mcp_tool(self, user, scope, tool):
-        from agentscope.tool import MCPTool
-
-        if not isinstance(tool, MCPTool):
+        # 原生网关工具与本地 MCPTool 使用同一协议，二者并非同一具体类型。
+        if not getattr(tool, "is_mcp", False):
             return False
         client = getattr(tool, "_egis_mcp_client", None)
         if client is None or client.name != tool.mcp_name:
             raise Forbidden("MCP 工具没有受管的连接来源")
         for row in await self._versions("mcp"):
-            if client.name != self._native_name(
+            if client.name != self._runtime_name(
                 user, "mcp", row["resource_id"], row["resource_version"]
             ):
                 continue

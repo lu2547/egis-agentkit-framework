@@ -200,8 +200,8 @@ async def test_import_http_accepts_upload_metadata_and_routes_owner_only(
     from types import SimpleNamespace
 
     import httpx
-    from egis_agentkit_app.manager_router import router
-    from egis_agentkit_app.security import current_user
+    from egis_agentkit_app.bootstrap._router import manager_router as router
+    from egis_agentkit_app.controller.base import current_user
     from fastapi import FastAPI
 
     from egis_agentkit.service.resource._skill_import import SkillImportService

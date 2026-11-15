@@ -3,21 +3,25 @@
 from ._access import Grant, ShareReview, ShareTarget
 from ._base import Model, new_id, utcnow
 from ._definition import (
-    AgentPayload,
     AgentType,
-    Definition,
     DefinitionRef,
+    TeamDefinitionRecord,
     TeamPayload,
     ViewType,
 )
 from ._resource import Asset, ResourceRef, SkillActivation, asset_snapshot_matches
 from ._user import Group, User
+from .agent._definition import AgentDefinition
+from .agent._payload import AgentPayload
+from .agent._update import AgentUpdate
 
 __all__ = [
     "AgentType",
     "AgentPayload",
     "Asset",
-    "Definition",
+    "AgentDefinition",
+    "AgentUpdate",
+    "TeamDefinitionRecord",
     "DefinitionRef",
     "Grant",
     "Group",

@@ -3,12 +3,12 @@ from types import SimpleNamespace
 import pytest
 from test_domain import COMPANY, expert, identities
 
-from egis_agentkit.errors import Forbidden
-from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._grant import GrantService
-from egis_agentkit.service.resource._catalog import ResourceService
+from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._share import ShareService
-from egis_agentkit.service.agent._expert_definition import ExpertDefinition
+from egis_agentkit.errors import Forbidden
+from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.storage import tables as t
 from egis_agentkit.storage.model import Asset
 
@@ -55,7 +55,7 @@ async def test_new_binding_rejects_unreviewed_version(storage, kind):
     value = expert()
     value.payload["bindings"] = [binding(kind, "2.0.0")]
     with pytest.raises(Forbidden):
-        await ExpertDefinition(storage).build(alice, value)
+        await AgentManager(storage).add_definition(alice, value)
 
 
 @pytest.mark.asyncio
@@ -64,13 +64,13 @@ async def test_execution_rejects_stored_unreviewed_binding(storage, kind):
     _, _, alice, _, _ = await prepare(storage, kind)
     value = expert()
     value.payload["bindings"] = [binding(kind, "1.0.0")]
-    row = await ExpertDefinition(storage).build(alice, value)
+    row = await AgentManager(storage).add_definition(alice, value)
     value.payload["bindings"] = [binding(kind, "2.0.0")]
     async with storage.definition_write() as write:
         saved = await write.definitions.update_definition(
             row["id"], value.model_dump(mode="json"), actor=alice.user_id
         )
-    snapshot = await storage.definitions.read_view(
+    snapshot = await storage.definitions.get_definition_view(
         saved["id"], "private", version=saved["resource_version"]
     )
     with pytest.raises(Forbidden):
@@ -85,7 +85,7 @@ async def test_approved_parent_preserves_old_asset_after_new_share(
     users, admin, alice, bob, shares = await prepare(storage, kind)
     value = expert()
     value.payload["bindings"] = [binding(kind, "1.0.0")]
-    row = await ExpertDefinition(storage).build(alice, value)
+    row = await AgentManager(storage).add_definition(alice, value)
     parent = await shares.submit(
         alice, "agent", row["id"], target=COMPANY
     )
@@ -99,7 +99,7 @@ async def test_approved_parent_preserves_old_asset_after_new_share(
     charlie = await users.get(charlie.user_id)
     permissions = PermissionService(storage)
     decision = await permissions.require(charlie, "agent", row["id"], "shared")
-    snapshot = await storage.definitions.read_view(
+    snapshot = await storage.definitions.get_definition_view(
         row["id"],
         "shared",
         version=decision.resource_version,
@@ -116,7 +116,7 @@ async def test_approved_parent_preserves_old_asset_after_new_share(
         binding={"agent_definition_id": snapshot["id"]},
     )
     assert await resources._usable(charlie, asset, scope)
-    assert await storage.definitions.read_view(row["id"], "private")
+    assert await storage.definitions.get_definition_view(row["id"], "private")
 
 
 @pytest.mark.asyncio
@@ -128,4 +128,4 @@ async def test_revoked_shared_asset_version_cannot_be_bound(storage):
     candidate = expert()
     candidate.payload["bindings"] = [binding("skill", "1.0.0")]
     with pytest.raises(Forbidden):
-        await ExpertDefinition(storage).build(alice, candidate)
+        await AgentManager(storage).add_definition(alice, candidate)

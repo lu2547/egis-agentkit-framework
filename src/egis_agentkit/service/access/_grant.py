@@ -16,7 +16,7 @@ from egis_agentkit.service.access._permission import (
     MANAGED_ASSET_KINDS,
 )
 from egis_agentkit.storage.model import Grant, ShareTarget, User, new_id
-from egis_agentkit.storage.model._base import publication_label
+from egis_agentkit.storage.model._base import publication_label, resource_available
 
 
 class GrantService:
@@ -44,7 +44,7 @@ class GrantService:
         require_admin(admin)
         resources = []
         for kind in DEFINITION_KINDS:
-            rows = await self.storage.definitions.grantable_versions(
+            rows = await self.storage.definitions.list_grantable_versions(
                 kind, excluded_agent_types=INTERNAL_AGENT_TYPES
             )
             for row in rows:
@@ -85,7 +85,11 @@ class GrantService:
 
     @staticmethod
     def _grantable_row(kind, identifier, row, name):
-        revision = row.get("config_version") or row.get("publication_revision")
+        revision = (
+            row.get("version")
+            or row.get("config_version")
+            or row.get("publication_revision")
+        )
         return {
             "resource_type": kind,
             "resource_id": identifier,
@@ -153,7 +157,7 @@ class GrantService:
     def _validate_grant_resource(data, resource):
         if resource is None:
             raise NotFound()
-        if not resource["is_enabled"]:
+        if not resource_available(resource):
             raise Conflict("源资源已经停用")
         if (resource["owner_type"], resource["owner_id"]) != (
             data.resource_owner_type,
@@ -168,7 +172,7 @@ class GrantService:
             raise Forbidden("该资源不能单独授权")
 
     async def _grant_dependencies(self, root, definition, *, actor, write):
-        from egis_agentkit.service.team._definition import team_member_definitions
+        from egis_agentkit.service.team._members import team_member_definitions
 
         team_id = definition["id"] if definition["definition_type"] == "team" else None
         members = (

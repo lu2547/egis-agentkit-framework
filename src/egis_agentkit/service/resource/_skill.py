@@ -11,7 +11,7 @@ from pathlib import PurePosixPath
 
 import yaml
 
-from egis_agentkit.backend.nacos._settings import (
+from egis_agentkit.client.nacos._settings import (
     DEFAULT_SKILL_ARCHIVE_MAX_BYTES,
     SkillArchiveConfig,
 )

@@ -43,7 +43,7 @@ from agentscope.tool._builtin._skill import SkillViewer
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
-from egis_agentkit.backend.nacos import NacosConfigProvider
+from egis_agentkit.client.nacos import NacosConfigProvider
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
 from egis_agentkit.service.access._permission import is_system_default_tool
 from egis_agentkit.storage.model import (

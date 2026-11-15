@@ -2,12 +2,12 @@
 
 from agentscope.app.storage import TeamData, TeamMember, TeamRecord
 
-from egis_agentkit.backend.nacos._settings import TeamRosterConfig
+from egis_agentkit.client.nacos._settings import TeamRosterConfig
+from egis_agentkit.core.agent._orchestrator_definition import OrchestratorDefinition
 from egis_agentkit.errors import Conflict, Forbidden, InvalidRequest, NotFound
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._permission import PermissionService
-from egis_agentkit.service.agent._orchestrator_definition import OrchestratorDefinition
-from egis_agentkit.storage.model import Definition, new_id
+from egis_agentkit.storage.model import TeamDefinitionRecord, new_id
 from egis_agentkit.storage.model._definition import EXPERT_TYPES
 
 
@@ -50,7 +50,7 @@ class TeamDefinition:
         access = await self.permissions.definition_access(
             user, source, view, version=version
         )
-        value = await self.repository.read_view(
+        value = await self.repository.get_definition_view(
             source["id"],
             access.view,
             version=access.decision.resource_version or version,
@@ -92,7 +92,7 @@ class TeamDefinition:
                     "agent_name",
                     "agent_display_name",
                     "payload",
-                    "config_version",
+                    "owner_version",
                 )
             }
         return result
@@ -106,7 +106,7 @@ class TeamDefinition:
 
     async def list(self, user) -> list[dict]:
         """列出当前用户可见的专家团及共享审核状态。"""
-        rows, states = await self.repository.read_catalog("team")
+        rows, states = await self.repository.list_definitions_and_reviews("team")
         result = []
         for row in rows:
             if not row["is_enabled"]:
@@ -122,19 +122,26 @@ class TeamDefinition:
     async def delete(self, user, identifier: str) -> None:
         """在同一事务中停用专家团及其主理人。"""
         async with self.storage.definition_write() as write:
-            row = await write.definitions.locked_definition(identifier)
+            row = await write.definitions.get_locked_definition(identifier)
             if row is None or row["definition_type"] != "team":
                 raise NotFound()
             self.permissions.require_definition_write(
                 user, owner_type=row["owner_type"], owner_id=row["owner_id"]
             )
-            await write.definitions.disable_definition(identifier, actor=user.user_id)
+            await write.definitions.delete_definition(identifier, actor=user.user_id)
             await GrantService(write).retire_definition_grants(
                 identifier, actor=user.user_id, previous=row
             )
             leader_id = row["payload"]["orchestrator"]["definition_id"]
-            await OrchestratorDefinition(write, self.permissions.policies).disable(
-                user, leader_id
+            leader = await write.agents.get_definition_for_update(leader_id)
+            if leader["agent_type"] != "orchestrator":
+                raise Forbidden("专家团主理人类型不匹配")
+            self.permissions.require_definition_write(
+                user, owner_type=leader["owner_type"], owner_id=leader["owner_id"]
+            )
+            await write.agents.delete_definition(leader_id, actor=user.user_id)
+            await GrantService(write).retire_definition_grants(
+                leader_id, actor=user.user_id, previous=leader
             )
 
     async def save(self, user, data: dict) -> dict:
@@ -156,7 +163,7 @@ class TeamDefinition:
         identifier = data.get("id") or new_id()
         async with self.storage.definition_write() as write:
             permissions = PermissionService(write, policies)
-            previous = await write.definitions.locked_definition(identifier)
+            previous = await write.definitions.get_locked_definition(identifier)
             if previous and previous["definition_type"] != "team":
                 raise Forbidden("该 ID 已由 Agent 定义使用")
             if previous and (previous["owner_type"], previous["owner_id"]) != (
@@ -167,30 +174,10 @@ class TeamDefinition:
             expected = previous["config_version"] if previous else 1
             if data.get("config_version", 1) != expected:
                 raise Conflict("专家团配置已变更，请刷新后重试")
-            orch_id = (
-                previous["payload"]["orchestrator"]["definition_id"]
-                if previous
-                else new_id()
-            )
-            orch_version = (
-                (await write.definitions.get_definition(orch_id))["config_version"]
-                if previous
-                else 1
-            )
             orch = data["orchestrator_config"]
-            leader = Definition(
-                id=orch_id,
-                owner_type=owner_type,
-                owner_id=owner_id,
-                agent_type="orchestrator",
-                agent_name=orch["agent_name"],
-                agent_display_name=orch["agent_display_name"],
-                config_version=orch_version,
-                payload=orch.get("payload", {}),
-            )
             # 只解析一次成员配置，将实际获准使用的版本保存到专家团。
             members = []
-            names, seen = {leader.agent_name}, set()
+            names, seen = {orch["agent_name"]}, set()
             for ref in data["members"]:
                 if ref["definition_id"] in seen:
                     raise Forbidden("不能重复添加同一专家")
@@ -208,7 +195,7 @@ class TeamDefinition:
                     child_options["version"] = decision.resource_version or ref.get(
                         "resource_version"
                     )
-                child = await write.definitions.read_view(
+                child = await write.definitions.get_definition_view(
                     ref["definition_id"],
                     ref["resource_view_type"],
                     **child_options,
@@ -228,18 +215,21 @@ class TeamDefinition:
                         "resource_version": child["resource_version"],
                     }
                 )
-            # 主理人先写入同一事务，再把确切版本绑定到专家团。
-            orchestrator = OrchestratorDefinition(write, policies)
-            if previous:
-                saved_leader = await orchestrator.save(user, leader)
-            else:
-                saved_leader = await orchestrator.build(user, leader)
-            team = Definition(
+            # 主理人维护自己的配置和版本，Team 只接收固定引用。
+            saved_leader = await self._save_orchestrator(
+                write,
+                user,
+                policies=policies,
+                owner_type=owner_type,
+                owner_id=owner_id,
+                config=orch,
+                previous_ref=previous["payload"]["orchestrator"] if previous else None,
+            )
+            team = TeamDefinitionRecord(
                 id=identifier,
                 definition_type="team",
                 owner_type=owner_type,
                 owner_id=owner_id,
-                agent_type=None,
                 team_name=data["team_name"],
                 team_display_name=data["team_display_name"],
                 config_version=data.get("config_version", 1),
@@ -255,7 +245,7 @@ class TeamDefinition:
                         }.items()
                     },
                     "orchestrator": {
-                        "definition_id": orch_id,
+                        "definition_id": saved_leader["id"],
                         "resource_version": saved_leader["resource_version"],
                         "resource_view_type": "system"
                         if owner_type == "system"
@@ -272,7 +262,7 @@ class TeamDefinition:
                     actor=user.user_id,
                 )
             else:
-                result = await write.definitions.insert_definition(
+                result = await write.definitions.add_definition(
                     values,
                     actor=user.user_id,
                 )
@@ -281,18 +271,32 @@ class TeamDefinition:
             )
             return result
 
-
-async def team_member_definitions(storage, root: dict) -> dict[str, dict]:
-    """读取 Team 定义固定的主理人和成员，返回以定义 ID 为键的记录。"""
-    if root["definition_type"] == "agent":
-        return {root["id"]: root}
-    payload = root["payload"]
-    return {
-        ref["definition_id"]: await storage.definitions.read_view(
-            ref["definition_id"],
-            ref["resource_view_type"],
-            version=ref["resource_version"],
-            dependency=True,
+    async def _save_orchestrator(
+        self, write, user, *, policies, owner_type, owner_id, config, previous_ref=None
+    ):
+        """组合主理人核心能力与团队事务，保持团队和主理人原子更新。"""
+        # 1. 读取现有主理人，Core 根据团队配置构建同一身份的新配置。
+        previous = (
+            await write.agents.get_definition_for_update(previous_ref["definition_id"])
+            if previous_ref
+            else None
         )
-        for ref in (payload["orchestrator"], *payload["members"])
-    }
+        core = OrchestratorDefinition()
+        data = core.build_from_team(
+            owner_type=owner_type, owner_id=owner_id, orchestrator_config=config, previous_definition=previous
+        )
+        permissions = PermissionService(write, policies)
+        permissions.require_definition_write(
+            user, owner_type=data.owner_type, owner_id=data.owner_id
+        )
+        await permissions.require_agent_bindings(user, data)
+        # 2. 使用团队已借用的存储事务，统一提交版本和授权。
+        values = data.model_dump(mode="json")
+        if previous is None:
+            saved = await write.agents.add_definition(values, actor=user.user_id)
+        else:
+            saved = await write.agents.update_definition(
+                data.id, values, actor=user.user_id
+            )
+        await GrantService(write).record_definition_owner(saved, actor=user.user_id)
+        return saved

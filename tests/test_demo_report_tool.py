@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
-from egis_agentkit_app.provision import seed_demo
+from egis_agentkit_app.bootstrap._demo import seed_demo
 from test_app_http import app_snapshot
 from test_domain import expert, identities
 
@@ -10,13 +10,13 @@ from egis_agentkit.extension._demo_report_tool_impl import (
     CreateDemoReport,
     deploy_demo_report_tools,
 )
-from egis_agentkit.service.agent._expert_definition import ExpertDefinition
+from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.resource._catalog import ResourceService
-from egis_agentkit.storage._workspace import WorkspaceFiles
+from egis_agentkit.storage.project._files import ProjectFileStorage
 
 
 async def test_deployed_report_tool_writes_project_artifact(tmp_path):
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     scope = SimpleNamespace(user_id="alice", project_id="finance")
     tool = CreateDemoReport(scope, files=files, version="1.1.0")
     result = await tool.call(title="财务报告", findings=["差旅支出 250 元"])
@@ -32,7 +32,7 @@ async def test_deployed_tool_requires_current_expert_and_exact_binding(
     _, admin, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
     registry = resources.tool_registry
-    deploy_demo_report_tools(registry, WorkspaceFiles(tmp_path))
+    deploy_demo_report_tools(registry, ProjectFileStorage(tmp_path))
     await resources.seed_builtin_tools()
     identity = "CreateDemoReport", "1.1.0"
     binding = {
@@ -43,8 +43,8 @@ async def test_deployed_tool_requires_current_expert_and_exact_binding(
     }
     value = expert()
     value.payload["bindings"] = [binding]
-    definition = await ExpertDefinition(storage).build(alice, value)
-    graph = await storage.definitions.read_view(
+    definition = await AgentManager(storage).add_definition(alice, value)
+    graph = await storage.definitions.get_definition_view(
         definition["id"], "private", version=definition["resource_version"]
     )
     scope = SimpleNamespace(
@@ -76,7 +76,7 @@ async def test_deployed_tool_requires_current_expert_and_exact_binding(
 
 async def test_demo_seed_uses_local_catalog_and_deployed_tool(storage, tmp_path):
     resources = ResourceService(storage, tmp_path)
-    deploy_demo_report_tools(resources.tool_registry, WorkspaceFiles(tmp_path))
+    deploy_demo_report_tools(resources.tool_registry, ProjectFileStorage(tmp_path))
     await resources.seed_builtin_tools()
     provider = SimpleNamespace(snapshot=app_snapshot(tmp_path))
     await seed_demo(storage, provider, resources)
@@ -86,7 +86,8 @@ async def test_demo_seed_uses_local_catalog_and_deployed_tool(storage, tmp_path)
     assert skill["payload"]["original_markdown"]
     connector = await storage.assets.get("mcp", "egis-demo-tools", "1.0.0")
     assert connector["payload"]["config"]["transport"] == "streamable_http"
-    experts = await storage.definitions.list_enabled_experts_after("", limit=10)
+    rows, _ = await storage.definitions.list_definitions_and_reviews("agent")
+    experts = [row for row in rows if row["agent_type"] in {"expert", "remote"}]
     assert len(experts) == 6
     assert all(
         any(

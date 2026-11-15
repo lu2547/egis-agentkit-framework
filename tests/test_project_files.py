@@ -1,12 +1,12 @@
 import pytest
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.service.workspace._changes import FileChangeService
-from egis_agentkit.storage._workspace import WorkspaceFiles
+from egis_agentkit.service.project._file_manager import ProjectFileManager
+from egis_agentkit.storage.project._files import ProjectFileStorage
 
 
 def test_project_layout_keeps_uploads_flat_and_reserved_areas_separate(tmp_path):
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     root = tmp_path / "user/alice/projects/project"
     assert files.project_root("alice", "project") == root
     upload = files.write("alice", "project", "input.pdf", b"input", area="uploads")
@@ -24,7 +24,7 @@ def test_project_layout_keeps_uploads_flat_and_reserved_areas_separate(tmp_path)
         item["path"]
         for item in files.list("alice", "project", "uploads", recursive=True)
     ] == ["input.pdf"]
-    assert set(FileChangeService(None, tmp_path).scan("alice", "project")) == {
+    assert set(ProjectFileManager(None, tmp_path).scan("alice", "project")) == {
         ("uploads", "input.pdf"),
         ("work", "scratch.py"),
         ("artifacts", "report.pdf"),
@@ -35,7 +35,7 @@ def test_project_layout_keeps_uploads_flat_and_reserved_areas_separate(tmp_path)
     "path", [".work", ".work/secret.txt", "artifacts", "artifacts/report.txt", ".WORK/secret.txt", "Artifacts/report.txt"]
 )
 def test_upload_area_rejects_reserved_paths_for_all_access(tmp_path, path):
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     files.write("alice", "project", "secret.txt", b"work")
     files.write("alice", "project", "report.txt", b"artifact", area="artifacts")
     operations = [
@@ -53,7 +53,7 @@ def test_upload_area_rejects_reserved_paths_for_all_access(tmp_path, path):
 
 
 def test_project_removal_retains_other_projects_and_does_not_follow_links(tmp_path):
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     files.write("alice", "first", "input.txt", b"input", area="uploads")
     files.write("alice", "second", "keep.txt", b"keep")
     outside = tmp_path / "outside"
@@ -70,7 +70,7 @@ def test_project_removal_retains_other_projects_and_does_not_follow_links(tmp_pa
 
 
 def test_delivery_discovery_excludes_project_inputs_but_keeps_work_outputs(tmp_path):
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     files.write("alice", "project", "input.md", b"input", area="uploads")
     files.write("alice", "project", "copy.md", b"input")
     files.write("alice", "project", "report.md", b"report")
@@ -86,25 +86,27 @@ async def test_native_workspace_uses_project_scope_for_shared_sessions(tmp_path)
     from types import SimpleNamespace
 
     from egis_agentkit.extension._session_lock_override import execution_scope
-    from egis_agentkit.extension._workspace_manager_impl import (
-        EgisLocalWorkspaceManager,
+    from egis_agentkit.service.workspace._local_manager import (
+        LocalWorkspaceManager,
     )
 
-    manager = EgisLocalWorkspaceManager(tmp_path)
+    manager = LocalWorkspaceManager(tmp_path)
+    manager.files.initialize_project("alice", "project")
     scope = execution_scope.set(
         SimpleNamespace(user_id="alice", project_id="project", session_id="first")
     )
     try:
         first = await manager.get_workspace(
-            "alice", "agent", "first", workspace_id="project"
+            "alice", "agent", "first", project_id="project"
         )
         execution_scope.set(
             SimpleNamespace(user_id="alice", project_id="project", session_id="second")
         )
         second = await manager.get_workspace(
-            "alice", "agent", "second", workspace_id="project"
+            "alice", "agent", "second", project_id="project"
         )
-        assert first is second
+        assert first is not second
+        assert first.workspace_id == second.workspace_id
         assert first.current_project_id() == "project"
         bash = next(tool for tool in await second.list_tools() if tool.name == "Bash")
         files_root = manager.files.project_root("alice", "project") / ".work"
@@ -112,8 +114,7 @@ async def test_native_workspace_uses_project_scope_for_shared_sessions(tmp_path)
         chunks = [chunk async for chunk in bash.call("pwd")]
         assert str(files_root) in str(chunks)
         instructions = await second.get_instructions()
-        assert str(manager.files.project_root("alice", "project")) in instructions
-        assert str(files_root) in instructions
+        assert str(manager.files.user_root("alice")) in instructions
     finally:
         execution_scope.reset(scope)
         await manager.close_all()
@@ -135,19 +136,19 @@ async def test_project_history_records_each_physical_file_once(storage, tmp_path
                 updated_by="alice",
             )
         )
-    first = FileChangeService(storage, tmp_path)
-    second = FileChangeService(storage, tmp_path)
+    first = ProjectFileManager(storage, tmp_path)
+    second = ProjectFileManager(storage, tmp_path)
     await first.observe("alice", "project")
     for area in ("uploads", "work", "artifacts"):
         first.files.write("alice", "project", "file.txt", area.encode(), area=area)
     await second.observe("alice", "project")
-    changes = (await first.list("project"))["items"]
+    changes = (await first.list_changes("project"))["items"]
     assert {(item["area"], item["path"], item["change_type"]) for item in changes} == {
         (area, "file.txt", "created") for area in ("uploads", "work", "artifacts")
     }
     assert len(changes) == 3
     await first.observe("alice", "project")
-    assert (await second.list("project"))["items"] == changes
+    assert (await second.list_changes("project"))["items"] == changes
 
 
 @pytest.mark.asyncio
@@ -159,7 +160,7 @@ async def test_late_observation_skips_deleted_and_deleting_projects(
     from egis_agentkit.errors import Conflict
     from egis_agentkit.storage import tables as t
 
-    service = FileChangeService(storage, tmp_path)
+    service = ProjectFileManager(storage, tmp_path)
     async with storage.engine.begin() as conn:
         await conn.execute(
             insert(t.projects).values(

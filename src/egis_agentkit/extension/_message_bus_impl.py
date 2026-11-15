@@ -10,7 +10,7 @@ from weakref import WeakKeyDictionary
 
 from agentscope.app.message_bus import InMemoryMessageBus, MessageBus, MessageBusKeys
 
-from egis_agentkit.backend.nacos._settings import KafkaConfig
+from egis_agentkit.client.nacos._settings import KafkaConfig
 from egis_agentkit.storage._message_bus import PostgresPrimitives
 
 logger = logging.getLogger(__name__)
@@ -126,7 +126,7 @@ class EgisMessageBus(MessageBus):
     async def ensure_topics(self, *, partitions=None, replication_factor=None):
         """Explicitly provision topics. Production may provision them externally."""
         if self.delegate is None:
-            from egis_agentkit.backend._kafka import KafkaTransport
+            from egis_agentkit.client._kafka import KafkaTransport
 
             topics = self._kafka_config.topics
             await KafkaTransport.ensure_topics(
@@ -145,7 +145,7 @@ class EgisMessageBus(MessageBus):
         if self.delegate is not None:
             await self.delegate.__aenter__()
         elif self._transport is None:
-            from egis_agentkit.backend._kafka import KafkaTransport
+            from egis_agentkit.client._kafka import KafkaTransport
 
             transport = KafkaTransport(self._pg, **self._kafka_args)
             try:
@@ -223,6 +223,18 @@ class EgisMessageBus(MessageBus):
         await self._primitives.queue_delete(key)
 
     async def log_append(self, key, payload, *, ttl_secs=None, max_len=None):
+        if key.startswith(MessageBusKeys.session_events("")):
+            # 回复落库前必须保留完整事件，按条数裁剪会丢掉 REPLY_START。
+            # 下一条回复开始时，只清理已被原生消息检查点覆盖的前缀。
+            if payload.get("type") == "REPLY_START":
+                session_id = key[len(MessageBusKeys.session_events("")) :]
+                checkpoint = await self.registry_get(
+                    MessageBusKeys.session_event_checkpoint(session_id),
+                    MessageBusKeys.SESSION_EVENT_CURSOR_FIELD,
+                )
+                if checkpoint is not None:
+                    await self._primitives.log_trim(key, before_id=checkpoint)
+            max_len = None
         return await self._primitives.log_append(
             key, payload, ttl_secs=ttl_secs, max_len=max_len
         )

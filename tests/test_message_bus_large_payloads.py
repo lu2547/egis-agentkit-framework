@@ -16,8 +16,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import StatementError
 from test_message_bus import pg_engine as pg_engine
 
+from egis_agentkit.client._kafka import KafkaTransport
 from egis_agentkit.extension._message_bus_impl import EgisMessageBus
-from egis_agentkit.backend._kafka import KafkaTransport
 
 
 class LimitedBroker:
@@ -293,7 +293,7 @@ async def test_payload_storage_error_does_not_expose_sql_parameters(
 
 
 async def test_kafka_uses_configured_cluster_and_broadcast_byte_limit():
-    from egis_agentkit.backend.nacos._settings import KafkaConfig
+    from egis_agentkit.client.nacos._settings import KafkaConfig
 
     settings = KafkaConfig.model_validate(
         {

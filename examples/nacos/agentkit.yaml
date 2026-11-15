@@ -6,7 +6,8 @@ agentkit:
     catalog:
       defaultPageSize: 50
       maxPageSize: 100
-      candidateBatchSize: 50
+      maxQueryLength: 500
+      maxCursorLength: 2048
     personal:
       documents:
         templates:
@@ -20,6 +21,7 @@ agentkit:
     remote:
       request:
         maxBytes: 1048576
+        maxProgressCharacters: 2000
       callback:
         publicBaseUrl: null
         publicBaseUrlEnv: null
@@ -74,6 +76,14 @@ agentkit:
       defaultName: 新对话
       maxLength: 80
       createMaxLength: 200
+    feedback:
+      defaultPageSize: 50
+      maxPageSize: 100
+      maxCommentLength: 4000
+      maxSnapshotChars: 20000
+    branch:
+      maxMessages: 2000
+      nameSuffix: ' · 分支'
   connector:
     oauth:
       credentialKeyEnv: AGENTKIT_MCP_CREDENTIAL_KEY
@@ -110,14 +120,13 @@ agentkit:
     defaults:
       name: 默认项目
       maxNameLength: 128
-  workspace:
+    context:
+      maxFiles: 50
+      maxDirectories: 200
     changes:
       defaultPageSize: 50
       maxPageSize: 100
-    runtime:
-      root: /srv/agentkit/workspace
-      mode: local
-      sandbox: {}
+      writingTools: [Write, Edit, Bash, PowerShell, CreateDemoReport]
     upload:
       maxBytes: 20971520
     scan:
@@ -127,16 +136,82 @@ agentkit:
       maxTotalBytes: 209715200
       readChunkBytes: 1048576
     preview:
+      cache:
+        isEnabled: true
+        root: var/cache/document-preview
+        ttlSeconds: 86400
+        maxEntries: 128
+        maxTotalBytes: 536870912
+        rendererRevision: 1
+      # 部署环境可配置安装好的中英文字体路径；不要依赖临时 HOME 下的用户字体。
+      fontDirectories: []
+      fontConfigFile: null
+      reference:
+        maxCount: 4
+        maxTotalBytes: 1048576
+        maxImageBytes: 262144
+        maxImagePixels: 1500000
+        maxImageEdge: 1600
+        maxRegions: 8
+        minRegionPixels: 5
+        maxExcerptChars: 8000
+        maxNoteChars: 500
+        captureTimeoutMs: 15000
+        jpegQuality: 0.85
+        jpegMinQuality: 0.25
+        jpegQualityStep: 0.15
       timeoutSeconds: 45.0
       maxBytes: 20971520
       maxConcurrent: 2
       maxPending: 4
+    workbook:
+      maxBytes: 20971520
+      maxReferenceCells: 2000
+      maxEntries: 1000
+      maxEntryBytes: 20971520
+      maxExpandedBytes: 52428800
+    presentation:
+      maxBytes: 20971520
+      maxEntries: 5000
+      maxEntryBytes: 20971520
+      maxExpandedBytes: 104857600
+      maxSlides: 200
+      maxTitleChars: 120
+      thumbnailWidth: 144
+      maxThumbnailPixels: 65536
+      thumbnailConcurrency: 2
     delivery:
       maxEntries: 10000
       maxTotalBytes: 209715200
     download:
       secretEnv: AGENTKIT_DOWNLOAD_SECRET
       minSecretLength: 32
+  workspace:
+    runtime:
+      root: /srv/agentkit/workspace
+      mode: local
+      opensandbox:
+        domain: 127.0.0.1:8090
+        hostRoot: /srv/agentkit/workspace
+        apiKeyEnv: OPEN_SANDBOX_API_KEY
+        protocol: http
+        image: python:3.11-slim
+        useServerProxy: true
+        inputsReadOnly: true
+        requestTimeoutSeconds: 600
+        readyTimeoutSeconds: 60
+        timeoutSeconds: 3600
+        bootstrapTimeoutSeconds: 600
+        ttlSeconds: 900
+        sweepIntervalSeconds: 60
+        keepaliveIntervalSeconds: 60
+        gatewayPort: 5600
+        gatewayTmpDir: /dev/shm
+        maxSkillBytes: 52428800
+        env: {}
+        resource: {cpu: '1', memory: 1Gi}
+        entrypoint: [tail, '-f', /dev/null]
+        extraPip: [docstring-parser, jinja2, aiofiles, python-frontmatter, tree-sitter, tree-sitter-bash, pypdf]
   model:
     catalog:
       models:
@@ -153,7 +228,7 @@ agentkit:
       allowOverride: true
       allowedKeys:
       - company
-  backend:
+  client:
     postgres:
       connection:
         urlEnv: AGENTKIT_DATABASE_URL

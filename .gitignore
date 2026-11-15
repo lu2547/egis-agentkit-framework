@@ -14,3 +14,7 @@ build/
 dist/
 .worktrees/
 .vscode/
+
+# Local documentation and generated runtime caches.
+/docs/
+/var/

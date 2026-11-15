@@ -4,14 +4,12 @@ from ._skill_binding_middleware_impl import SkillBindingMiddleware
 from ._team_prompt_middleware_impl import TeamPromptMiddleware
 from ._tool_access_middleware_impl import ToolAccessMiddleware
 from ._user_preference_middleware_impl import UserPreferenceMiddleware
-from ._workspace_file_changes_middleware_impl import FileChangesMiddleware
-from ._workspace_prompt_middleware_impl import WorkspacePromptMiddleware
+from ._runtime_callback_middleware_impl import RuntimeCallbackMiddleware
 
 __all__ = [
-    "FileChangesMiddleware",
+    "RuntimeCallbackMiddleware",
     "SkillBindingMiddleware",
     "TeamPromptMiddleware",
     "ToolAccessMiddleware",
     "UserPreferenceMiddleware",
-    "WorkspacePromptMiddleware",
 ]

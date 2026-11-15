@@ -6,21 +6,22 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from egis_agentkit_app import manager_router
-from egis_agentkit_app.security import current_user
+from egis_agentkit_app.bootstrap import _router as manager_router
+from egis_agentkit_app.controller.base import current_user
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from test_domain import COMPANY, expert, identities
 from test_workspace_service import make_workspace
 
-from egis_agentkit.errors import AgentKitError, Forbidden, NotFound
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._share import ShareService
-from egis_agentkit.service.agent._expert_definition import ExpertDefinition
-from egis_agentkit.service.agent._personal_definition import PersonalDefinition
-from egis_agentkit.service.agent._query import AgentQuery
+from egis_agentkit.errors import AgentKitError, Forbidden, NotFound
+from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.agent._personal_manager import PersonalManager
 from egis_agentkit.service.team._definition import TeamDefinition
 from egis_agentkit.storage.model import Grant
+
+from test_domain import agent_changes
 
 
 def test_manager_openapi_carries_optional_recipient_in_share_requests():
@@ -82,8 +83,8 @@ def test_manager_openapi_pins_version_and_excludes_tools_from_access_writes():
 
 
 def test_controllers_do_not_own_storage_file_io_or_other_controllers():
-    root = Path(manager_router.__file__).parent
-    manager = ast.parse((root / "manager_router.py").read_text())
+    root = Path(manager_router.__file__).parent.parent
+    manager = ast.parse(Path(manager_router.__file__).read_text())
     assert not any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         for node in ast.walk(manager)
@@ -99,18 +100,23 @@ def test_controllers_do_not_own_storage_file_io_or_other_controllers():
         "user",
     }
     for domain in domains:
-        path = root / "controllers" / f"{domain}.py"
-        assert path.is_file(), f"missing {domain} controller"
+        package = root / "controller" / domain
+        assert (package / "__init__.py").is_file(), f"missing {domain} controller"
+    for path in (root / "controller").rglob("_*.py"):
+        if path.name in {"__init__.py", "_model.py"} or path.parent.name == "base":
+            continue
         tree = ast.parse(path.read_text())
-        assert any(
-            isinstance(node, ast.ImportFrom) and node.module == "dependencies"
-            for node in ast.walk(tree)
-        )
+        if path.parent.name != "health":
+            assert any(
+                isinstance(node, ast.ImportFrom) and node.module == "base"
+                for node in ast.walk(tree)
+            ) or path.parent.name == "remote_agent"
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
-                assert node.module not in domains - {domain}, (
+                assert node.module not in domains - {path.parent.name}, (
                     "controllers must not call one another"
                 )
+                assert "bootstrap" not in (node.module or "").split(".")
                 if "storage" in (node.module or "").split("."):
                     assert node.module == "egis_agentkit.storage.model"
             if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call):
@@ -138,7 +144,7 @@ def test_controllers_do_not_own_storage_file_io_or_other_controllers():
                 yield route.endpoint
 
     for endpoint in endpoints(manager_router.router):
-        assert endpoint.__module__.startswith("egis_agentkit_app.controllers.")
+        assert endpoint.__module__.startswith("egis_agentkit_app.controller.")
 
 
 @pytest.mark.asyncio
@@ -146,28 +152,28 @@ async def test_definition_detail_separates_editability_from_use_and_rejects_wron
     storage,
 ):
     _, admin, alice, bob = await identities(storage)
-    agents = ExpertDefinition(storage)
-    queries = AgentQuery(storage)
-    private = await agents.build(alice, expert())
-    own = await queries.read(alice, private["id"], "private")
+    agents = AgentManager(storage)
+    queries = AgentManager(storage)
+    private = await agents.add_definition(alice, expert())
+    own = await queries.get_definition(alice, private["id"], "private")
     assert own["is_editable"] and own["is_deletable"] and own["is_usable"]
     with pytest.raises(Forbidden):
-        await queries.read(bob, private["id"], "private")
+        await queries.get_definition(bob, private["id"], "private")
     with pytest.raises(NotFound):
         await TeamDefinition(storage).read(alice, private["id"], "private")
     with pytest.raises(NotFound):
-        await queries.read(alice, "missing", "private")
-    system = await agents.build(admin, expert("egis-demo", "system", "system_writer"))
+        await queries.get_definition(alice, "missing", "private")
+    system = await agents.add_definition(admin, expert("egis-demo", "system", "system_writer"))
     with pytest.raises(Forbidden):
-        await queries.read(alice, system["id"], "system")
-    admin_view = await queries.read(admin, system["id"], "system")
+        await queries.get_definition(alice, system["id"], "system")
+    admin_view = await queries.get_definition(admin, system["id"], "system")
     assert admin_view["is_editable"] and not admin_view["is_usable"]
     with pytest.raises(Forbidden):
-        await queries.read(bob, private["id"], "shared")
+        await queries.get_definition(bob, private["id"], "shared")
     shares = ShareService(storage)
     review = await shares.submit(alice, "agent", private["id"], target=COMPANY)
     await shares.decide(admin, review["review_id"], True, "approved")
-    shared = await queries.read(bob, private["id"], "shared")
+    shared = await queries.get_definition(bob, private["id"], "shared")
     assert shared["resource_view_type"] == "shared"
     assert shared["is_usable"] and not shared["is_editable"]
 
@@ -175,7 +181,7 @@ async def test_definition_detail_separates_editability_from_use_and_rejects_wron
 @pytest.mark.asyncio
 async def test_team_detail_only_exposes_orchestrator_configuration_to_editors(storage):
     _, admin, alice, _ = await identities(storage)
-    member = await ExpertDefinition(storage).build(admin, expert("egis-demo", "system"))
+    member = await AgentManager(storage).add_definition(admin, expert("egis-demo", "system"))
     teams = TeamDefinition(storage)
     team = await teams.save(
         admin,
@@ -199,7 +205,7 @@ async def test_team_detail_only_exposes_orchestrator_configuration_to_editors(st
         "agent_name",
         "agent_display_name",
         "payload",
-        "config_version",
+        "owner_version",
     }
     assert own["orchestrator_config"]["agent_name"] == "coordinator"
     with pytest.raises(Forbidden):
@@ -255,16 +261,16 @@ async def test_controllers_use_named_services_and_preserve_file_http_contract(
 ):
     _, _, alice, bob = await identities(storage)
     svc = make_workspace(storage, tmp_path, max_bytes=32)
-    agents = ExpertDefinition(storage)
-    definition = await agents.build(alice, expert())
-    task = await svc.tasks.create(alice, definition["id"], "private")
+    agents = AgentManager(storage)
+    definition = await agents.add_definition(alice, expert())
+    task = await svc.tasks.add_session(alice, definition["id"], "private")
     sid, pid = task["session_id"], task["project_id"]
     app = FastAPI()
     # No dict access, raw files or storage are offered to the controllers.
     app.state.egis_services = SimpleNamespace(
-        workspace=svc.workspace,
-        agent_query=AgentQuery(storage),
-        personal_definition=PersonalDefinition(storage),
+        project_files=svc.workspace,
+        agents=AgentManager(storage),
+        personal=PersonalManager(storage),
         teams=TeamDefinition(storage),
     )
     app.dependency_overrides[current_user] = lambda: alice
@@ -278,15 +284,17 @@ async def test_controllers_use_named_services_and_preserve_file_http_contract(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         expert_detail = f"/manager/agents/{definition['id']}"
-        await agents.save(
-            alice,
-            expert().model_copy(
+        await agents.update_definition(alice, (expert().model_copy(
                 update={
                     "id": definition["id"],
                     "agent_display_name": "新版专家",
                 }
-            ),
-        )
+            )).id, agent_changes(expert().model_copy(
+                update={
+                    "id": definition["id"],
+                    "agent_display_name": "新版专家",
+                }
+            )))
         assert (await client.get(expert_detail)).json()["is_editable"]
         historical = (
             await client.get(expert_detail, params={"resource_version": "1"})
@@ -365,7 +373,7 @@ async def test_controllers_use_named_services_and_preserve_file_http_contract(
 @pytest.mark.asyncio
 async def test_access_http_requires_recipient_and_authorizes_admin_actions(storage):
     _, admin, alice, bob = await identities(storage)
-    definition = await ExpertDefinition(storage).build(alice, expert())
+    definition = await AgentManager(storage).add_definition(alice, expert())
     app = FastAPI()
     app.state.egis_services = SimpleNamespace(
         sharing=ShareService(storage), grants=GrantService(storage)

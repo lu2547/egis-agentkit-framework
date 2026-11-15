@@ -3,7 +3,9 @@
 import pytest
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import DBAPIError
+from test_domain import agent_changes
 
+from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.storage import tables
 
 
@@ -17,15 +19,13 @@ async def test_schema_creates_only_native_tables_required_by_workbench(storage):
     assert set(names) == set(tables.metadata.tables) | {
         "agents",
         "credentials",
-        "mcps",
         "messages",
         "schedules",
         "sessions",
-        "skills",
         "teams",
     }
     assert "ak_project_sessions" not in names
-    assert {"ak_workspace_file_changes", "ak_workspace_file_fingerprints"} <= set(names)
+    assert {"ak_project_file_changes", "ak_project_file_fingerprints"} <= set(names)
     assert any(index["column_names"] == ["project_id", "user_id"] for index in indexes)
 
 
@@ -35,14 +35,13 @@ async def test_project_schema_upgrade_preserves_workspace_data_and_checks_legacy
     from test_domain import expert, identities
 
     from egis_agentkit.service._session import SessionService
-    from egis_agentkit.service.agent._expert_definition import ExpertDefinition
     from egis_agentkit.service.team._definition import TeamDefinition
     from egis_agentkit.storage._schema import cleanup_schema, upgrade_schema
 
     _, _, alice, _ = await identities(storage)
-    definition = await ExpertDefinition(storage).build(alice, expert())
+    definition = await AgentManager(storage).add_definition(alice, expert())
     sessions = SessionService(storage, tmp_path)
-    session = await sessions.create(alice, definition["id"], "private")
+    session = await sessions.add_session(alice, definition["id"], "private")
     sid, project = session["session_id"], session["project_id"]
     team = await TeamDefinition(storage).save(
         alice,
@@ -58,10 +57,10 @@ async def test_project_schema_upgrade_preserves_workspace_data_and_checks_legacy
             ],
         },
     )
-    team_session = await sessions.create(
+    team_session = await sessions.add_session(
         alice, team["id"], "private", project_id=project
     )
-    leader = await sessions.session(alice, team_session["session_id"])
+    leader = await sessions.get_session_record(alice, team_session["session_id"])
     native_team = await storage.get_team(alice.user_id, leader.team_id)
     member = native_team.data.members[0]
     worker = await storage.get_session(
@@ -92,11 +91,11 @@ async def test_project_schema_upgrade_preserves_workspace_data_and_checks_legacy
             ],
         )
         await connection.execute(
-            text("ALTER TABLE ak_workspace_file_changes RENAME TO ak_file_changes")
+            text("ALTER TABLE ak_project_file_changes RENAME TO ak_file_changes")
         )
         await connection.execute(
             text(
-                "ALTER TABLE ak_workspace_file_fingerprints RENAME TO ak_file_fingerprints"
+                "ALTER TABLE ak_project_file_fingerprints RENAME TO ak_file_fingerprints"
             )
         )
         await connection.execute(
@@ -135,7 +134,7 @@ async def test_project_schema_upgrade_preserves_workspace_data_and_checks_legacy
         assert await connection.scalar(text("SELECT to_regclass('ak_file_changes')"))
         assert (
             await connection.scalar(
-                text("SELECT to_regclass('ak_workspace_file_changes')")
+                text("SELECT to_regclass('ak_project_file_changes')")
             )
             is None
         )
@@ -169,7 +168,7 @@ async def test_project_schema_upgrade_preserves_workspace_data_and_checks_legacy
     ] == "verified"
     applied = await cleanup_schema(storage.engine, database=database, apply=True)
     assert applied.tables["ak_project_sessions"] == "dropped"
-    assert (await SessionService(storage, tmp_path).get(alice, sid))[
+    assert (await SessionService(storage, tmp_path).get_session(alice, sid))[
         "project_id"
     ] == project
     record = await storage.get_session(alice.user_id, session["agent_id"], sid)
@@ -183,7 +182,7 @@ async def test_project_schema_upgrade_preserves_workspace_data_and_checks_legacy
     assert binding["definition_id"] == team["id"]
     assert binding["agent_definition_id"] == definition["id"]
     assert worker.team_id == leader.team_id
-    assert (await sessions.get(alice, leader.id))["project_id"] == project
+    assert (await sessions.get_session(alice, leader.id))["project_id"] == project
 
 
 async def test_upgrade_rejects_mixed_agent_types_and_preserves_remote_runs(storage):
@@ -192,29 +191,28 @@ async def test_upgrade_rejects_mixed_agent_types_and_preserves_remote_runs(stora
     from test_domain import expert, identities
     from test_remote_agents import config
 
-    from egis_agentkit.service.agent._expert_definition import ExpertDefinition
     from egis_agentkit.storage._schema import upgrade_schema
 
     _, _, alice, _ = await identities(storage)
-    definitions = ExpertDefinition(storage)
+    definitions = AgentManager(storage)
     draft = expert()
-    original = await definitions.build(alice, draft)
-    draft.id, draft.config_version = original["id"], original["config_version"]
-    await definitions.save(alice, draft)
+    original = await definitions.add_definition(alice, draft)
+    draft.id, draft.owner_version = original["id"], original["owner_version"]
+    await definitions.update_definition(alice, (draft).id, agent_changes(draft))
     remote = config().model_dump(mode="json")
     async with storage.engine.begin() as connection:
         database = await connection.scalar(text("SELECT current_database()"))
         await connection.execute(
             text("""
-            ALTER TABLE ak_agent_definitions DROP CONSTRAINT ak_agent_definitions_agent_type_check,
-            ADD CONSTRAINT ak_agent_definitions_agent_type_check
+            ALTER TABLE ak_agent_definition_summary DROP CONSTRAINT ak_agent_definition_summary_agent_type_check,
+            ADD CONSTRAINT ak_agent_definition_summary_agent_type_check
             CHECK (agent_type IN ('personal', 'expert', 'orchestrator'))
         """)
         )
         await connection.execute(
             text("""
-            UPDATE ak_agent_definition_versions SET payload = payload || CAST(:remote AS jsonb)
-            WHERE definition_id = :id AND config_version = 2
+            UPDATE ak_agent_definition_detail SET payload = payload || CAST(:remote AS jsonb)
+            WHERE definition_id = :id AND version = 2
         """),
             {
                 "id": draft.id,
@@ -246,10 +244,10 @@ async def test_upgrade_rejects_mixed_agent_types_and_preserves_remote_runs(stora
         )
         await connection.execute(
             text("""
-            UPDATE ak_agent_definition_versions AS first SET payload = second.payload
-            FROM ak_agent_definition_versions AS second
-            WHERE first.definition_id = :id AND first.config_version = 1
-              AND second.definition_id = first.definition_id AND second.config_version = 2
+            UPDATE ak_agent_definition_detail AS first SET payload = second.payload
+            FROM ak_agent_definition_detail AS second
+            WHERE first.definition_id = :id AND first.version = 1
+              AND second.definition_id = first.definition_id AND second.version = 2
         """),
             {"id": draft.id},
         )

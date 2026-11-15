@@ -20,10 +20,11 @@ from agentscope.skill import Skill
 from agentscope.state import AgentState
 from agentscope.tool import Read, Toolkit
 from agentscope.workspace import WorkspaceBase
+from runtime_helpers import file_middleware, project_prompt, session_middlewares
 
 import egis_agentkit.extension as components
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.extension import _session_middlewares_callback as factories
+from egis_agentkit.extension import RuntimeCallbackMiddleware
 from egis_agentkit.extension._agent_tools_callback import BoundToolFactory
 from egis_agentkit.extension._session_lock_override import (
     ExecutionScope,
@@ -32,9 +33,6 @@ from egis_agentkit.extension._session_lock_override import (
 from egis_agentkit.extension._tool_access_callback import (
     team_prompt_middleware,
     tool_access_middleware,
-)
-from egis_agentkit.extension._workspace_file_changes_middleware_impl import (
-    FileChangesMiddleware,
 )
 
 
@@ -46,12 +44,11 @@ def test_core_middleware_import_leaves_enterprise_wiring_unloaded():
             """
 import sys
 from egis_agentkit.extension import (
-    FileChangesMiddleware,
+    RuntimeCallbackMiddleware,
     SkillBindingMiddleware,
     TeamPromptMiddleware,
     ToolAccessMiddleware,
     UserPreferenceMiddleware,
-    WorkspacePromptMiddleware,
 )
 from egis_agentkit.extension._skill_loader_impl import LiveSkillLoader
 
@@ -130,10 +127,10 @@ class Resources:
         self.scopes = []
 
     @property
-    def installations(self):
+    def personal(self):
         return self
 
-    async def assets(self, user, resource_type, *, enabled_only):
+    async def selected_for_personal(self, user, resource_type, *, enabled_only):
         assert resource_type == "skill"
         assert enabled_only
         return {
@@ -474,7 +471,7 @@ async def test_workspace_prompt_lists_project_inputs_without_following_links(tmp
     upload.write_text("pdf")
     (root / "linked-file").symlink_to(upload)
     (root / "linked-directory").symlink_to(tmp_path, target_is_directory=True)
-    workspace = component("WorkspacePromptMiddleware")(scope)
+    workspace = project_prompt(scope)
     prompt = await workspace.on_system_prompt(None, "system")
     assert uploaded_paths(prompt) == [
         str(upload),
@@ -492,7 +489,7 @@ async def test_workspace_prompt_has_bounded_file_and_directory_scan(tmp_path):
     root.mkdir(parents=True)
     for index in range(55):
         (root / f"input-{index:02d}.txt").touch()
-    workspace = component("WorkspacePromptMiddleware")(scope)
+    workspace = project_prompt(scope)
     assert len(uploaded_paths(await workspace.on_system_prompt(None, ""))) == 50
     for path in root.iterdir():
         path.unlink()
@@ -502,7 +499,7 @@ async def test_workspace_prompt_has_bounded_file_and_directory_scan(tmp_path):
     assert uploaded_paths(await workspace.on_system_prompt(None, "")) == []
     linked_scope = replace(scope, workdir=tmp_path / "linked" / ".work")
     (tmp_path / "linked").symlink_to(root, target_is_directory=True)
-    linked = component("WorkspacePromptMiddleware")(linked_scope)
+    linked = project_prompt(linked_scope)
     assert uploaded_paths(await linked.on_system_prompt(None, "")) == []
 
 
@@ -533,7 +530,7 @@ class Preferences:
     def __init__(self):
         self.reads = []
 
-    async def read_documents(self, user):
+    async def get_preferences(self, user):
         self.reads.append(user.user_id)
         return {"user_md": "Keep answers brief"}
 
@@ -547,7 +544,7 @@ class Changes:
         self.observations.append((user_id, project_id, discover))
 
     @asynccontextmanager
-    async def track_deliveries(self, user_id, project_id, session_id, reply_id):
+    async def track_changes(self, user_id, project_id, session_id, reply_id):
         self.deliveries.append((user_id, project_id, session_id, reply_id))
         yield
 
@@ -557,7 +554,7 @@ class Changes:
 async def test_factories_use_injected_services_and_the_exact_bound_scope(
     tmp_path, monkeypatch, kind
 ):
-    users, preferences, changes = Users(), Preferences(), Changes()
+    users, changes = Users(), Changes()
     seen = []
     workspace = WorkspaceBase()
     bound_tool = Read(model_input_types=[])
@@ -571,10 +568,9 @@ async def test_factories_use_injected_services_and_the_exact_bound_scope(
     resources.tool_registry = SimpleNamespace(resolve=resolve)
 
     tools = BoundToolFactory(resources, users)
-    middleware = factories.SessionMiddlewareFactory(
+    middleware = session_middlewares(
         None,
         users=users,
-        personal=preferences,
         file_changes=changes,
         resources=resources,
     )
@@ -583,7 +579,11 @@ async def test_factories_use_injected_services_and_the_exact_bound_scope(
         "agent_id",
         "session_id",
     ]
-    assert list(inspect.signature(middleware).parameters) == [
+    assert [
+        name
+        for name, item in inspect.signature(middleware).parameters.items()
+        if item.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    ] == [
         "user_id",
         "agent_id",
         "session_id",
@@ -596,7 +596,8 @@ async def test_factories_use_injected_services_and_the_exact_bound_scope(
     finally:
         execution_scope.reset(token)
     assert seen == [scope]
-    assert isinstance(result[0], FileChangesMiddleware) and result[0].changes is changes
+    assert isinstance(result[0], RuntimeCallbackMiddleware)
+    assert result[0].reply.func.__self__.observe_safe == changes.observe_safe
     access = next(
         mw for mw in result if isinstance(mw, component("ToolAccessMiddleware"))
     )
@@ -608,12 +609,11 @@ async def test_factories_use_injected_services_and_the_exact_bound_scope(
         and access.scope is scope
         and access.skills.scope is scope
     )
-    assert preferences.reads == (["alice"] if kind == "personal" else [])
     prompt = "system"
     for mw in result:
         if mw.is_implemented("on_system_prompt"):
             prompt = await mw.on_system_prompt(None, prompt)
-    assert ("Keep answers brief" in prompt) == (kind == "personal")
+    assert "Keep answers brief" not in prompt
 
     async def terminal(**kwargs):
         yield "event"
@@ -630,9 +630,7 @@ async def test_factories_use_injected_services_and_the_exact_bound_scope(
 async def test_both_factories_reject_missing_or_mismatched_execution_scope(tmp_path):
     users = Users()
     tools = BoundToolFactory(None, users)
-    middleware = factories.SessionMiddlewareFactory(
-        None, users=users, personal=Preferences(), file_changes=Changes()
-    )
+    middleware = session_middlewares(None, users=users, file_changes=Changes())
     for scope in (None, scope_at(tmp_path)):
         token = execution_scope.set(scope)
         try:
@@ -663,10 +661,9 @@ async def test_factories_do_not_reresolve_or_mix_scopes_across_sessions(tmp_path
     resources.tool_registry = SimpleNamespace(resolve=resolve)
     users = Users()
     tools = BoundToolFactory(resources, users)
-    middleware = factories.SessionMiddlewareFactory(
+    middleware = session_middlewares(
         None,
         users=users,
-        personal=Preferences(),
         file_changes=Changes(),
         resources=resources,
     )
@@ -679,7 +676,7 @@ async def test_factories_do_not_reresolve_or_mix_scopes_across_sessions(tmp_path
             ids = (scope.user_id, scope.agent_id, scope.session_id)
             assert await tools(*ids) == []
             result = await middleware(*ids, WorkspaceBase())
-            assert result[0].scope is scope
+            assert result[0].reply.args == (scope,)
         finally:
             execution_scope.reset(token)
 
@@ -690,7 +687,7 @@ async def test_factories_do_not_reresolve_or_mix_scopes_across_sessions(tmp_path
 @pytest.mark.asyncio
 async def test_file_change_observation_retains_project_identity_on_failure(tmp_path):
     changes = Changes()
-    middleware = FileChangesMiddleware(changes, scope_at(tmp_path))
+    middleware = file_middleware(changes, scope_at(tmp_path))
 
     async def failing(**kwargs):
         yield "first"
@@ -719,7 +716,7 @@ async def test_file_change_observation_retains_project_identity_on_failure(tmp_p
 @pytest.mark.asyncio
 async def test_read_and_team_tools_never_hold_project_delivery_lock(tmp_path):
     changes = Changes()
-    middleware = FileChangesMiddleware(changes, scope_at(tmp_path))
+    middleware = file_middleware(changes, scope_at(tmp_path))
 
     async def handler(**kwargs):
         yield "native result"

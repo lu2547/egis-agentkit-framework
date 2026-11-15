@@ -9,15 +9,15 @@ from agentscope.app._tool._team_create import TeamCreate
 from agentscope.app._tool._team_say import TeamSay
 from agentscope.message import Msg, ToolResultState
 
+from egis_agentkit.core.agent._definition_base import AgentDefinitionBase
 from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.service._project import purge_session_bus
-from egis_agentkit.service.agent._definition_base import AgentDefinitionBase
+from egis_agentkit.service.project._project_manager import purge_session_bus
 from egis_agentkit.service.team._collaboration import (
     collaboration_allowed,
     collaborators,
     validate_collaborators,
 )
-from egis_agentkit.storage.model._definition import definition_reference
+from egis_agentkit.storage.model import new_id
 
 
 class InvitationStorage:
@@ -42,8 +42,10 @@ class InvitationStorage:
 
     async def get_agent(self, user_id, agent_id):
         if self.member and agent_id == self.member["native_agent_id"]:
-            definition = await self.storage.definitions.read_reference(self.member)
-            await self.permissions.require_execution(self.user, definition, allow_pinned=True)
+            definition = await self.storage.definitions.get_definition_by_reference(self.member)
+            await self.permissions.require_execution(
+                self.user, definition, allow_pinned=True
+            )
         return await self.storage.get_agent(user_id, agent_id)
 
     async def upsert_team(self, user_id, team):
@@ -67,20 +69,27 @@ class InvitationStorage:
             or getattr(kwargs.get("origin"), "type", None) != "team"
         ):
             raise Forbidden("邀请会话不属于已批准专家")
-        definition = await self.storage.definitions.read_reference(member)
-        await self.permissions.require_execution(self.user, definition, allow_pinned=True)
+        definition = await self.storage.definitions.get_definition_by_reference(member)
+        await self.permissions.require_execution(
+            self.user, definition, allow_pinned=True
+        )
         binding = self.state.middle_context["egis_agentkit"]
-        config.workspace_id = binding["project_id"]
-        config.cwd = self.scope.session_record.config.cwd
-        kwargs["state"].middle_context["egis_agentkit"] = {
-            "project_id": binding["project_id"],
-            "is_initialized": True,
-            **definition_reference(definition),
-            "agent_definition_id": definition["id"],
-            "is_team": False,
-            "selected_model_key": None,
-            "collaboration_parent_session_id": self.scope.session_id,
-        }
+        config, assembled = AgentDefinitionBase.build_session(
+            definition,
+            project_id=binding["project_id"],
+            workspace_id=self.scope.session_record.config.workspace_id,
+            session_id=kwargs.setdefault("session_id", new_id()),
+            cwd=self.scope.session_record.config.cwd,
+            config=config,
+            is_initialized=True,
+        )
+        assembled.middle_context["egis_agentkit"]["collaboration_parent_session_id"] = (
+            self.scope.session_id
+        )
+        kwargs["state"].middle_context["egis_agentkit"] = assembled.middle_context[
+            "egis_agentkit"
+        ]
+        kwargs["state"].session_id = assembled.session_id
         session = await self.storage.upsert_session(user_id, agent_id, config, **kwargs)
         self.created_sessions.append(session.id)
         return session
@@ -214,7 +223,7 @@ async def _apply_invitations(user, scope, state, native_create, inputs, permissi
                 )
                 member.update(status="joined", worker_session_id=existing.session_id)
             else:
-                record = AgentDefinitionBase.make_record(
+                record = AgentDefinitionBase.build_agent(
                     scope.user_id,
                     root,
                     source="team",

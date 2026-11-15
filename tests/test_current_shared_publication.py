@@ -3,22 +3,24 @@
 import pytest
 from test_domain import COMPANY, expert, identities
 
-from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._share import ShareService
-from egis_agentkit.service.agent._expert_definition import ExpertDefinition
+from egis_agentkit.errors import Conflict, Forbidden
+from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.storage.model import Grant
+
+from test_domain import agent_changes
 
 
 @pytest.mark.asyncio
 async def test_update_review_pins_edition_and_reuses_all_existing_grants(storage):
     _, admin, alice, bob = await identities(storage)
-    definitions, shares = ExpertDefinition(storage), ShareService(storage)
+    definitions, shares = AgentManager(storage), ShareService(storage)
     grants = GrantService(storage)
     permissions = PermissionService(storage)
     value = expert()
-    first = await definitions.build(alice, value)
+    first = await definitions.add_definition(alice, value)
     review = await shares.submit(alice, "agent", value.id, target=COMPANY)
     await shares.decide(admin, review["review_id"], True, "")
     direct = await grants.grant(
@@ -35,15 +37,15 @@ async def test_update_review_pins_edition_and_reuses_all_existing_grants(storage
     )
     before = await grants.list_grants(admin)
     value.payload["system_prompt"] = "second"
-    second = await definitions.save(alice, value)
+    second = await definitions.update_definition(alice, (value).id, agent_changes(value))
     update = await shares.submit(alice, "agent", value.id)
     assert update["review_type"] == "update"
     assert update["principal_id"] is None
     with pytest.raises(Conflict):
         await shares.submit(alice, "agent", value.id)
-    value.config_version = second["config_version"]
+    value.owner_version = second["owner_version"]
     value.payload["system_prompt"] = "third"
-    await definitions.save(alice, value)
+    await definitions.update_definition(alice, (value).id, agent_changes(value))
     assert (
         await permissions.require(bob, "agent", value.id, "shared")
     ).resource_version == first["resource_version"]
@@ -78,7 +80,7 @@ async def test_update_replaces_dependency_paths_without_changing_root_grants(sto
 
     users, admin, alice, bob = await identities(storage)
     carol = await users.sync_identity("carol", "Carol")
-    definitions, shares = ExpertDefinition(storage), ShareService(storage)
+    definitions, shares = AgentManager(storage), ShareService(storage)
     grants, permissions = GrantService(storage), PermissionService(storage)
     async with storage.definition_write() as write:
         for identifier in ("previous", "replacement"):
@@ -103,7 +105,7 @@ async def test_update_replaces_dependency_paths_without_changing_root_grants(sto
 
     value = expert()
     value.payload["bindings"] = [binding("previous")]
-    await definitions.build(alice, value)
+    await definitions.add_definition(alice, value)
     review = await shares.submit(alice, "agent", value.id, target=COMPANY)
     await shares.decide(admin, review["review_id"], True, "")
     await grants.grant(
@@ -119,12 +121,12 @@ async def test_update_replaces_dependency_paths_without_changing_root_grants(sto
         ),
     )
     root = await permissions.require(bob, "agent", value.id, "shared")
-    pinned = await storage.definitions.read_view(
+    pinned = await storage.definitions.get_definition_view(
         value.id, "shared", **root.source_options
     )
     await permissions.require_execution(bob, pinned)
     value.payload["bindings"] = [binding("replacement")]
-    await definitions.save(alice, value)
+    await definitions.update_definition(alice, (value).id, agent_changes(value))
     update = await shares.submit(alice, "agent", value.id)
     await shares.decide(admin, update["review_id"], True, "")
 
@@ -145,7 +147,7 @@ async def test_update_replaces_dependency_paths_without_changing_root_grants(sto
     )
     for recipient in (bob, carol):
         current = await permissions.require(recipient, "agent", value.id, "shared")
-        definition = await storage.definitions.read_view(
+        definition = await storage.definitions.get_definition_view(
             value.id, "shared", **current.source_options
         )
         await permissions.require_execution(recipient, definition)
@@ -159,10 +161,10 @@ async def test_update_replaces_dependency_paths_without_changing_root_grants(sto
 @pytest.mark.asyncio
 async def test_revoking_last_recipient_cancels_pending_update(storage):
     _, admin, alice, bob = await identities(storage)
-    definitions, shares = ExpertDefinition(storage), ShareService(storage)
+    definitions, shares = AgentManager(storage), ShareService(storage)
     grants = GrantService(storage)
     value = expert()
-    await definitions.build(alice, value)
+    await definitions.add_definition(alice, value)
     initial = await shares.submit(alice, "agent", value.id, target=COMPANY)
     await shares.decide(admin, initial["review_id"], True, "")
     initial_grant = next(
@@ -170,11 +172,11 @@ async def test_revoking_last_recipient_cancels_pending_update(storage):
         for row in await grants.list_grants(admin)
         if row["grant_source_type"] == "share"
     )
-    second = await definitions.save(alice, value)
+    second = await definitions.update_definition(alice, (value).id, agent_changes(value))
     stale = await shares.submit(alice, "agent", value.id)
     await grants.revoke(admin, initial_grant["id"])
-    value.config_version = second["config_version"]
-    third = await definitions.save(alice, value)
+    value.owner_version = second["owner_version"]
+    third = await definitions.update_definition(alice, (value).id, agent_changes(value))
     await grants.grant(
         admin,
         Grant(

@@ -1,17 +1,15 @@
 import asyncio
 from contextlib import asynccontextmanager
+from functools import partial
 
 import httpx
 import pytest
 from egis_agentkit_app.bootstrap import build_app
 from test_domain import identities
 
-from egis_agentkit.backend.nacos import AgentKitConfig, NacosBootstrap, NacosClient
+from egis_agentkit.client.nacos import AgentKitConfig, NacosBootstrap, NacosClient
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.extension._agent_tools_callback import BoundToolFactory
-from egis_agentkit.extension._session_middlewares_callback import (
-    SessionMiddlewareFactory,
-)
 from egis_agentkit.extension._session_storage_override import ExecutionStorage
 
 
@@ -31,9 +29,9 @@ def app_snapshot(tmp_path, **domains):
     return AgentKitConfig.model_validate(
         {
             "revision": 1,
-            "backend": {"postgres": {"connection": {"url_env": "TEST_DB_URL"}}},
-            "workspace": {
-                "runtime": {"root": str(tmp_path)},
+            "client": {"postgres": {"connection": {"url_env": "TEST_DB_URL"}}},
+            "workspace": {"runtime": {"root": str(tmp_path)}},
+            "project": {
                 "upload": {"max_bytes": 20_971_520},
                 "download": {"secret_env": "TEST_DOWNLOAD"},
             },
@@ -91,15 +89,19 @@ async def test_http_identity_native_write_seal_and_real_task_files(
     assert app.state.egis_bus.coordinator.projects is services.projects
     assert isinstance(app.state.storage, ExecutionStorage)
     assert app.state.storage is not services.sessions.storage
-    assert app.state.storage.engine is services.sessions.storage.engine is storage.engine
+    assert (
+        app.state.storage.engine is services.sessions.storage.engine is storage.engine
+    )
     assert app.state.egis_bus.coordinator.storage is services.sessions.storage
     assert services.resources.tool_registry is not None
     assert isinstance(app.state.extra_agent_tools, BoundToolFactory)
     factory = app.state.extra_agent_middlewares
-    assert isinstance(factory, SessionMiddlewareFactory)
-    assert factory.users is services.users
-    assert factory.personal is services.personal_definition
-    assert factory.file_changes is services.workspace.file_changes
+    assert isinstance(factory, partial)
+    assert factory.func.__self__ is services.sessions
+    assert factory.keywords["users"] is services.users
+    assert app.state.egis_bus.coordinator.personal is services.personal
+    assert services.sessions.personal is services.personal
+    assert factory.keywords["file_changes"] is services.project_files
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app, client=("127.0.0.1", 1234)),
@@ -122,6 +124,45 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             )
             assert login.status_code == 200, login.text
             client.headers["Authorization"] = "Bearer " + login.json()["access_token"]
+            preferences = {"agent_md": "# 自定义规范", "soul_md": "", "user_md": "背景"}
+            saved = await client.put("/manager/preferences", json=preferences)
+            assert saved.status_code == 200, saved.text
+            assert saved.json() == preferences
+            assert (await client.get("/manager/preferences")).json() == preferences
+            created_agent = await client.post(
+                "/manager/agents",
+                json={
+                    "agent_name": "edit_contract",
+                    "agent_display_name": "编辑契约",
+                    "payload": {"system_prompt": "初始提示"},
+                },
+            )
+            assert created_agent.status_code == 201, created_agent.text
+            agent_id = created_agent.json()["id"]
+            changes = {
+                "agent_name": "edit_contract",
+                "agent_display_name": "更新名称",
+                "owner_version": 1,
+                "payload": {"system_prompt": "更新提示"},
+            }
+            for immutable in ({"agent_type": "remote"}, {"owner_id": "bob"}):
+                assert (
+                    await client.put(
+                        f"/manager/agents/{agent_id}", json={**changes, **immutable}
+                    )
+                ).status_code == 422
+            updated_agent = await client.put(
+                f"/manager/agents/{agent_id}", json=changes
+            )
+            assert updated_agent.status_code == 200, updated_agent.text
+            assert updated_agent.json()["agent_type"] == "expert"
+            assert updated_agent.json()["owner_id"] == "alice"
+            assert updated_agent.json()["owner_version"] == 2
+            oversized = {**preferences, "user_md": "中" * 64_000}
+            assert (
+                await client.put("/manager/preferences", json=oversized)
+            ).status_code == 409
+            assert (await client.get("/manager/preferences")).json() == preferences
             assert (await client.get("/health/ready")).status_code == 200
             original_health = app.state.egis_bus.health
             monkeypatch.setattr(
@@ -242,7 +283,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
                 },
             )
             assert team_response.status_code == 201, team_response.text
-            team_task = await app.state.egis_services.sessions.create(
+            team_task = await app.state.egis_services.sessions.add_session(
                 admin, team_response.json()["id"], "private"
             )
             native_session = await storage.read_session_unscoped(
@@ -313,6 +354,10 @@ async def test_http_identity_native_write_seal_and_real_task_files(
                 await client.get(f"/sessions/{sid}/messages", params={"agent_id": aid})
             ).status_code == 200
             project_id = task.json()["project_id"]
+            protected = await client.delete(f"/manager/projects/{project_id}")
+            assert protected.status_code == 403
+            assert protected.json()["detail"] == "默认项目不能删除"
+            assert (await client.get(f"/manager/tasks/{sid}")).status_code == 200
             project_files = f"/manager/projects/{project_id}/files"
             upload = await client.post(
                 project_files,
@@ -340,7 +385,34 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             assert (
                 await client.get(file_url, params=file_query)
             ).content == b"# replacement\n"
-            app.state.egis_services.workspace.files.write(
+            # 页面编辑只替换读取时的文件版本；缺少摘要、并发覆盖都要拒绝。
+            opened = await client.get(file_url, params=file_query)
+            saved = await client.put(
+                file_url,
+                params=file_query,
+                content=b"# Edited\n",
+                headers={"If-Match": opened.headers["etag"]},
+            )
+            assert saved.status_code == 200, saved.text
+            assert (
+                await client.get(file_url, params=file_query)
+            ).content == b"# Edited\n"
+            assert (
+                await client.put(
+                    file_url,
+                    params=file_query,
+                    content=b"stale",
+                    headers={"If-Match": opened.headers["etag"]},
+                )
+            ).status_code == 409
+            assert (
+                await client.put(file_url, params=file_query, content=b"no checksum")
+            ).status_code == 422
+            limits = await client.get(
+                f"/manager/projects/{project_id}/workbook-options"
+            )
+            assert limits.status_code == 200 and limits.json()["maxReferenceCells"] > 0
+            app.state.egis_services.project_files.files.write(
                 alice.user_id,
                 task.json()["project_id"],
                 "report.md",
@@ -373,7 +445,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
                     return preview_pdf
 
             preview = Preview()
-            app.state.egis_services.workspace.preview = preview
+            app.state.egis_services.project_files.preview = preview
             office = await client.post(
                 project_files,
                 files={"file": ("测试 幻灯片.pptx", b"office fixture")},
@@ -401,6 +473,14 @@ async def test_http_identity_native_write_seal_and_real_task_files(
                 },
             )
             client.headers["Authorization"] = "Bearer " + other.json()["access_token"]
+            assert (
+                await client.put(
+                    file_url,
+                    params=file_query,
+                    content=b"other user",
+                    headers={"If-Match": opened.headers["etag"]},
+                )
+            ).status_code == 404
             assert (
                 await client.get(
                     f"/manager/projects/{project_id}/preview",

@@ -4,12 +4,12 @@ from agentscope.app.storage import AgentRecord, TeamMember, TeamRecord
 def test_agent_factory_prepares_invitable_team_record_and_projects_pinned_data():
     from types import SimpleNamespace
 
+    from egis_agentkit.core.agent._definition_base import AgentDefinitionBase
     from egis_agentkit.extension._session_lock_override import projected_agent
-    from egis_agentkit.service.agent._definition_base import AgentDefinitionBase
 
-    agent = AgentDefinitionBase.make_record(
+    agent = AgentDefinitionBase.build_agent(
         "alice",
-        {"agent_name": "expert"},
+        {"agent_name": "expert", "payload": {"system_prompt": "专家提示"}},
         source="team",
         record_id="agent-a",
         invite_description="Expert analyst",
@@ -22,13 +22,13 @@ def test_agent_factory_prepares_invitable_team_record_and_projects_pinned_data()
     projected = projected_agent(
         agent,
         SimpleNamespace(
-            definition={"agent_name": "pinned", "payload": {"system_prompt": "old"}}
+            definition={"agent_type": "expert", "agent_name": "pinned", "payload": {"system_prompt": "old"}}
         ),
     )
     assert (projected.id, projected.data.id) == (agent.id, agent.data.id)
     assert (projected.data.name, projected.data.system_prompt) == ("pinned", "old")
     assert not projected.data.chat_config.invite_config.invitable
-    assert (agent.data.name, agent.data.system_prompt) == ("expert", "")
+    assert (agent.data.name, agent.data.system_prompt) == ("expert", "专家提示")
     assert agent.data.chat_config.invite_config.invitable
 
 

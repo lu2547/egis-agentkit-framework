@@ -3,24 +3,25 @@
 import pytest
 from test_domain import expert, identities
 
-from egis_agentkit.errors import Forbidden
-from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._share import ShareService
-from egis_agentkit.service.agent._expert_definition import ExpertDefinition
-from egis_agentkit.service.agent._query import AgentQuery
+from egis_agentkit.errors import Forbidden
+from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.storage.model import Asset, Grant, Group, ShareTarget
+
+from test_domain import agent_changes
 
 
 @pytest.mark.asyncio
 async def test_manual_grant_uses_existing_shared_publication(storage):
     _, admin, alice, bob = await identities(storage)
-    definitions = ExpertDefinition(storage)
-    query = AgentQuery(storage)
+    definitions = AgentManager(storage)
+    query = AgentManager(storage)
     shares = ShareService(storage)
 
     original = expert()
-    await definitions.build(alice, original)
+    await definitions.add_definition(alice, original)
     review = await shares.submit(
         alice,
         "agent",
@@ -28,11 +29,11 @@ async def test_manual_grant_uses_existing_shared_publication(storage):
         target=ShareTarget(principal_type="user", principal_id=bob.user_id),
     )
     updated = original.model_copy(update={"payload": {"system_prompt": "新版"}})
-    await definitions.save(alice, updated)
+    await definitions.update_definition(alice, (updated).id, agent_changes(updated))
     approved = await shares.decide(admin, review["review_id"], True, "通过")
     assert approved["resource_version"] == "1"
     assert "snapshot" not in approved
-    assert (await query.read(bob, original.id, "shared"))["payload"] == original.payload
+    assert (await query.get_definition(bob, original.id, "shared"))["payload"] == original.payload
 
     grant = await GrantService(storage).grant(
         admin,
@@ -48,9 +49,9 @@ async def test_manual_grant_uses_existing_shared_publication(storage):
     )
     assert "resource_version" not in grant
     with pytest.raises(Forbidden):
-        await query.read(bob, original.id, "shared", version="2")
+        await query.get_definition(bob, original.id, "shared", version="2")
     await GrantService(storage).revoke(admin, grant["id"])
-    assert (await query.read(bob, original.id, "shared"))["resource_version"] == "1"
+    assert (await query.get_definition(bob, original.id, "shared"))["resource_version"] == "1"
 
 
 @pytest.mark.asyncio
@@ -106,7 +107,7 @@ async def test_expert_share_adds_independent_dependency_paths_for_group_and_user
             "resource_view_type": "shared",
         }
     ]
-    await ExpertDefinition(storage).build(bob, definition)
+    await AgentManager(storage).add_definition(bob, definition)
     company_review = await share(bob, "agent", definition.id, "company")
     direct = await GrantService(storage).grant(
         admin,
@@ -145,7 +146,7 @@ async def test_expert_share_adds_independent_dependency_paths_for_group_and_user
     assert (
         await permissions.explain(carol, "skill", "skill1", "shared")
     ).resource_version == "1"
-    root = await storage.definitions.read_view(
+    root = await storage.definitions.get_definition_view(
         definition.id, "shared", version="1", grant_id=direct["id"]
     )
     await permissions.require_execution(dave, root)

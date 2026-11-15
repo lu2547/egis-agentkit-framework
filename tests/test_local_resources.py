@@ -5,6 +5,7 @@ import pytest
 from test_domain import identities
 
 from egis_agentkit.errors import Forbidden
+from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.resource._catalog import ResourceService
 
 
@@ -15,8 +16,7 @@ async def test_connector_dependency_permits_credentials_without_marketplace_acce
     from cryptography.fernet import Fernet
 
     from egis_agentkit.service.access._grant import GrantService
-    from egis_agentkit.service.agent._expert_definition import ExpertDefinition
-    from egis_agentkit.storage.model import Definition, Grant
+    from egis_agentkit.storage.model import AgentDefinition, Grant
 
     _, admin, _, bob = await identities(storage)
     resources = ResourceService(storage, tmp_path, credential_key=Fernet.generate_key())
@@ -40,9 +40,9 @@ async def test_connector_dependency_permits_credentials_without_marketplace_acce
             "markdown": "# Scoped",
         },
     )
-    agent = await ExpertDefinition(storage).build(
+    agent = await AgentManager(storage).add_definition(
         admin,
-        Definition(
+        AgentDefinition(
             owner_type="system",
             owner_id="system",
             agent_name="scoped",
@@ -94,7 +94,7 @@ async def test_connector_dependency_permits_credentials_without_marketplace_acce
         )
     )["authorized"]
     with pytest.raises(Forbidden):
-        await resources.installations.install(bob, "mcp", "scoped-connector", "1.0.0")
+        await resources.install(bob, "mcp", "scoped-connector")
     await resources.set_asset_enabled(admin, "skill", "scoped-skill", "1.0.0", False)
     assert await resources.mcp_dependency_authorizations(bob) == []
     with pytest.raises(Forbidden):
@@ -152,10 +152,9 @@ async def test_local_mcp_install_stores_no_credentials(storage, tmp_path):
             },
         },
     )
-    await resources.installations.install(alice, "mcp", "connector", "1.0.0")
-    records = await storage.list_mcps("alice")
-    assert len(records) == 1
-    assert not records[0].client.mcp_config.headers
+    await resources.install(alice, "mcp", "connector")
+    state = (await resources.personal.list_resources(alice, "mcp"))["connector"]
+    assert state["is_enabled"] and "credential" not in state and "payload" not in state
     with pytest.raises(Forbidden):
         await resources.mcps_for_refs(
             alice,
@@ -332,23 +331,24 @@ async def test_system_default_workspace_tools_load_without_installation_or_grant
 
     from egis_agentkit.errors import Conflict
     from egis_agentkit.extension._session_lock_override import execution_scope
-    from egis_agentkit.extension._workspace_manager_impl import (
-        EgisLocalWorkspaceManager,
+    from egis_agentkit.service.workspace._local_manager import (
+        LocalWorkspaceManager,
     )
 
     _, admin, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
     await resources.seed_builtin_tools()
-    manager = EgisLocalWorkspaceManager(tmp_path, resources=resources)
-    workspace = await manager.get_workspace(alice.user_id, "agent", "one", "project")
+    manager = LocalWorkspaceManager(tmp_path, resources=resources)
     scope = SimpleNamespace(
         user_id=alice.user_id,
         session_id="one",
+        agent_id="agent",
         project_id="project",
-        definition={"agent_type": "personal"},
+        definition={"agent_type": "personal", "payload": {}},
     )
     token = execution_scope.set(scope)
     try:
+        workspace = await manager.get_workspace(alice.user_id, "agent", "one")
         tools = {tool.name: tool for tool in await workspace.list_tools()}
         assert "Read" in tools and ("Bash" in tools or "PowerShell" in tools)
         tool = tools["Read"]
@@ -378,7 +378,7 @@ async def test_system_default_workspace_tools_load_without_installation_or_grant
         view = await resources.detail(alice, "tool", "Read", "1.0.0")
         assert view["is_system_default"] and view["is_installed"] and view["is_enabled"]
         with pytest.raises(Forbidden):
-            await resources.installations.set_installation(alice, "tool", "Read", "1.0.0", False)
+            await resources.update_installation(alice, "tool", "Read", False)
         with pytest.raises(Conflict):
             await resources.set_asset_enabled(
                 admin, "tool", "Read", "1.0.0", False, admin=True
@@ -502,7 +502,7 @@ async def test_native_mcp_uses_each_users_encrypted_api_key(
                     resource_owner_id="system",
                 ),
             )
-            await resources.installations.install(user, "mcp", "actual-mcp", "1.0.0")
+            await resources.install(user, "mcp", "actual-mcp")
             await resources.mcp_auth_action(
                 user, "actual-mcp", "1.0.0", "set_api_key", key=f"key-{user.user_id}"
             )
@@ -510,9 +510,6 @@ async def test_native_mcp_uses_each_users_encrypted_api_key(
             auth = resources.mcp_authorization
             persisted = await auth.storage.read(user.user_id, auth._connection(asset))
             assert f"key-{user.user_id}".encode() not in persisted["credential"]
-            assert not (await storage.list_mcps(user.user_id))[
-                0
-            ].client.mcp_config.headers
             ref = [
                 {
                     "resource_type": "mcp",

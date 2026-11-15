@@ -6,19 +6,23 @@ from egis_agentkit.storage.model import Group, User
 
 
 def require_admin(user: User) -> None:
+    """确认当前有效用户具有管理员角色。"""
     if not user.is_enabled or user.role_type != "admin":
         raise Forbidden("只有管理员可以执行此操作")
 
 
 class UserService:
+    """读取有效身份，管理用户角色、组织组和成员关系。"""
+
     def __init__(self, storage: AgentKitStorage):
         self.storage = storage
 
     async def get(self, user_id: str) -> User:
+        """重新读取数据库身份，使角色和组成员变更立即生效。"""
         row = await self.storage.get_user(user_id)
         if row is None:
             raise NotFound("用户不存在")
-        user = User.model_validate({k: row[k] for k in User.model_fields})
+        user = User.model_validate({key: row[key] for key in User.model_fields})
         if not user.is_enabled:
             raise Forbidden("用户已停用")
         return user

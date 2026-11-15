@@ -11,20 +11,30 @@ from agentscope.app.storage._sql._tables import _Base as NativeBase
 from sqlalchemy import inspect, text
 
 from ._message_bus import rename_bus_tables
+from .migration._agent import RENAMES as AGENT_RENAMES
+from .migration._agent import agent_tables, migrate_agent_storage
+from .migration._personal_resources import migrate_personal_resources
+from .migration._project import (
+    TABLE_SOURCES,
+    migrate_project_tables,
+    migrate_session_workspaces,
+)
+from .migration._sequences import repair_sequences
+from .migration._workspace_changes import migrate_workspace_changes
 from .model._tables import metadata
 
 SCHEMA_LOCK = 727140201
 NATIVE_TABLES = (
     "agents",
     "credentials",
-    "mcps",
     "messages",
     "schedules",
     "sessions",
-    "skills",
     "teams",
 )
 OBSOLETE_TABLES = (
+    "mcps",
+    "skills",
     "ak_definitions",
     "ak_tool_installations",
     "channels",
@@ -35,8 +45,6 @@ OBSOLETE_TABLES = (
 )
 LEGACY_PROJECT_SESSIONS = "ak_project_sessions"
 TABLE_RENAMES = {
-    "ak_file_changes": "ak_workspace_file_changes",
-    "ak_file_fingerprints": "ak_workspace_file_fingerprints",
     "ak_remote_agent_runs": "ak_agent_remote_runs",
 }
 PROJECT_BINDING = "'{state,middle_context,egis_agentkit,project_id}'"
@@ -65,6 +73,18 @@ async def init_schema(engine):
         if schema is None:
             raise ValueError("连接未选择有效的 schema")
         existing = await _existing_tables(connection, schema)
+        old_project_tables = {
+            name for sources in TABLE_SOURCES.values() for name in sources
+        }
+        if old_project_tables & existing:
+            raise ValueError("项目文件表名需要先执行 upgrade-db 预览和升级")
+        if (
+            "sessions" in existing
+            and await migrate_session_workspaces(connection, schema) == "pending"
+        ):
+            raise ValueError("会话工作区身份需要先执行 upgrade-db 预览和升级")
+        if set(AGENT_RENAMES) & existing:
+            raise ValueError("旧版 Agent 数据库请先通过 upgrade-db 预览和升级")
         if (
             set(TABLE_RENAMES) & existing
             or LEGACY_PROJECT_SESSIONS in existing
@@ -80,6 +100,11 @@ async def init_schema(engine):
             columns = await _table_columns(connection, schema, "ak_agent_definitions")
             if "shared_version" not in columns:
                 raise ValueError("旧版定义表请先通过 upgrade-db 预览和升级")
+        if "ak_project_file_changes" in existing:
+            if await migrate_workspace_changes(connection, schema) == "pending":
+                raise ValueError(
+                    "工作区变更表缺少会话归属字段或索引，请先执行 upgrade-db"
+                )
         await connection.run_sync(native.create_all, tables=required)
         await connection.run_sync(metadata.create_all)
         await _create_session_project_index(connection, schema)
@@ -138,9 +163,10 @@ async def upgrade_schema(engine, *, database=None, apply=False):
     async with engine.begin() as connection:
         actual_database, schema = await _target(connection, database, apply)
         existing = await _existing_tables(connection, schema)
+        layout = await agent_tables(connection, schema)
         core = {
-            "ak_agent_definitions",
-            "ak_agent_definition_versions",
+            layout["ak_agent_definition_summary"],
+            layout["ak_agent_definition_detail"],
             "ak_team_definition_versions",
             "ak_projects",
             "sessions",
@@ -150,8 +176,8 @@ async def upgrade_schema(engine, *, database=None, apply=False):
         legacy = LEGACY_PROJECT_SESSIONS in existing
         if apply:
             locked = {
-                "ak_agent_definitions",
-                "ak_agent_definition_versions",
+                layout["ak_agent_definition_summary"],
+                layout["ak_agent_definition_detail"],
                 "sessions",
                 "ak_projects",
             }
@@ -169,12 +195,19 @@ async def upgrade_schema(engine, *, database=None, apply=False):
             for old, new in TABLE_RENAMES.items()
             if old in existing
         }
+        states.update(await migrate_project_tables(connection, schema))
+        states["Session Workspace 身份"] = await migrate_session_workspaces(
+            connection, schema
+        )
         states.update(
             {
                 name: "pending"
                 for name in await rename_bus_tables(connection, apply=False)
             }
         )
+        states["Agent 存储结构"] = await migrate_agent_storage(connection, schema)
+        states["个人资源开关"] = await migrate_personal_resources(connection, schema)
+        states["工作区变更归属"] = await migrate_workspace_changes(connection, schema)
         states["Agent 类型"] = await _agent_upgrade_state(connection, schema)
         states["Session 绑定"] = await _session_upgrade_state(connection, schema)
         states["授权和共享版本"] = await check_access_upgrade(connection, schema)
@@ -217,6 +250,28 @@ async def upgrade_schema(engine, *, database=None, apply=False):
             if states["授权和共享版本"] == "pending":
                 await upgrade_access_tables(connection, schema)
                 states["授权和共享版本"] = "upgraded"
+            states["Agent 存储结构"] = await migrate_agent_storage(
+                connection, schema, apply=True
+            )
+            states["个人资源开关"] = await migrate_personal_resources(
+                connection, schema, apply=True
+            )
+        if apply:
+            states.update(await migrate_project_tables(connection, schema, apply=True))
+            states["Session Workspace 身份"] = await migrate_session_workspaces(
+                connection, schema, apply=True
+            )
+            states["工作区变更归属"] = await migrate_workspace_changes(
+                connection, schema, apply=True
+            )
+        states.update(
+            {
+                f"自增序列:{name}": state
+                for name, state in (
+                    await repair_sequences(connection, schema, apply=apply)
+                ).items()
+            }
+        )
         return SchemaReport(actual_database, schema, states)
 
 
@@ -237,8 +292,9 @@ async def _target(connection, database, apply):
 
 
 async def _agent_upgrade_state(connection, schema):
-    definitions = _qualified(connection, schema, "ak_agent_definitions")
-    versions = _qualified(connection, schema, "ak_agent_definition_versions")
+    layout = await agent_tables(connection, schema)
+    definitions = _qualified(connection, schema, layout["ak_agent_definition_summary"])
+    versions = _qualified(connection, schema, layout["ak_agent_definition_detail"])
     mixed = await connection.scalar(
         text(f"""
         SELECT EXISTS (
@@ -257,11 +313,11 @@ async def _agent_upgrade_state(connection, schema):
         return "inconsistent"
     checks = await connection.run_sync(
         lambda conn: inspect(conn).get_check_constraints(
-            "ak_agent_definitions", schema=schema
+            layout["ak_agent_definition_summary"], schema=schema
         )
     )
     accepts_remote = any(
-        item["name"] == AGENT_TYPE_CONSTRAINT and "'remote'" in item["sqltext"]
+        "agent_type" in item["sqltext"] and "'remote'" in item["sqltext"]
         for item in checks
     )
     needs_rewrite = await connection.scalar(
@@ -277,13 +333,22 @@ async def _agent_upgrade_state(connection, schema):
 
 
 async def _upgrade_agent_types(connection, schema):
-    definitions = _qualified(connection, schema, "ak_agent_definitions")
-    versions = _qualified(connection, schema, "ak_agent_definition_versions")
-    await connection.execute(
-        text(f"""
-        ALTER TABLE {definitions} DROP CONSTRAINT IF EXISTS {AGENT_TYPE_CONSTRAINT}
-    """)
+    layout = await agent_tables(connection, schema)
+    definitions = _qualified(connection, schema, layout["ak_agent_definition_summary"])
+    versions = _qualified(connection, schema, layout["ak_agent_definition_detail"])
+    checks = await connection.run_sync(
+        lambda conn: inspect(conn).get_check_constraints(
+            layout["ak_agent_definition_summary"], schema=schema
+        )
     )
+    quote = connection.dialect.identifier_preparer.quote_identifier
+    for check in checks:
+        if "agent_type" in check["sqltext"]:
+            await connection.execute(
+                text(
+                    f"ALTER TABLE {definitions} DROP CONSTRAINT {quote(check['name'])}"
+                )
+            )
     await connection.execute(
         text(f"""
         UPDATE {definitions} AS d SET agent_type = 'remote'
@@ -365,7 +430,7 @@ async def cleanup_schema(engine, *, database=None, apply=False):
         actual_database, schema = await _target(connection, database, apply)
         existing = await _existing_tables(connection, schema)
         if apply and not {
-            "ak_agent_definition_versions",
+            "ak_agent_definition_detail",
             "ak_team_definition_versions",
         }.issubset(existing):
             raise ValueError("清理仅适用于已初始化版本表的独立 AgentKit schema")

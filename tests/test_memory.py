@@ -4,15 +4,15 @@ from types import SimpleNamespace
 
 import pytest
 from agentscope.middleware import ReMeMiddleware
+from runtime_helpers import session_middlewares
 
-from egis_agentkit.backend.nacos import AgentKitConfig
-from egis_agentkit.backend.nacos._settings import MemoryConfig
+from egis_agentkit.client.nacos import AgentKitConfig
+from egis_agentkit.client.nacos._settings import MemoryConfig
+from egis_agentkit.extension._personal_memory_callback import MemoryService
 from egis_agentkit.extension._session_lock_override import (
     ExecutionScope,
     execution_scope,
 )
-from egis_agentkit.service.agent._memory import MemoryService
-from egis_agentkit.extension._session_middlewares_callback import SessionMiddlewareFactory
 
 original = importlib.util.find_spec
 
@@ -22,10 +22,7 @@ def memory_snapshot(tmp_path, **memory):
         {
             "revision": 1,
             "agent": {"personal": {"memory": memory}},
-            "workspace": {
-                "runtime": {"root": str(tmp_path)},
-                "upload": {"max_bytes": 20_971_520},
-            },
+            "workspace": {"runtime": {"root": str(tmp_path)}}, "project": {"upload": {"max_bytes": 20_971_520}},
             "user": {
                 "identity": {
                     "mode": "demo",
@@ -67,8 +64,8 @@ def test_enabled_memory_rejects_missing_dependency(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_native_middleware_is_cached_per_user_and_closed(monkeypatch, tmp_path):
-    from egis_agentkit.service.agent import _memory as memory
-    from egis_agentkit.service.agent._memory import MemoryService
+    from egis_agentkit.extension import _personal_memory_callback as memory
+    from egis_agentkit.extension._personal_memory_callback import MemoryService
 
     monkeypatch.setattr(memory.importlib.util, "find_spec", lambda name: object())
     calls = []
@@ -83,7 +80,9 @@ async def test_native_middleware_is_cached_per_user_and_closed(monkeypatch, tmp_
 
     monkeypatch.setattr(memory.ModelService, "resolve", resolve)
     monkeypatch.setattr(memory, "get_model", get_model)
-    config = SimpleNamespace(snapshot=memory_snapshot(tmp_path, is_enabled=True, top_k=3))
+    config = SimpleNamespace(
+        snapshot=memory_snapshot(tmp_path, is_enabled=True, top_k=3)
+    )
     service = MemoryService(None, tmp_path, config)
     alice = SimpleNamespace(user_id="alice")
     bob = SimpleNamespace(user_id="bob")
@@ -119,9 +118,11 @@ async def test_factory_adds_memory_only_for_personal(tmp_path):
     async def preferences(user):
         return {}
 
-    factory = SessionMiddlewareFactory(
-        None, users=Users(), personal=SimpleNamespace(read_documents=preferences),
-        file_changes=object(), memory=Memory(),
+    factory = session_middlewares(
+        None,
+        users=Users(),
+        file_changes=object(),
+        memory=Memory(),
     )
     marker = object()
     for kind, expected in [("personal", True), ("private", False)]:

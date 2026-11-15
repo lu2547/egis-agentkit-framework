@@ -8,7 +8,7 @@ import re
 from itertools import islice
 from pathlib import PurePosixPath
 
-from egis_agentkit.backend.nacos._settings import ComposerOptionsConfig
+from egis_agentkit.client.nacos._settings import ComposerOptionsConfig
 from egis_agentkit.errors import Conflict, Forbidden, InvalidRequest, NotFound
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.team._collaboration import (
@@ -25,13 +25,13 @@ class ComposerService:
     """列出当前输入区和已绑定会话可以使用的选项。"""
 
     def __init__(
-        self, storage, agent_query, resources, workspace, *, config_provider=None
+        self, storage, agent_query, resources, project_files, *, config_provider=None
     ):
         self.config = config_provider
         self.storage = storage
         self.agent_query = agent_query
         self.resources = resources
-        self.workspace = workspace
+        self.project_files = project_files
 
     async def options(
         self,
@@ -72,9 +72,9 @@ class ComposerService:
         after = self._decode_cursor(cursor, scope) if cursor else None
         personal = can_invite = True
         if session_id:
-            session = await self.workspace.sessions.session(user, session_id)
+            session = await self.project_files.sessions.get_session_record(user, session_id)
             binding = session.state.middle_context["egis_agentkit"]
-            root = await self.storage.definitions.read_reference(binding)
+            root = await self.storage.definitions.get_definition_by_reference(binding)
             can_invite = collaboration_allowed(session, root)
             personal = root.get("agent_type") == "personal"
             # 会话项目决定输入区可访问的文件范围。
@@ -100,7 +100,7 @@ class ComposerService:
                 user, query, after, limit + 1, settings.candidate_batch_size
             )
         elif category == "context" and project_id:
-            async with self.workspace.projects.guard(user, project_id):
+            async with self.project_files.projects.guard(user, project_id):
                 items = await asyncio.to_thread(
                     self._files, user.user_id, project_id, query, after, limit + 1
                 )
@@ -140,8 +140,9 @@ class ComposerService:
         scanned = after or ""
         while len(result) < count:
             # Authorization can reject many candidates; keep each DB read bounded.
-            rows = await self.storage.definitions.list_enabled_experts_after(
-                scanned, limit=batch_size
+            rows = await self.storage.agents.page_visible_definitions(
+                user, EXPERT_TYPES, after=scanned or None, limit=batch_size, query=query,
+                policies=permissions.policies if permissions else None, order_by_id=True,
             )
             if not rows:
                 break
@@ -156,7 +157,7 @@ class ComposerService:
                     else "shared"
                 )
                 try:
-                    value = await self.agent_query.read_for_use(
+                    value = await self.agent_query.get_definition_for_use(
                         user, row["id"], view, permissions=permissions
                     )
                     verifier = (
@@ -205,16 +206,13 @@ class ComposerService:
             )
             if not identifiers:
                 break
-            selected = await self.resources.installations.assets(
+            selected = await self.resources.selected_for_personal(
                 user, "skill", rows, enabled_only=True
             )
             for identifier in identifiers:
                 scanned = identifier
                 asset = selected.get(identifier)
                 if asset is None or not asset["is_enabled"]:
-                    continue
-                installed = await self.resources.installations.selection(user, asset)
-                if installed is None or not installed.enabled:
                     continue
                 if not await self.resources._usable(user, asset):
                     continue
@@ -235,7 +233,7 @@ class ComposerService:
         return result
 
     def _files(self, user_id, project_id, query, after, count):
-        files = self.workspace.files
+        files = self.project_files.files
 
         def metadata(root, entries, ignored_root=()):
             # Reuse the no-follow directory adapter. Content scan byte ceilings

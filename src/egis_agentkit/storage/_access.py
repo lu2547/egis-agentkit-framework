@@ -10,7 +10,7 @@ from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from egis_agentkit.backend._postgres import PostgresTransaction, transaction_connection
+from egis_agentkit.client._postgres import PostgresTransaction, transaction_connection
 from egis_agentkit.storage import tables as t
 from egis_agentkit.storage.model import utcnow
 
@@ -40,7 +40,7 @@ class AccessStorage:
     async def list_grants(self) -> list[dict]:
         async with self.engine.connect() as conn:
             rows = await conn.execute(
-                select(t.grants).order_by(t.grants.c.granted_at.desc(), t.grants.c.id)
+                select(t.resource_access).order_by(t.resource_access.c.granted_at.desc(), t.resource_access.c.id)
             )
             return [dict(row) for row in rows.mappings()]
 
@@ -50,11 +50,11 @@ class AccessStorage:
             async with self.engine.connect() as connection:
                 return await self.direct_grants(kind, identifier, conn=connection)
         rows = await conn.execute(
-            select(t.grants).where(
-                t.grants.c.resource_type == kind,
-                t.grants.c.resource_id == identifier,
-                t.grants.c.grant_source_type.in_(("manual", "share")),
-                t.grants.c.revoked_at.is_(None),
+            select(t.resource_access).where(
+                t.resource_access.c.resource_type == kind,
+                t.resource_access.c.resource_id == identifier,
+                t.resource_access.c.grant_source_type.in_(("manual", "share")),
+                t.resource_access.c.revoked_at.is_(None),
             )
         )
         return [dict(row) for row in rows.mappings()]
@@ -64,7 +64,7 @@ class AccessStorage:
         if conn is None:
             async with self.engine.connect() as connection:
                 return await self.shared_version(kind, identifier, conn=connection)
-        table = self._definition_table(kind)
+        table = self._get_definition_table(kind)
         if table is not None:
             version = await conn.scalar(
                 select(table.c.shared_version).where(table.c.id == identifier)
@@ -79,13 +79,13 @@ class AccessStorage:
         )
 
     @staticmethod
-    def _definition_table(kind):
-        return {"agent": t.agent_definitions, "team": t.team_definitions}.get(kind)
+    def _get_definition_table(kind):
+        return {"agent": t.agent_definition_summary, "team": t.team_definitions}.get(kind)
 
     async def set_shared_version(self, kind, identifier, version, *, conn=None):
         """切换共享配置，同时结束其他发布版本的当前审核状态。"""
         conn = transaction_connection(self.engine, conn)
-        table = self._definition_table(kind)
+        table = self._get_definition_table(kind)
         if table is not None:
             await conn.execute(
                 update(table)
@@ -167,26 +167,26 @@ class AccessStorage:
             t.groups.c.group_id.in_(group_ids), t.groups.c.is_enabled
         )
         statement = (
-            select(t.grants)
+            select(t.resource_access)
             .where(
-                t.grants.c.revoked_at.is_(None),
+                t.resource_access.c.revoked_at.is_(None),
                 or_(
                     and_(
-                        t.grants.c.principal_type == "user",
-                        t.grants.c.principal_id == user_id,
+                        t.resource_access.c.principal_type == "user",
+                        t.resource_access.c.principal_id == user_id,
                     ),
                     and_(
-                        t.grants.c.principal_type == "group",
-                        t.grants.c.principal_id.in_(enabled_groups),
+                        t.resource_access.c.principal_type == "group",
+                        t.resource_access.c.principal_id.in_(enabled_groups),
                     ),
                 ),
             )
-            .order_by(t.grants.c.granted_at.desc(), t.grants.c.id)
+            .order_by(t.resource_access.c.granted_at.desc(), t.resource_access.c.id)
         )
         if kind is not None:
-            statement = statement.where(t.grants.c.resource_type == kind)
+            statement = statement.where(t.resource_access.c.resource_type == kind)
         if resource_id is not None:
-            statement = statement.where(t.grants.c.resource_id == resource_id)
+            statement = statement.where(t.resource_access.c.resource_id == resource_id)
         rows = await conn.execute(statement)
         return [dict(row) for row in rows.mappings()]
 
@@ -194,15 +194,15 @@ class AccessStorage:
         self, values: dict, *, actor: str, conn: AsyncConnection | None = None
     ) -> dict:
         conn = transaction_connection(self.engine, conn)
-        statement = insert(t.grants).values(
+        statement = insert(t.resource_access).values(
             **values, granted_by=actor, granted_at=utcnow()
         )
         result = await conn.execute(
             statement.on_conflict_do_update(
-                index_elements=[t.grants.c[key] for key in GRANT_KEY],
-                index_where=t.grants.c.revoked_at.is_(None),
+                index_elements=[t.resource_access.c[key] for key in GRANT_KEY],
+                index_where=t.resource_access.c.revoked_at.is_(None),
                 set_={"origin_key": statement.excluded.origin_key},
-            ).returning(t.grants)
+            ).returning(t.resource_access)
         )
         return dict(result.mappings().one())
 
@@ -213,11 +213,11 @@ class AccessStorage:
         row = (
             (
                 await conn.execute(
-                    select(t.grants).where(
-                        t.grants.c.id == grant_id,
-                        t.grants.c.resource_id == resource_id,
-                        t.grants.c.root_grant_id.is_(None),
-                        t.grants.c.revoked_at.is_(None),
+                    select(t.resource_access).where(
+                        t.resource_access.c.id == grant_id,
+                        t.resource_access.c.resource_id == resource_id,
+                        t.resource_access.c.root_grant_id.is_(None),
+                        t.resource_access.c.revoked_at.is_(None),
                     )
                 )
             )
@@ -230,11 +230,11 @@ class AccessStorage:
         """收回根授权不再使用的依赖路径。"""
         conn = transaction_connection(self.engine, conn)
         await conn.execute(
-            update(t.grants)
+            update(t.resource_access)
             .where(
-                t.grants.c.root_grant_id == root_id,
-                t.grants.c.revoked_at.is_(None),
-                t.grants.c.id.not_in(retained_ids),
+                t.resource_access.c.root_grant_id == root_id,
+                t.resource_access.c.revoked_at.is_(None),
+                t.resource_access.c.id.not_in(retained_ids),
             )
             .values(revoked_at=utcnow(), revoked_by=actor)
         )
@@ -246,11 +246,11 @@ class AccessStorage:
         row = (
             (
                 await conn.execute(
-                    select(t.grants)
+                    select(t.resource_access)
                     .where(
-                        t.grants.c.id == grant_id,
-                        t.grants.c.grant_source_type.in_(("manual", "share")),
-                        t.grants.c.root_grant_id.is_(None),
+                        t.resource_access.c.id == grant_id,
+                        t.resource_access.c.grant_source_type.in_(("manual", "share")),
+                        t.resource_access.c.root_grant_id.is_(None),
                     )
                     .with_for_update()
                 )
@@ -264,10 +264,10 @@ class AccessStorage:
             return dict(row)
         now = utcnow()
         await conn.execute(
-            update(t.grants)
+            update(t.resource_access)
             .where(
-                or_(t.grants.c.id == grant_id, t.grants.c.root_grant_id == grant_id),
-                t.grants.c.revoked_at.is_(None),
+                or_(t.resource_access.c.id == grant_id, t.resource_access.c.root_grant_id == grant_id),
+                t.resource_access.c.revoked_at.is_(None),
             )
             .values(revoked_at=now, revoked_by=actor)
         )
@@ -293,33 +293,33 @@ class AccessStorage:
                 return
             await self.set_shared_version(kind, identifier, None, conn=conn)
             await conn.execute(
-                update(t.grants)
+                update(t.resource_access)
                 .where(
-                    t.grants.c.resource_type == kind,
-                    t.grants.c.resource_id == identifier,
-                    t.grants.c.grant_source_type.in_(("manual", "share")),
-                    t.grants.c.revoked_at.is_(None),
+                    t.resource_access.c.resource_type == kind,
+                    t.resource_access.c.resource_id == identifier,
+                    t.resource_access.c.grant_source_type.in_(("manual", "share")),
+                    t.resource_access.c.revoked_at.is_(None),
                 )
                 .values(revoked_at=utcnow(), revoked_by=actor)
             )
             return
         await self.set_shared_version(kind, identifier, None, conn=conn)
-        matching = select(t.grants.c.id).where(
-            t.grants.c.resource_type == kind,
-            t.grants.c.resource_id == identifier,
-            t.grants.c.revoked_at.is_(None),
+        matching = select(t.resource_access.c.id).where(
+            t.resource_access.c.resource_type == kind,
+            t.resource_access.c.resource_id == identifier,
+            t.resource_access.c.revoked_at.is_(None),
         )
         branch = matching.cte("revoked_branch", recursive=True)
         branch = branch.union(
-            select(t.grants.c.id)
-            .join(branch, t.grants.c.parent_grant_id == branch.c.id)
-            .where(t.grants.c.revoked_at.is_(None))
+            select(t.resource_access.c.id)
+            .join(branch, t.resource_access.c.parent_grant_id == branch.c.id)
+            .where(t.resource_access.c.revoked_at.is_(None))
         )
         rows = await conn.execute(
-            update(t.grants)
-            .where(t.grants.c.id.in_(select(branch.c.id)))
+            update(t.resource_access)
+            .where(t.resource_access.c.id.in_(select(branch.c.id)))
             .values(revoked_at=utcnow(), revoked_by=actor)
-            .returning(t.grants.c.grant_source_type, t.grants.c.source_review_id)
+            .returning(t.resource_access.c.grant_source_type, t.resource_access.c.source_review_id)
         )
         reviews = [
             row.source_review_id for row in rows if row.grant_source_type == "share"
@@ -331,7 +331,7 @@ class AccessStorage:
                 .values(is_current=False)
             )
 
-    async def approved_review(
+    async def get_approved_review(
         self,
         resource_id: str,
         *,
@@ -342,7 +342,7 @@ class AccessStorage:
     ) -> dict | None:
         if conn is None:
             async with self.engine.connect() as connection:
-                return await self.approved_review(
+                return await self.get_approved_review(
                     resource_id,
                     resource_type=resource_type,
                     review_id=review_id,

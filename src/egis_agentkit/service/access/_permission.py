@@ -10,7 +10,8 @@ from dataclasses import dataclass, field
 
 from egis_agentkit.errors import Forbidden, NotFound
 from egis_agentkit.service._user import UserService, require_admin
-from egis_agentkit.storage.model import Definition, User
+from egis_agentkit.storage.model import AgentDefinition, User
+from egis_agentkit.storage.model._base import resource_available
 
 DEFINITION_KINDS = ("agent", "team")
 MANAGED_ASSET_KINDS = ("skill", "mcp")
@@ -75,8 +76,11 @@ class PermissionService:
         elif user.role_type != "admin" and owner_id != user.user_id:
             raise Forbidden()
 
-    async def require_agent_bindings(self, user: User, data: Definition) -> None:
-        """校验绑定资源的归属和使用权。"""
+    async def require_agent_bindings(
+        self, user: User, data: AgentDefinition
+    ) -> list[dict]:
+        """校验绑定资源的归属和使用权，返回通过校验的资源。"""
+        assets = []
         for ref in data.payload.get("bindings", []):
             asset = await self.storage.assets.get(
                 ref["resource_type"],
@@ -92,8 +96,8 @@ class PermissionService:
                 raise Forbidden("只能绑定自己的私有资源")
             if data.owner_type == "system" and asset["owner_type"] != "system":
                 raise Forbidden("系统定义不能引用用户私有资源")
+            assets.append(asset)
             if ref["resource_type"] == "tool":
-                self._require_agent_tool(data, asset)
                 continue
             if (user.role_type != "admin" or view == "shared") and not (
                 await self.explain(
@@ -106,15 +110,7 @@ class PermissionService:
             ).is_allowed:
                 raise Forbidden("只能绑定本人或已授权的资源")
 
-    @staticmethod
-    def _require_agent_tool(definition, asset):
-        payload = asset["payload"]
-        if (
-            definition.agent_type != "expert"
-            or payload.get("source") != "deployed"
-            or payload.get("exposure") != "model"
-        ):
-            raise Forbidden("仅本地专家可以绑定已部署的专家工具")
+        return assets
 
     async def definition_access(self, user, source, view=None, *, version=None):
         """确定查询可读的视图与版本，并标记维护权限。"""
@@ -138,7 +134,9 @@ class PermissionService:
             view = "private"
         if view == "system" and not (editable or decision.is_allowed):
             raise Forbidden()
-        current = version is None or str(source["config_version"]) == str(version)
+        current = version is None or str(
+            source.get("owner_version", source.get("config_version"))
+        ) == str(version)
         return DefinitionAccess(
             view, editable and current and view != "shared", decision
         )
@@ -188,7 +186,7 @@ class PermissionService:
             return result
         shared = await self.storage.access.shared_version(kind, identifier)
         result["has_shared_version"] = shared is not None
-        if target["is_enabled"] and target["resource_version"] == str(version):
+        if resource_available(target) and target["resource_version"] == str(version):
             result["can_share"] = shared is None
             result["can_share_update"] = (
                 shared is not None
@@ -204,7 +202,7 @@ class PermissionService:
             )
             if row["definition_type"] != kind:
                 raise NotFound("资源类型不匹配")
-            return {**row, "resource_version": str(row["config_version"])}
+            return row
         if version is not None:
             return await self.storage.assets.get(kind, identifier, str(version))
         return await self.storage.assets.find_asset(kind, identifier)
@@ -327,7 +325,7 @@ class PermissionService:
     def _valid_view(target, view):
         return (
             target is not None
-            and target["is_enabled"]
+            and resource_available(target)
             and (view == "system") == (target["owner_type"] == "system")
         )
 
@@ -419,7 +417,7 @@ class PermissionService:
             return None
         try:
             return {
-                **await self.storage.definitions.read_view(
+                **await self.storage.definitions.get_definition_view(
                     identifier, root["resource_view_type"], grant_id=root_id
                 ),
                 "resource_view_type": root["resource_view_type"],
@@ -429,7 +427,7 @@ class PermissionService:
 
     async def _dependency_versions(self, root, row):
         """从根定义的固定引用解析派生路径允许的资源版本。"""
-        from egis_agentkit.service.team._definition import team_member_definitions
+        from egis_agentkit.service.team._members import team_member_definitions
 
         if root is None:
             return set()
@@ -462,7 +460,7 @@ class PermissionService:
 
     async def require_execution(self, user, root, *, allow_pinned=False):
         """校验根授权及定义中的固定成员和资源绑定。"""
-        from egis_agentkit.service.team._definition import team_member_definitions
+        from egis_agentkit.service.team._members import team_member_definitions
 
         root_grant = await self.require(
             user,

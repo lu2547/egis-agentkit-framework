@@ -1,21 +1,22 @@
 import pytest
 from test_domain import COMPANY, expert, identities
 
-from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._share import ShareService
-from egis_agentkit.service.agent._expert_definition import ExpertDefinition
-from egis_agentkit.service.agent._query import AgentQuery
+from egis_agentkit.errors import Conflict, Forbidden
+from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.storage.model import Asset, Grant, Group, ShareTarget
+
+from test_domain import agent_changes
 
 
 @pytest.mark.asyncio
 async def test_share_uses_submitted_recipient_and_resolves_its_review(storage):
     users, admin, alice, bob = await identities(storage)
     await users.save_group(admin, Group(group_id="ops", group_name="运营"))
-    agents, shares = ExpertDefinition(storage), ShareService(storage)
-    first = await agents.build(alice, expert())
+    agents, shares = AgentManager(storage), ShareService(storage)
+    first = await agents.add_definition(alice, expert())
     review = await shares.submit(
         alice,
         "agent",
@@ -26,7 +27,7 @@ async def test_share_uses_submitted_recipient_and_resolves_its_review(storage):
     changed = expert()
     changed.id = first["id"]
     changed.payload["system_prompt"] = "组内版本"
-    await agents.save(alice, changed)
+    await agents.update_definition(alice, (changed).id, agent_changes(changed))
     team_review = await shares.submit(
         alice,
         "agent",
@@ -34,20 +35,20 @@ async def test_share_uses_submitted_recipient_and_resolves_its_review(storage):
         target=ShareTarget(principal_type="group", principal_id="ops"),
     )
     await shares.decide(admin, team_review["review_id"], True, "")
-    assert (await AgentQuery(storage).read_for_use(bob, first["id"], "shared"))[
+    assert (await AgentManager(storage).get_definition_for_use(bob, first["id"], "shared"))[
         "payload"
     ]["system_prompt"] == "旧版"
     with pytest.raises(Forbidden):
-        await AgentQuery(storage).read_for_use(admin, first["id"], "shared")
+        await AgentManager(storage).get_definition_for_use(admin, first["id"], "shared")
     await users.update_user(admin, admin.model_copy(update={"group_ids": ["ops"]}))
-    assert (await AgentQuery(storage).read_for_use(admin, first["id"], "shared"))[
+    assert (await AgentManager(storage).get_definition_for_use(admin, first["id"], "shared"))[
         "payload"
     ]["system_prompt"] == "旧版"
     update = await shares.submit(alice, "agent", first["id"])
     await shares.decide(admin, update["review_id"], True, "")
     for recipient in (admin, bob):
         assert (
-            await AgentQuery(storage).read_for_use(recipient, first["id"], "shared")
+            await AgentManager(storage).get_definition_for_use(recipient, first["id"], "shared")
         )["payload"]["system_prompt"] == "组内版本"
 
     company = await shares.submit(
@@ -69,7 +70,7 @@ async def test_three_expert_paths_and_marketplace_grant_are_revoked_independentl
     storage,
 ):
     _, admin, _, bob = await identities(storage)
-    agents, permissions = ExpertDefinition(storage), PermissionService(storage)
+    agents, permissions = AgentManager(storage), PermissionService(storage)
     asset = Asset(
         resource_type="skill",
         resource_id="report",
@@ -105,7 +106,7 @@ async def test_three_expert_paths_and_marketplace_grant_are_revoked_independentl
                 "resource_view_type": "system",
             }
         ]
-        row = await agents.build(admin, value)
+        row = await agents.add_definition(admin, value)
         roots.append(await grant("agent", row["id"]))
 
     async def can_use(root=None):
@@ -125,7 +126,7 @@ async def test_three_expert_paths_and_marketplace_grant_are_revoked_independentl
     for root in roots:
         assert await can_use(root)
     direct = await grant("skill", asset.resource_id)
-    await agents.disable(admin, roots[0]["resource_id"])
+    await agents.delete_definition(admin, roots[0]["resource_id"])
     await GrantService(storage).revoke(admin, roots[1]["id"])
     assert not await can_use(roots[0])
     assert not await can_use(roots[1])
@@ -134,15 +135,15 @@ async def test_three_expert_paths_and_marketplace_grant_are_revoked_independentl
     await GrantService(storage).revoke(admin, direct["id"])
     assert not await can_use()
     assert await can_use(roots[2])
-    await agents.disable(admin, roots[2]["resource_id"])
+    await agents.delete_definition(admin, roots[2]["resource_id"])
     assert not await can_use(roots[2])
 
 
 @pytest.mark.asyncio
 async def test_admin_direct_grant_of_private_resource_needs_no_review(storage):
     _, admin, alice, bob = await identities(storage)
-    agents, shares = ExpertDefinition(storage), ShareService(storage)
-    row = await agents.build(alice, expert())
+    agents, shares = AgentManager(storage), ShareService(storage)
+    row = await agents.add_definition(alice, expert())
     grant = await GrantService(storage).grant(
         admin,
         Grant(
@@ -157,9 +158,9 @@ async def test_admin_direct_grant_of_private_resource_needs_no_review(storage):
     )
     assert "resource_version" not in grant
     assert await shares.list(admin, admin=True) == []
-    assert (await AgentQuery(storage).read_for_use(bob, row["id"], "shared"))[
+    assert (await AgentManager(storage).get_definition_for_use(bob, row["id"], "shared"))[
         "id"
     ] == row["id"]
     await GrantService(storage).revoke(admin, grant["id"])
     with pytest.raises(Forbidden):
-        await AgentQuery(storage).read_for_use(bob, row["id"], "shared")
+        await AgentManager(storage).get_definition_for_use(bob, row["id"], "shared")

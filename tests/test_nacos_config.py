@@ -2,7 +2,7 @@ import httpx
 import pytest
 import yaml
 
-from egis_agentkit.backend.nacos import (
+from egis_agentkit.client.nacos import (
     NacosBootstrap,
     NacosClient,
     NacosConfigProvider,
@@ -40,10 +40,7 @@ def documents(revision=1):
         "agentkit.yaml": {
             "agentkit": {
                 "revision": revision,
-                "workspace": {
-                    "runtime": {"root": "/tmp/work"},
-                    "upload": {"maxBytes": 20_971_520},
-                },
+                "workspace": {"runtime": {"root": "/tmp/work"}}, "project": {"upload": {"maxBytes": 20_971_520}},
                 "user": {
                     "identity": {
                         "mode": "demo",
@@ -142,11 +139,11 @@ async def test_snapshot_reads_one_document_and_updates_typed_hot_settings():
             await provider.refresh()
         assert provider.snapshot == first
         docs.update(documents(2))
-        docs["agentkit.yaml"]["agentkit"]["workspace"]["upload"]["maxBytes"] = 40
+        docs["agentkit.yaml"]["agentkit"]["project"]["upload"]["maxBytes"] = 40
         second = await provider.refresh()
         assert second.revision == 2
-        assert second.workspace.upload.max_bytes == 40
-        assert first.workspace.upload.max_bytes == 20_971_520
+        assert second.project.upload.max_bytes == 40
+        assert first.project.upload.max_bytes == 20_971_520
         docs.update(documents(3))
         docs["agentkit.yaml"]["agentkit"]["workspace"]["runtime"]["root"] = "/different"
         with pytest.raises(NacosError, match="restart"):
@@ -162,7 +159,7 @@ async def test_first_refresh_rejects_missing_or_invalid_key_without_exposing_val
     value,
 ):
     docs = documents()
-    upload = docs["agentkit.yaml"]["agentkit"]["workspace"]["upload"]
+    upload = docs["agentkit.yaml"]["agentkit"]["project"]["upload"]
     if value is None:
         del upload["maxBytes"]
     else:
@@ -179,7 +176,7 @@ async def test_first_refresh_rejects_missing_or_invalid_key_without_exposing_val
             NacosClient(NacosBootstrap(server_url="http://registry"), http_client=http)
         )
         with pytest.raises(
-            NacosError, match=r"agentkit\.workspace\.upload\.maxBytes"
+            NacosError, match=r"agentkit\.project\.upload\.maxBytes"
         ) as exc:
             await provider.refresh()
         assert "4096" not in str(exc.value)
@@ -295,7 +292,7 @@ async def test_config_poller_refreshes_and_shutdown_stops_further_fetches():
         provider = NacosConfigProvider(
             NacosClient(NacosBootstrap(server_url="http://registry"), http_client=http)
         )
-        docs["agentkit.yaml"]["agentkit"]["backend"] = {
+        docs["agentkit.yaml"]["agentkit"]["client"] = {
             "nacos": {"refresh": {"intervalSeconds": 0.005}}
         }
         await provider.start()
@@ -338,7 +335,7 @@ async def test_unregistered_platform_default_keeps_last_valid_snapshot():
 
 
 def test_yaml_rejects_duplicate_agentkit_root():
-    from egis_agentkit.backend.nacos import load_agentkit_config
+    from egis_agentkit.client.nacos import load_agentkit_config
 
     content = yaml.safe_dump(documents()["agentkit.yaml"])
     with pytest.raises(NacosError, match="duplicate"):
@@ -348,9 +345,9 @@ def test_yaml_rejects_duplicate_agentkit_root():
 def test_checked_in_agentkit_example_validates():
     from pathlib import Path
 
-    from egis_agentkit.backend.nacos import load_agentkit_config
+    from egis_agentkit.client.nacos import load_agentkit_config
 
     example = Path(__file__).resolve().parents[1] / "examples/nacos/agentkit.yaml"
     settings = load_agentkit_config(example.read_text())
-    assert settings.workspace.upload.max_bytes == 20_971_520
+    assert settings.project.upload.max_bytes == 20_971_520
     assert settings.model.selection.default_key == "company"

@@ -3,11 +3,11 @@ from pathlib import Path
 import pytest
 
 from egis_agentkit.errors import Forbidden, NotFound
-from egis_agentkit.storage._workspace import WorkspaceFiles
+from egis_agentkit.storage.project._files import ProjectFileStorage
 
 
 def test_preview_rejects_cross_user_and_symlink_escape(tmp_path):
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     root = files.area_root("alice", "s1", "work")
     root.mkdir(parents=True)
     (root / "notes.md").write_text("hello")
@@ -19,7 +19,7 @@ def test_preview_rejects_cross_user_and_symlink_escape(tmp_path):
 
 
 def test_artifact_commit_preserves_source_and_does_not_overwrite(tmp_path):
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     root = files.area_root("alice", "s1", "work")
     root.mkdir(parents=True)
     (root / "report.md").write_text("first")
@@ -32,7 +32,7 @@ def test_artifact_commit_preserves_source_and_does_not_overwrite(tmp_path):
 
 
 def test_project_uploads_are_visible_and_do_not_become_deliveries(tmp_path):
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     files.write("alice", "s1", "input.pdf", b"input", area="uploads")
     files.write("alice", "s2", "private.pdf", b"private", area="uploads")
     files.write("bob", "s1", "other.pdf", b"other", area="uploads")
@@ -51,7 +51,7 @@ def test_project_uploads_are_visible_and_do_not_become_deliveries(tmp_path):
 
 
 def test_user_upload_does_not_hide_project_output_and_versions_are_preserved(tmp_path):
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     archive = files.user_root("alice") / "uploads" / "input.txt"
     archive.parent.mkdir(parents=True)
     archive.write_bytes(b"original upload")
@@ -70,7 +70,7 @@ def test_user_upload_does_not_hide_project_output_and_versions_are_preserved(tmp
 
 
 def test_remove_project_unlinks_symlinks_without_touching_other_data(tmp_path):
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     for area in ("work", "artifacts", "uploads"):
         files.write("alice", "s1", "remove.txt", b"remove", area=area)
         files.write("alice", "s2", "keep.txt", b"keep", area=area)
@@ -95,7 +95,7 @@ def test_discovery_preserves_newer_artifact_and_requires_explicit_code_delivery(
 ):
     import os
 
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     work = files.write("alice", "s1", "report.md", b"old work")
     artifact = files.write(
         "alice", "s1", "report.md", b"new explicit delivery", area="artifacts"
@@ -114,15 +114,19 @@ def test_discovery_preserves_newer_artifact_and_requires_explicit_code_delivery(
 
 @pytest.mark.asyncio
 async def test_shared_native_workspace_initializes_each_project_directory(tmp_path):
-    from egis_agentkit.extension._workspace_manager_impl import EgisLocalWorkspaceManager
+    from egis_agentkit.service.workspace._local_manager import (
+        LocalWorkspaceManager,
+    )
 
-    manager = EgisLocalWorkspaceManager(tmp_path)
+    manager = LocalWorkspaceManager(tmp_path)
     try:
         with pytest.raises(NotFound):
             await manager.get_workspace("alice", "agent", "s1")
-        first = await manager.get_workspace("alice", "agent", "s1", workspace_id="p1")
-        second = await manager.get_workspace("alice", "agent", "s2", workspace_id="p2")
-        assert first is second
+        for pid in ("p1", "p2"):
+            manager.files.initialize_project("alice", pid)
+        first = await manager.get_workspace('alice', 'agent', 's1', project_id='p1')
+        second = await manager.get_workspace('alice', 'agent', 's2', project_id='p2')
+        assert first.workspace_id == second.workspace_id
         assert all(
             manager.files.area_root("alice", sid, area).is_dir()
             for sid in ("p1", "p2")
@@ -133,7 +137,7 @@ async def test_shared_native_workspace_initializes_each_project_directory(tmp_pa
 
 
 def test_other_project_upload_does_not_hide_current_delivery(tmp_path):
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     files.write("alice", "s2", "input.md", b"same bytes", area="uploads")
     files.write("alice", "s1", "report.md", b"same bytes")
     files.discover_deliveries("alice", "s1")
@@ -141,7 +145,7 @@ def test_other_project_upload_does_not_hide_current_delivery(tmp_path):
 
 
 def test_discovery_prunes_dependency_directories_before_recursing(tmp_path):
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     files.write("alice", "s1", "report.md", b"finished")
     deep = files.area_root("alice", "s1", "work") / "node_modules"
     for _ in range(35):
@@ -155,7 +159,7 @@ def test_discovery_prunes_dependency_directories_before_recursing(tmp_path):
 
 
 def test_read_only_listing_does_not_recreate_deleted_project(tmp_path):
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     for area in ("work", "artifacts", "uploads"):
         files.write("alice", "s1", "old.txt", b"old", area=area)
     files.remove_project("alice", "s1")

@@ -7,7 +7,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from egis_agentkit.backend._postgres import PostgresTransaction, transaction_connection
+from egis_agentkit.client._postgres import PostgresTransaction, transaction_connection
 from egis_agentkit.storage import tables as t
 from egis_agentkit.storage.model import Asset, utcnow
 

@@ -2,12 +2,15 @@
 
 from agentscope.app.message_bus import MessageBusKeys
 
-from egis_agentkit.backend.nacos._settings import TeamInviteConfig
+from egis_agentkit.client.nacos._settings import TeamInviteConfig
 from egis_agentkit.errors import Conflict, Forbidden, InvalidRequest
 from egis_agentkit.service.access._permission import PermissionService
-from egis_agentkit.service.agent._query import select_definition
+from egis_agentkit.service.agent._agent_manager import get_definition_for_execution
 from egis_agentkit.storage.model import new_id
-from egis_agentkit.storage.model._definition import EXPERT_TYPES, definition_reference
+from egis_agentkit.storage.model._definition import (
+    EXPERT_TYPES,
+    build_definition_reference,
+)
 
 
 class TeamCollaborationService:
@@ -17,18 +20,18 @@ class TeamCollaborationService:
     async def stage_collaborators(tasks, user, session_id, bus, request_id, experts):
         """更新个人助理会话的待邀请专家，已入团成员继续由原生 Team 管理。"""
         # 已撤销的待邀请成员仍可从选择中移除。
-        session = await tasks.session(user, session_id, require_use=False)
+        session = await tasks.get_session_record(user, session_id, require_use=False)
         binding = session.state.middle_context["egis_agentkit"]
         async with tasks.projects.guard(user, binding["project_id"]):
             key = MessageBusKeys.session_lock(session_id)
             if not await bus.try_lock(key):
                 raise Conflict("对话正在运行，请等待本轮完成后邀请专家")
             try:
-                session = await tasks.session(
+                session = await tasks.get_session_record(
                     user, session_id, check_collaborators=False
                 )
                 binding = session.state.middle_context["egis_agentkit"]
-                root = await tasks.storage.definitions.read_reference(binding)
+                root = await tasks.storage.definitions.get_definition_by_reference(binding)
                 if not collaboration_allowed(session, root):
                     raise Forbidden(
                         "只有个人智能体主对话可以邀请专家协作；专家不能担任组长，固定专家团不能调整成员"
@@ -63,7 +66,7 @@ class TeamCollaborationService:
                         for identity, version in requested.items()
                     ):
                         raise Conflict("邀请请求编号已用于不同的专家选择")
-                    return await tasks.get(user, session_id)
+                    return await tasks.get_session(user, session_id)
                 if (
                     not request_id
                     or len(request_id) > limits.max_request_id_length
@@ -87,7 +90,7 @@ class TeamCollaborationService:
                         identity not in requested or not matches_version
                     ):
                         continue
-                    definition = await tasks.storage.definitions.read_reference(member)
+                    definition = await tasks.storage.definitions.get_definition_by_reference(member)
                     await permissions.require_execution(
                         user, definition, allow_pinned=True
                     )
@@ -95,7 +98,7 @@ class TeamCollaborationService:
                 for (identifier, view), version in sorted(requested.items()):
                     if (identifier, view) in retained:
                         continue
-                    root = await select_definition(
+                    root = await get_definition_for_execution(
                         permissions, user, "agent", identifier, view, version=version
                     )
                     if (
@@ -104,7 +107,7 @@ class TeamCollaborationService:
                     ):
                         raise Forbidden("只能邀请预配置的专家智能体")
                     retained[identifier, view] = dict(
-                        **definition_reference(root),
+                        **build_definition_reference(root),
                         display_name=root["agent_display_name"],
                         native_agent_id=new_id(),
                         status="pending",
@@ -137,7 +140,7 @@ class TeamCollaborationService:
                 )
             finally:
                 await bus.unlock(key)
-        return await tasks.get(user, session_id)
+        return await tasks.get_session(user, session_id)
 
 
 def collaboration_allowed(session, root):
@@ -184,7 +187,7 @@ async def validate_collaborators(permissions, user, binding):
     """读取并校验会话实际引用的临时协作专家。"""
     definitions = {}
     for member in collaborators(binding):
-        definition = await permissions.storage.definitions.read_reference(member)
+        definition = await permissions.storage.definitions.get_definition_by_reference(member)
         await permissions.require_execution(user, definition, allow_pinned=True)
         definitions[member["native_agent_id"]] = definition
     return definitions

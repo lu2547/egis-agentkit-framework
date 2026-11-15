@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 
-from egis_agentkit.backend.nacos._settings import (
+from egis_agentkit.client.nacos._settings import (
     ConnectorOAuthConfig,
 )
 from egis_agentkit.errors import AgentKitError, Forbidden

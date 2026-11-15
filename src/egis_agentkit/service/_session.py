@@ -1,43 +1,66 @@
 """会话生命周期及输入区可选能力。"""
 
+from functools import partial
 from pathlib import Path
 
 from agentscope.app.message_bus import MessageBusKeys
 from agentscope.app.storage import (
-    SessionConfig,
     TeamMember,
 )
 from agentscope.app.storage._model._session import TeamOrigin
+from agentscope.app.storage._utils import _resolve_team_leader
+from agentscope.middleware import MiddlewareBase
 from agentscope.permission import PermissionMode
-from agentscope.state import AgentState
+from agentscope.workspace import WorkspaceBase
 
-from egis_agentkit.backend.nacos._settings import (
+from egis_agentkit.client.nacos._settings import (
+    SessionBranchConfig,
     SessionListingConfig,
     SessionNamingConfig,
     SessionPermissionsConfig,
 )
+from egis_agentkit.core.agent._definition_base import (
+    AgentDefinitionBase,
+)
+from egis_agentkit.core.agent._personal_definition import PersonalDefinition
+from egis_agentkit.core.workspace._identity import workspace_id_for
 from egis_agentkit.errors import Conflict, Forbidden, InvalidRequest, NotFound
-from egis_agentkit.service._project import ProjectService, purge_session_bus
+from egis_agentkit.extension import (
+    SkillBindingMiddleware,
+)
+from egis_agentkit.extension._agent_remote_middleware_impl import (
+    RemoteAgentMiddlewareImpl,
+)
+from egis_agentkit.extension._runtime_callback_middleware_impl import (
+    RuntimeCallbackMiddleware,
+)
+from egis_agentkit.extension._session_lock_override import bound_execution_scope
+from egis_agentkit.extension._skill_loader_impl import LiveSkillLoader
+from egis_agentkit.extension._tool_access_callback import (
+    team_prompt_middleware,
+    tool_access_middleware,
+)
+from egis_agentkit.service._reply import build_branch_context
 from egis_agentkit.service.access._permission import PermissionService
+from egis_agentkit.service.agent._agent_manager import get_definition_for_execution
+from egis_agentkit.service.agent._personal_manager import PersonalManager
+from egis_agentkit.service.project._project_manager import (
+    ProjectManager,
+    purge_session_bus,
+)
 from egis_agentkit.service.team._collaboration import (
     collaboration_allowed,
     collaborators,
     pending_request_id,
     validate_collaborators,
 )
-from egis_agentkit.service.team._definition import (
-    TeamDefinition,
-    team_member_definitions,
-)
-from egis_agentkit.storage._workspace import WorkspaceFiles
+from egis_agentkit.service.team._definition import TeamDefinition
+from egis_agentkit.service.team._members import team_member_definitions
 from egis_agentkit.storage.model import new_id
 from egis_agentkit.storage.model._definition import (
-    definition_options,
-    definition_reference,
+    build_definition_options,
 )
-
-from .agent._definition_base import AgentDefinitionBase
-from .agent._query import select_definition
+from egis_agentkit.storage.project._files import ProjectFileStorage
 
 
 class SessionService:
@@ -51,48 +74,52 @@ class SessionService:
         config_provider=None,
         *,
         projects=None,
+        personal=None,
     ):
         self.storage = storage
-        self.files = WorkspaceFiles(Path(workspace_root))
+        self.files = ProjectFileStorage(Path(workspace_root))
         self.models, self.config = models, config_provider
+        self.personal = personal or PersonalManager(
+            storage, workspace_root=workspace_root, config=config_provider
+        )
         self.projects = (
             projects
             if projects is not None
-            else ProjectService(
+            else ProjectManager(
                 storage, workspace_root, config_provider=config_provider
             )
         )
 
-    def allowed_permission_modes(self):
+    def list_permission_modes(self):
         """列出工作台开放的原生权限模式。"""
         return [
             mode
-            for mode in self._permission_settings().allowed_modes
+            for mode in self._get_permission_settings().allowed_modes
             if mode != PermissionMode.DONT_ASK
         ]
 
-    def _permission_settings(self):
+    def _get_permission_settings(self):
         return (
             self.config.snapshot.session.permissions
             if self.config
             else SessionPermissionsConfig()
         )
 
-    def require_mode(self, mode, *, permissions=None):
+    def validate_permission_mode(self, mode, *, permissions=None):
         """只接受配置中开放的工作台模式。"""
         mode = PermissionMode(mode)
         permissions = (
-            permissions if permissions is not None else self._permission_settings()
+            permissions if permissions is not None else self._get_permission_settings()
         )
         if mode == PermissionMode.DONT_ASK or mode not in permissions.allowed_modes:
             raise Forbidden("此权限模式未开放")
         return mode
 
-    def default_permission_mode(self):
+    def get_default_permission_mode(self):
         """返回新主会话的配置默认模式。"""
-        return self._permission_settings().default_mode
+        return self._get_permission_settings().default_mode
 
-    async def create(
+    async def add_session(
         self,
         user,
         definition_id,
@@ -106,7 +133,9 @@ class SessionService:
     ):
         """在项目范围内按指定版本创建会话。"""
         configuration = self.config.snapshot if self.config else None
-        naming = configuration.session.naming if configuration else SessionNamingConfig()
+        naming = (
+            configuration.session.naming if configuration else SessionNamingConfig()
+        )
         if name is not None and len(name) > naming.create_max_length:
             raise InvalidRequest(f"会话名称最多 {naming.create_max_length} 个字符")
         projects = self.projects
@@ -116,7 +145,7 @@ class SessionService:
             else await projects.default(user)
         )
         async with projects.guard(user, project_record["id"]):
-            return await self._create(
+            return await self._add_session(
                 user,
                 definition_id,
                 view,
@@ -129,7 +158,7 @@ class SessionService:
                 naming=naming,
             )
 
-    async def _create(
+    async def _add_session(
         self,
         user,
         definition_id,
@@ -142,12 +171,16 @@ class SessionService:
         project_id,
         configuration,
         naming,
+        branch_history=None,
+        branch_source=None,
     ):
         """解析授权版本，创建主会话以及固定 Team 的成员会话。"""
         permissions_config = (
-            configuration.session.permissions if configuration else SessionPermissionsConfig()
+            configuration.session.permissions
+            if configuration
+            else SessionPermissionsConfig()
         )
-        permission_mode = self.require_mode(
+        permission_mode = self.validate_permission_mode(
             permissions_config.default_mode
             if permission_mode is None
             else permission_mode,
@@ -156,7 +189,7 @@ class SessionService:
         source = await self.storage.get_definition(definition_id)
         policies = configuration.access if configuration else None
         permissions = PermissionService(self.storage, policies)
-        root = await select_definition(
+        root = await get_definition_for_execution(
             permissions,
             user,
             source["definition_type"],
@@ -164,7 +197,6 @@ class SessionService:
             view,
             version=resource_version,
         )
-        reference = definition_reference(root)
         if root["definition_type"] == "agent" and root["agent_type"] == "orchestrator":
             raise Forbidden("编排智能体只能在专家团内使用")
         is_team = root["definition_type"] == "team"
@@ -173,53 +205,67 @@ class SessionService:
             root["payload"]["orchestrator"]["definition_id"] if is_team else root["id"]
         )
         created_agents, created_sessions = [], []
+        created_team_id = None
 
         async def project(definition, *, member=False):
-            native = AgentDefinitionBase.make_record(
+            personal = definition["agent_type"] == "personal"
+            builder = PersonalDefinition if personal else AgentDefinitionBase
+            preferences = (
+                await self.personal.get_preferences(user) if personal else None
+            )
+            native = builder.build_agent(
                 user.user_id,
                 definition,
                 source="team" if member else "user",
+                preferences=preferences,
             )
             await self.storage.upsert_agent(user.user_id, native)
             created_agents.append(native.id)
             sid = new_id()
-            binding = {
-                "project_id": project_id,
-                "is_initialized": False,
-                **reference,
-                "agent_definition_id": definition["id"],
-                "is_team": is_team,
-                "selected_model_key": model_key,
-            }
             model = (
-                await self.models.resolve(
-                    user,
-                    model_key or definition["payload"].get("model_key"),
-                    is_override=model_key is not None,
-                    snapshot=configuration,
+                branch_source.config.chat_model_config
+                if branch_source is not None and not member
+                else (
+                    await self.models.resolve(
+                        user,
+                        model_key or definition["payload"].get("model_key"),
+                        is_override=model_key is not None,
+                        snapshot=configuration,
+                    )
+                    if self.models
+                    else None
                 )
-                if self.models
-                else None
             )
             title = name or naming.default_name
+            session_config, state = builder.build_session(
+                definition,
+                root=root,
+                project_id=project_id,
+                workspace_id=workspace_id_for(user.user_id),
+                session_id=sid,
+                cwd=str(self.files.area_root(user.user_id, project_id, "work")),
+                name=title,
+                auto_name=name is None and not member,
+                model=model,
+                selected_model_key=model_key,
+                permission_mode=PermissionMode.DEFAULT if member else permission_mode,
+            )
+            if branch_source is not None and not member:
+                session_config = branch_source.config.model_copy(
+                    update={
+                        "workspace_id": session_config.workspace_id,
+                        "cwd": session_config.cwd,
+                        "name": title,
+                        "naming": session_config.naming,
+                    },
+                    deep=True,
+                )
             session = await self.storage.upsert_session(
                 user.user_id,
                 native.id,
-                SessionConfig(
-                    workspace_id=project_id,
-                    name=title,
-                    naming={"auto": name is None and not member},
-                    cwd=str(self.files.area_root(user.user_id, project_id, "work")),
-                    chat_model_config=model,
-                ),
+                session_config,
                 session_id=sid,
-                state=AgentState(
-                    session_id=sid,
-                    middle_context={"egis_agentkit": binding},
-                    permission_context={
-                        "mode": PermissionMode.DEFAULT if member else permission_mode
-                    },
-                ),
+                state=state,
                 origin=TeamOrigin() if member else None,
             )
             created_sessions.append((native.id, session.id))
@@ -250,31 +296,115 @@ class SessionService:
                     members=members,
                 )
                 await self.storage.upsert_team(user.user_id, team)
+                created_team_id = team.id
                 for _, sid in created_sessions:
                     await self.storage.set_session_team_id(user.user_id, sid, team.id)
             # 所有会话和团队关系就绪后才开放执行。
-            for aid, sid in created_sessions:
+            for aid, sid in reversed(created_sessions):
                 session = await self.storage.read_session_unscoped(
                     user.user_id, aid, sid
                 )
                 session.state.middle_context["egis_agentkit"]["is_initialized"] = True
-                await self.storage.update_session_state(
-                    user.user_id, aid, sid, session.state
-                )
+                if branch_history is not None and sid == leader_session.id:
+                    source_sid, reply_id, messages = branch_history
+                    session.state.context = build_branch_context(
+                        messages, branch_source.state.context
+                    )
+                    session.state.middle_context["egis_agentkit"]["branched_from"] = {
+                        "session_id": source_sid,
+                        "reply_id": reply_id,
+                    }
+                    await self.storage.sessions.save_branch_history(
+                        user.user_id,
+                        session,
+                        source_sid,
+                        [message.id for message in messages],
+                    )
+                else:
+                    await self.storage.update_session_state(
+                        user.user_id, aid, sid, session.state
+                    )
                 for area in ("work", "artifacts", "uploads"):
                     self.files.area_root(user.user_id, project_id, area).mkdir(
                         parents=True, exist_ok=True
                     )
-            return await self.get(user, leader_session.id)
+            return await self.get_session(user, leader_session.id)
         except BaseException:
             # 创建失败时只清理由本次请求分配的记录。
-            for aid, sid in reversed(created_sessions):
-                await self.storage.delete_session(user.user_id, aid, sid)
-            for aid in reversed(created_agents):
-                await self.storage.delete_agent(user.user_id, aid)
+            if created_team_id is not None:
+                await self.storage.delete_team(user.user_id, created_team_id)
+            async with self.storage.session_cleanup() as (sessions, workspace):
+                await workspace.delete_session_artifacts(
+                    project_id, [sid for _, sid in created_sessions]
+                )
+                await sessions.delete_sessions(
+                    user.user_id,
+                    [(sid, aid) for aid, sid in reversed(created_sessions)],
+                    created_agents,
+                )
             raise
 
-    async def session(
+    async def add_session_branch(self, user, session_id, reply_id, bus):
+        """从已完成回复建立独立主会话，不复制后续历史及临时执行状态。"""
+        session = await self.get_session_record(user, session_id)
+        if session.origin.type != "user":
+            raise Forbidden("只能从主对话创建分支")
+        binding = session.state.middle_context["egis_agentkit"]
+        async with self.projects.guard(user, binding["project_id"]):
+            key = MessageBusKeys.session_lock(session_id)
+            if not await bus.try_lock(key):
+                raise Conflict("对话正在运行，请先停止生成后再创建分支")
+            try:
+                session = await self.get_session_record(user, session_id)
+                binding = session.state.middle_context["egis_agentkit"]
+                reply = await self.storage.get_message(
+                    user.user_id, session_id, reply_id
+                )
+                if reply is None:
+                    raise NotFound("回复不存在或不可访问")
+                if reply.role != "assistant" or not reply.finished_at:
+                    raise InvalidRequest("请选择已经完成的助手回复")
+                configuration = self.config.snapshot if self.config else None
+                branch = (
+                    configuration.session.branch
+                    if configuration
+                    else SessionBranchConfig()
+                )
+                naming = (
+                    configuration.session.naming
+                    if configuration
+                    else SessionNamingConfig()
+                )
+                messages = await self.storage.sessions.list_messages_through(
+                    session_id, reply_id, limit=branch.max_messages
+                )
+                if len(messages) > branch.max_messages:
+                    raise InvalidRequest(
+                        f"分支历史超过 {branch.max_messages} 条，请选择较早的回复"
+                    )
+                return await self._add_session(
+                    user,
+                    binding["definition_id"],
+                    binding["resource_view_type"],
+                    resource_version=binding["resource_version"],
+                    project_id=binding["project_id"],
+                    name=(
+                        session.config.name[
+                            : max(0, naming.create_max_length - len(branch.name_suffix))
+                        ]
+                        + branch.name_suffix
+                    )[: naming.create_max_length],
+                    model_key=binding.get("selected_model_key"),
+                    permission_mode=session.state.permission_context.mode,
+                    configuration=configuration,
+                    naming=naming,
+                    branch_history=(session_id, reply_id, messages),
+                    branch_source=session,
+                )
+            finally:
+                await bus.unlock(key)
+
+    async def get_session_record(
         self,
         user,
         session_id,
@@ -310,7 +440,7 @@ class SessionService:
                 binding["root_resource_type"],
                 binding["definition_id"],
                 binding["resource_view_type"],
-                **definition_options(binding),
+                **build_definition_options(binding),
             )
             if check_collaborators:
                 await validate_collaborators(
@@ -322,12 +452,14 @@ class SessionService:
             await UserService(self.storage).get(user.user_id)
         return session
 
-    async def get(self, user, session_id):
+    async def get_session(self, user, session_id):
         """从固定版本读取对话展示信息，保留可清除的待邀请选项。"""
         # 元数据只检查根权限，不因待邀请成员或执行依赖停用而隐藏。
-        session = await self.session(user, session_id, check_collaborators=False)
+        session = await self.get_session_record(
+            user, session_id, check_collaborators=False
+        )
         binding = session.state.middle_context["egis_agentkit"]
-        root = await self.storage.definitions.read_reference(binding)
+        root = await self.storage.definitions.get_definition_by_reference(binding)
         agents = await team_member_definitions(self.storage, root)
         return {
             "project_id": binding["project_id"],
@@ -370,16 +502,20 @@ class SessionService:
             "resource_version": binding["resource_version"],
         }
 
-    async def list(self, user, bus=None):
+    async def list_sessions(self, user, bus=None):
         """读取当前用户可访问的主会话及运行状态。"""
-        listing = self.config.snapshot.session.listing if self.config else SessionListingConfig()
+        listing = (
+            self.config.snapshot.session.listing
+            if self.config
+            else SessionListingConfig()
+        )
         session_ids = await self.storage.sessions.list_main_ids(
             user.user_id, limit=listing.max_sessions
         )
         result = []
         for sid in session_ids:
             try:
-                item = await self.get(user, sid)
+                item = await self.get_session(user, sid)
                 if bus is not None:
                     item["is_running"] = await bus.is_locked(
                         MessageBusKeys.session_lock(sid)
@@ -389,9 +525,9 @@ class SessionService:
                 continue
         return result
 
-    async def delete(self, user, session_id, bus):
+    async def delete_session(self, user, session_id, bus):
         """在项目和会话锁内删除主会话及其成员记录。"""
-        session = await self.session(user, session_id, require_use=False)
+        session = await self.get_session_record(user, session_id, require_use=False)
         if session.origin.type != "user":
             raise Forbidden("只能删除主对话")
         project_id = session.state.middle_context["egis_agentkit"]["project_id"]
@@ -405,7 +541,7 @@ class SessionService:
             raise Conflict("对话正在运行，请先停止生成后再删除")
         held = [leader_key]
         try:
-            session = await self.session(user, session_id, require_use=False)
+            session = await self.get_session_record(user, session_id, require_use=False)
             member_ids = set()
             if session.team_id:
                 team = await self.storage.get_team(user.user_id, session.team_id)
@@ -419,7 +555,9 @@ class SessionService:
                 held.append(key)
             session_ids = [session_id, *sorted(member_ids)]
             binding = session.state.middle_context["egis_agentkit"]
-            projections = [member["native_agent_id"] for member in collaborators(binding)]
+            projections = [
+                member["native_agent_id"] for member in collaborators(binding)
+            ]
             async with self.storage.session_cleanup() as (sessions, workspace):
                 await sessions.delete_sessions(
                     user.user_id, [(session.id, session.agent_id)], projections
@@ -431,22 +569,26 @@ class SessionService:
             for key in reversed(held):
                 await bus.unlock(key)
 
-    async def rename(self, user, session_id, bus, name):
+    async def update_session_name(self, user, session_id, bus, name):
         from agentscope.app.message_bus import MessageBusKeys
         from agentscope.app.storage import SessionNaming
 
-        naming = self.config.snapshot.session.naming if self.config else SessionNamingConfig()
+        naming = (
+            self.config.snapshot.session.naming
+            if self.config
+            else SessionNamingConfig()
+        )
         name = name.strip()
         if not name:
             raise Conflict("会话名称不能为空")
         if len(name) > naming.max_length:
             raise InvalidRequest(f"会话名称最多 {naming.max_length} 个字符")
-        await self.session(user, session_id)
+        await self.get_session_record(user, session_id)
         key = MessageBusKeys.session_lock(session_id)
         if not await bus.try_lock(key):
             raise Conflict("对话正在运行，请先停止生成后再重命名")
         try:
-            session = await self.session(user, session_id)
+            session = await self.get_session_record(user, session_id)
             if session.origin.type != "user":
                 raise Forbidden("只能重命名主对话")
             session.config.name = name
@@ -460,23 +602,23 @@ class SessionService:
             )
         finally:
             await bus.unlock(key)
-        return await self.get(user, session_id)
+        return await self.get_session(user, session_id)
 
-    async def update_settings(
+    async def update_session_settings(
         self, user, session_id, bus, *, permission_mode=None, model_key=None
     ):
         from agentscope.app.message_bus import MessageBusKeys
 
-        await self.session(user, session_id)
+        await self.get_session_record(user, session_id)
         key = MessageBusKeys.session_lock(session_id)
         if not await bus.try_lock(key):
             raise Conflict("对话正在运行，请先停止生成后再修改设置")
         try:
-            session = await self.session(user, session_id)
+            session = await self.get_session_record(user, session_id)
             if session.origin.type != "user":
                 raise Forbidden("只能修改主对话")
             if permission_mode is not None:
-                session.state.permission_context.mode = self.require_mode(
+                session.state.permission_context.mode = self.validate_permission_mode(
                     permission_mode
                 )
             if model_key is not None:
@@ -497,4 +639,97 @@ class SessionService:
             )
         finally:
             await bus.unlock(key)
-        return await self.get(user, session_id)
+        return await self.get_session(user, session_id)
+
+    async def build_middlewares(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        workspace: WorkspaceBase,
+        *,
+        users,
+        file_changes,
+        memory=None,
+        resources=None,
+        remote_agents=None,
+        workspace_manager=None,
+    ) -> list[MiddlewareBase]:
+        """组合已绑定会话的运行回调、授权、资源和远程执行扩展。"""
+        scope = bound_execution_scope(user_id, agent_id, session_id)
+        user = await users.get(user_id)
+        policies = scope.policies
+        personal = scope.definition["agent_type"] == "personal"
+        skills = (
+            LiveSkillLoader(user, scope, resources, workspace=workspace)
+            if resources is not None
+            else None
+        )
+
+        async def authorize_tool(agent, tool, parameters=None):
+            if parameters is not None:
+                if workspace_manager is not None:
+                    await workspace_manager.refresh_resources(workspace)
+            current_user = await users.get(user_id)
+            if await resources.authorize_mcp_tool(current_user, scope, tool):
+                return
+            await resources.tool_registry.authorize(
+                current_user, scope, agent, tool, parameters
+            )
+
+        tool_authorizer = (
+            authorize_tool
+            if resources is not None
+            and getattr(resources, "tool_registry", None) is not None
+            else None
+        )
+        reply = partial(file_changes.on_reply, scope)
+        if workspace_manager is not None and hasattr(workspace_manager, "keep_alive"):
+            reply = partial(workspace_manager.on_reply, workspace, reply)
+        result: list[MiddlewareBase] = [
+            RuntimeCallbackMiddleware(
+                reply=reply,
+                acting=partial(file_changes.on_acting, scope),
+                system_prompt=partial(
+                    self.projects.on_system_prompt, scope, file_changes
+                ),
+            ),
+            tool_access_middleware(
+                user,
+                scope,
+                PermissionService(self.storage, policies),
+                skills,
+                authorize_tool=tool_authorizer,
+            ),
+            SkillBindingMiddleware(
+                skills, bind_state=skills.bind_state if skills is not None else None
+            ),
+            team_prompt_middleware(scope),
+        ]
+        if scope.definition["agent_type"] == "remote":
+            if remote_agents is None:
+                raise Forbidden("未配置远程专家执行服务")
+            leader_name = None
+            if scope.session_record.team_id is not None:
+                team = await self.storage.get_team(
+                    user_id, scope.session_record.team_id
+                )
+                if team is not None and team.session_id != session_id:
+                    leader = await _resolve_team_leader(self.storage, user_id, team)
+                    if leader is None:
+                        raise Forbidden("未找到远程专家的组长会话")
+                    leader_name = leader.name
+            result.append(
+                RemoteAgentMiddlewareImpl(
+                    remote_agents.get_client_for_definition(
+                        scope.definition,
+                        configuration=scope.configuration,
+                    ),
+                    session_id,
+                    leader_name,
+                    runtime=remote_agents,
+                )
+            )
+        if personal and memory is not None:
+            result.append(await memory.for_user(user))
+        return result

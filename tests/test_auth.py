@@ -2,9 +2,9 @@ import time
 
 import jwt
 import pytest
+from egis_agentkit.client.identity import JWTIdentity
 
-from egis_agentkit_app.identity import JWTIdentity
-from egis_agentkit.backend.nacos import AuthConfig
+from egis_agentkit.client.nacos import AuthConfig
 from egis_agentkit.errors import Forbidden
 
 

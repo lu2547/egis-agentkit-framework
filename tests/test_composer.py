@@ -7,22 +7,21 @@ from agentscope.app.storage import SkillRecord
 from test_domain import expert, identities
 from test_resources import put_asset
 
+from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service._composer import ComposerService
 from egis_agentkit.service._session import SessionService
-from egis_agentkit.service.access._grant import GrantService
-from egis_agentkit.service.agent._expert_definition import ExpertDefinition
-from egis_agentkit.service.agent._personal_definition import PersonalDefinition
-from egis_agentkit.service.agent._query import AgentQuery
+from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.agent._personal_manager import PersonalManager
 from egis_agentkit.service.resource._catalog import ResourceService
-from egis_agentkit.storage._workspace import WorkspaceFiles
+from egis_agentkit.storage.project._files import ProjectFileStorage
 
 
 def composer(storage, tmp_path, *, tasks=None, projects=None, config=None):
     resources = ResourceService(storage, tmp_path)
-    files = WorkspaceFiles(tmp_path)
+    files = ProjectFileStorage(tmp_path)
     workspace = SimpleNamespace(files=files, sessions=tasks, projects=projects)
     return ComposerService(
-        storage, AgentQuery(storage), resources, workspace, config_provider=config
+        storage, AgentManager(storage), resources, workspace, config_provider=config
     ), files
 
 
@@ -35,11 +34,11 @@ async def test_expert_pages_are_authorized_searchable_and_cursor_scoped(
     for index in range(23):
         row = expert(name=f"writer{index:02}")
         row.id = f"expert{index:02}"
-        await ExpertDefinition(storage).build(alice, row)
-    await PersonalDefinition(storage).build(alice)
+        await AgentManager(storage).add_definition(alice, row)
+    await PersonalManager(storage).get_or_add_definition(alice)
     denied = expert("demo", "system", "denied")
     denied.id = "a-denied"
-    await ExpertDefinition(storage).build(admin, denied)
+    await AgentManager(storage).add_definition(admin, denied)
     first = await service.options(alice, "experts")
     assert len(first["items"]) == 10
     assert first["next_cursor"]
@@ -152,20 +151,8 @@ async def test_only_enabled_installed_authorized_skills_are_offered(storage, tmp
             owner_id=owner,
         )
         if rid != "uninstalled":
-            await storage.upsert_skill(
-                "alice",
-                SkillRecord(
-                    id=service.resources._native_id(alice, "skill", rid, "1.0.0"),
-                    user_id="alice",
-                    name=rid,
-                    description="demo",
-                    markdown="",
-                    hub_id=service.resources.skill_hub.hub_id,
-                    card_id=rid,
-                    version="1.0.0",
-                    enabled=enabled,
-                ),
-            )
+            await service.resources.personal.add_resource(alice, "skill", rid)
+            await service.resources.personal.update_resource_enabled(alice, "skill", rid, enabled)
     assert [
         item["id"] for item in (await service.options(alice, "skills"))["items"]
     ] == ["allowed@1.0.0"]
@@ -179,8 +166,8 @@ async def test_only_enabled_installed_authorized_skills_are_offered(storage, tmp
 async def test_existing_nonpersonal_session_cannot_offer_invites(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
     tasks = SessionService(storage, tmp_path)
-    source = await ExpertDefinition(storage).build(alice, expert())
-    task = await tasks.create(alice, source["id"], "private")
+    source = await AgentManager(storage).add_definition(alice, expert())
+    task = await tasks.add_session(alice, source["id"], "private")
     service, _ = composer(storage, tmp_path, tasks=tasks)
     assert (await service.options(alice, "experts", session_id=task["session_id"]))[
         "items"
@@ -222,7 +209,7 @@ async def test_expert_with_unavailable_dependency_is_not_callable(
             "resource_view_type": "system",
         }
     ]
-    await ExpertDefinition(storage).build(alice, definition)
+    await AgentManager(storage).add_definition(alice, definition)
     assert len((await service.options(alice, "experts"))["items"]) == 1
     if unavailable == "revoked":
         await GrantService(storage).revoke(admin, grant.id)
@@ -280,18 +267,18 @@ async def test_context_metadata_pages_do_not_scan_aggregate_file_content(
 async def test_nonuser_personal_session_does_not_offer_invites(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
     tasks = SessionService(storage, tmp_path)
-    source = await PersonalDefinition(storage).build(alice)
-    task = await tasks.create(alice, source["id"], "private")
+    source = await PersonalManager(storage).get_or_add_definition(alice)
+    task = await tasks.add_session(alice, source["id"], "private")
 
     async def session(user, sid):
-        record = await tasks.session(user, sid)
+        record = await tasks.get_session_record(user, sid)
         return SimpleNamespace(
             origin=SimpleNamespace(type="scheduled"),
             state=record.state,
         )
 
-    service, _ = composer(storage, tmp_path, tasks=SimpleNamespace(session=session))
-    await ExpertDefinition(storage).build(alice, expert())
+    service, _ = composer(storage, tmp_path, tasks=SimpleNamespace(get_session_record=session))
+    await AgentManager(storage).add_definition(alice, expert())
     assert (await service.options(alice, "experts", session_id=task["session_id"]))[
         "items"
     ] == []
@@ -315,8 +302,8 @@ async def test_composer_uses_configured_option_bounds(storage, tmp_path):
             },
         )
     )
-    await ExpertDefinition(storage).build(alice, expert(name="first"))
-    await ExpertDefinition(storage).build(alice, expert(name="second"))
+    await AgentManager(storage).add_definition(alice, expert(name="first"))
+    await AgentManager(storage).add_definition(alice, expert(name="second"))
     service, _ = composer(storage, tmp_path, config=config)
     page = await service.options(alice, "experts")
     assert len(page["items"]) == 1

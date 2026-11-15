@@ -25,3 +25,10 @@ def publication_label(revision: int) -> str:
     """把递增的发布序号显示为 1.0 至 1.9，之后进到 2.0。"""
     major, minor = divmod(revision - 1, PUBLICATION_REVISIONS_PER_MAJOR)
     return f"{major + 1}.{minor}"
+
+
+def resource_available(record: dict) -> bool:
+    """按资源生命周期判断可用性；Agent 删除与安装项启停分别表达。"""
+    if record.get("definition_type") == "agent":
+        return record.get("deleted_at") is None
+    return record["is_enabled"]

@@ -26,7 +26,7 @@ class SkillResources(Protocol):
     @property
     def workspace_root(self) -> Path: ...
 
-    async def installed_assets(
+    async def selected_for_personal(
         self, user: User, resource_type: str, *, enabled_only: bool
     ) -> dict[str, dict]: ...
 
@@ -52,8 +52,9 @@ class LiveSkillLoader(SkillLoaderBase):
     content. Native Session state owns those pins across turns and workers.
     """
 
-    def __init__(self, user: User, scope, resources: SkillResources):
+    def __init__(self, user: User, scope, resources: SkillResources, *, workspace=None):
         self.user, self.scope, self.resources = user, scope, resources
+        self.workspace = workspace
         self.loaded = {}
         self.pins = {}
         self.unavailable = {}
@@ -87,7 +88,6 @@ class LiveSkillLoader(SkillLoaderBase):
                 skill = await self.resources.restore_skill(
                     self.user, pin, authorization_scope=self.scope
                 )
-                self.loaded[skill.name] = skill
                 restored_dir = str(self.resources.workspace_root / pin["cache_dir"])
                 if str(Path(skill.dir)) != restored_dir:
                     pins[rid] = await self.resources.skill_pin(
@@ -96,12 +96,31 @@ class LiveSkillLoader(SkillLoaderBase):
                         skill,
                     )
                     relocated = True
+                self.loaded[skill.name] = await self._runtime_skill(skill, pins[rid])
             except AgentKitError as exc:
                 # Revoked/disabled pins must not break unrelated conversation,
                 # reappear as a new version, or retain a readable directory.
                 self.unavailable[pin["skill_name"]] = str(exc)
+                await self._unpublish_skill(pin)
         if relocated:
             await self._persist()
+
+    async def _runtime_skill(self, skill, pin):
+        """保留宿主缓存校验记录，只把激活内容发布到当前执行环境。"""
+        publish = getattr(self.workspace, "publish_skill", None)
+        if publish is None:
+            return skill
+        return await publish(
+            skill, agent_id=self.scope.agent_id, checksum=pin["cache_checksum_sha256"]
+        )
+
+    async def _unpublish_skill(self, pin):
+        """撤销时清理沙箱副本，Local 继续保留受管资源缓存。"""
+        remove = getattr(self.workspace, "unpublish_skill", None)
+        if remove is not None:
+            await remove(
+                agent_id=self.scope.agent_id, checksum=pin["cache_checksum_sha256"]
+            )
 
     async def _persist(self):
         await self.resources.storage.update_session_state(
@@ -136,7 +155,7 @@ class LiveSkillLoader(SkillLoaderBase):
     async def refs(self):
         refs = self.scope.definition["payload"].get("bindings", [])
         if self.scope.definition["agent_type"] == "personal":
-            installed = await self.resources.installations.assets(
+            installed = await self.resources.selected_for_personal(
                 self.user, "skill", enabled_only=True
             )
             refs = [
@@ -199,6 +218,7 @@ class LiveSkillLoader(SkillLoaderBase):
             except AgentKitError as exc:
                 self.loaded.pop(name, None)
                 self.unavailable[name] = str(exc)
+                await self._unpublish_skill(pin)
 
     async def activate(self, name: str) -> None:
         async with self._lock:
@@ -227,6 +247,6 @@ class LiveSkillLoader(SkillLoaderBase):
                 except BaseException:
                     self.pins.pop(ref["resource_id"], None)
                     raise
-                self.loaded[name] = skill
+                self.loaded[name] = await self._runtime_skill(skill, pin)
                 return
             raise Forbidden("技能不在当前智能体的可用范围内")

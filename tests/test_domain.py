@@ -5,15 +5,22 @@ import asyncio
 import pytest
 from sqlalchemy import text
 
-from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._share import ShareService
+from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.service._user import UserService
-from egis_agentkit.service.agent._expert_definition import ExpertDefinition
-from egis_agentkit.service.agent._personal_definition import PersonalDefinition
-from egis_agentkit.service.agent._query import AgentQuery
-from egis_agentkit.storage.model import Definition, Group, ShareTarget
+from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.agent._personal_manager import PersonalManager
+from egis_agentkit.storage.model import AgentDefinition, Group, ShareTarget
+
+from egis_agentkit.storage.model.agent._update import AgentUpdate
+
+
+def agent_changes(definition):
+    """测试管理更新时只提交允许编辑的配置。"""
+    return AgentUpdate(**definition.model_dump(include=set(AgentUpdate.model_fields)))
+
 
 COMPANY = ShareTarget(principal_type="group", principal_id="company")
 
@@ -41,7 +48,7 @@ async def identities(storage):
 
 
 def expert(owner="alice", owner_type="user", name="writer"):
-    return Definition(
+    return AgentDefinition(
         owner_type=owner_type,
         owner_id=owner,
         agent_name=name,
@@ -55,16 +62,16 @@ async def test_login_does_not_overwrite_admin_or_duplicate_personal(storage):
     users, admin, alice, _ = await identities(storage)
     await users.sync_identity("admin", "新姓名")
     assert (await users.get("admin")).role_type == "admin"
-    service = PersonalDefinition(storage)
-    rows = await asyncio.gather(*(service.build(alice) for _ in range(6)))
+    service = PersonalManager(storage)
+    rows = await asyncio.gather(*(service.get_or_add_definition(alice) for _ in range(6)))
     assert len({row["id"] for row in rows}) == 1
 
 
 @pytest.mark.asyncio
 async def test_system_register_defaults_denied_including_admin(storage):
     _, admin, alice, _ = await identities(storage)
-    agents = ExpertDefinition(storage)
-    saved = await agents.build(admin, expert("egis-demo", "system"))
+    agents = AgentManager(storage)
+    saved = await agents.add_definition(admin, expert("egis-demo", "system"))
     permissions = PermissionService(storage)
     assert not (
         await permissions.explain(alice, "agent", saved["id"], "system")
@@ -74,7 +81,7 @@ async def test_system_register_defaults_denied_including_admin(storage):
     ).is_allowed
     assert (
         await permissions.explain(
-            alice, "agent", (await agents.build(alice, expert()))["id"], "private"
+            alice, "agent", (await agents.add_definition(alice, expert()))["id"], "private"
         )
     ).is_allowed
 
@@ -82,20 +89,20 @@ async def test_system_register_defaults_denied_including_admin(storage):
 @pytest.mark.asyncio
 async def test_own_save_needs_no_review_shared_version_is_immutable(storage):
     _, admin, alice, bob = await identities(storage)
-    agents, shares = ExpertDefinition(storage), ShareService(storage)
-    source = await agents.build(alice, expert())
-    assert (await AgentQuery(storage).read_for_use(alice, source["id"], "private"))[
+    agents, shares = AgentManager(storage), ShareService(storage)
+    source = await agents.add_definition(alice, expert())
+    assert (await AgentManager(storage).get_definition_for_use(alice, source["id"], "private"))[
         "payload"
     ]["system_prompt"] == "旧版"
     with pytest.raises(Forbidden):
-        await AgentQuery(storage).read_for_use(bob, source["id"], "shared")
+        await AgentManager(storage).get_definition_for_use(bob, source["id"], "shared")
     review = await shares.submit(alice, "agent", source["id"], target=COMPANY)
     approved = await shares.decide(admin, review["review_id"], True, "通过")
     changed = expert()
-    changed.id, changed.config_version = source["id"], source["config_version"]
+    changed.id, changed.owner_version = source["id"], source["owner_version"]
     changed.payload["system_prompt"] = "未审核的新内容"
-    await agents.save(alice, changed)
-    assert (await AgentQuery(storage).read_for_use(bob, source["id"], "shared"))[
+    await agents.update_definition(alice, (changed).id, agent_changes(changed))
+    assert (await AgentManager(storage).get_definition_for_use(bob, source["id"], "shared"))[
         "payload"
     ]["system_prompt"] == "旧版"
     again = await shares.decide(admin, review["review_id"], True, "重试")
@@ -109,12 +116,12 @@ async def test_own_save_needs_no_review_shared_version_is_immutable(storage):
 @pytest.mark.asyncio
 async def test_failed_approval_keeps_previous_review_and_grant_current(storage):
     _, admin, alice, _ = await identities(storage)
-    agents, shares = ExpertDefinition(storage), ShareService(storage)
+    agents, shares = AgentManager(storage), ShareService(storage)
     value = expert()
-    source = await agents.build(alice, value)
+    source = await agents.add_definition(alice, value)
     previous = await shares.submit(alice, "agent", source["id"], target=COMPANY)
     await shares.decide(admin, previous["review_id"], True, "通过")
-    await agents.save(alice, value)
+    await agents.update_definition(alice, (value).id, agent_changes(value))
     pending = await shares.submit(alice, "agent", source["id"])
     async with storage.transaction() as conn:
         await conn.execute(
@@ -141,16 +148,16 @@ async def test_failed_approval_keeps_previous_review_and_grant_current(storage):
 @pytest.mark.asyncio
 async def test_compare_and_swap_prevents_lost_updates_and_owner_spoofing(storage):
     _, _, alice, bob = await identities(storage)
-    agents = ExpertDefinition(storage)
-    row = await agents.build(alice, expert())
+    agents = AgentManager(storage)
+    row = await agents.add_definition(alice, expert())
     changed = expert()
     changed.id = row["id"]
     changed.payload["system_prompt"] = "已修改"
-    await agents.save(alice, changed)
+    await agents.update_definition(alice, (changed).id, agent_changes(changed))
     with pytest.raises(Conflict):
-        await agents.save(alice, changed)
+        await agents.update_definition(alice, (changed).id, agent_changes(changed))
     with pytest.raises(Forbidden):
-        await agents.save(bob, changed)
+        await agents.update_definition(bob, (changed).id, agent_changes(changed))
 
 
 @pytest.mark.asyncio

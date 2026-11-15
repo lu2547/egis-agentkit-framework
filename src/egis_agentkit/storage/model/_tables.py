@@ -19,6 +19,50 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 metadata = MetaData()
 
+# 反馈保留问题和回答快照，删除原会话后仍能由管理员处理。
+session_reply_feedback = Table(
+    "ak_session_reply_feedback",
+    metadata,
+    Column("id", String(64), primary_key=True),
+    Column("user_id", String(128), nullable=False),
+    Column("username", Text, nullable=False),
+    Column("project_id", String(128), nullable=False),
+    Column("project_name", Text, nullable=False),
+    Column("session_id", String(128), nullable=False),
+    Column("session_name", Text, nullable=False),
+    Column("reply_id", String(128), nullable=False),
+    Column("agent_id", String(128), nullable=False),
+    Column("definition_id", String(128), nullable=False),
+    Column("agent_display_name", Text, nullable=False),
+    Column("comment", Text, nullable=False),
+    Column("question_text", Text, nullable=False),
+    Column("reply_text", Text, nullable=False),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    ),
+    Column(
+        "updated_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    ),
+)
+Index(
+    "uq_ak_reply_feedback_user_reply",
+    session_reply_feedback.c.user_id,
+    session_reply_feedback.c.session_id,
+    session_reply_feedback.c.reply_id,
+    unique=True,
+)
+Index(
+    "ix_ak_reply_feedback_created",
+    session_reply_feedback.c.created_at.desc(),
+    session_reply_feedback.c.id.desc(),
+)
+
 
 def audit_columns():
     return [
@@ -60,46 +104,46 @@ groups = Table(
     Column("is_enabled", Boolean, nullable=False, server_default=text("true")),
     *audit_columns(),
 )
-agent_definitions = Table(
-    "ak_agent_definitions",
+agent_definition_summary = Table(
+    "ak_agent_definition_summary",
     metadata,
     Column("id", String(64), primary_key=True),
     Column("owner_type", String(16), nullable=False),
     Column("owner_id", String(128), nullable=False),
     Column("agent_type", String(16), nullable=False),
     Column("agent_name", String(128), nullable=False),
-    Column("is_enabled", Boolean, nullable=False),
-    Column("config_version", BigInteger, nullable=False),
+    Column("deleted_at", DateTime(timezone=True)),
+    Column("owner_version", BigInteger, nullable=False),
     Column("shared_version", BigInteger),
     *audit_columns(),
     CheckConstraint("owner_type IN ('user','system')"),
-    CheckConstraint("config_version > 0"),
+    CheckConstraint("owner_version > 0"),
     CheckConstraint("agent_type IN ('personal','expert','remote','orchestrator')"),
 )
 Index(
     "uq_ak_agent_definition_name",
-    agent_definitions.c.owner_type,
-    agent_definitions.c.owner_id,
-    agent_definitions.c.agent_name,
+    agent_definition_summary.c.owner_type,
+    agent_definition_summary.c.owner_id,
+    agent_definition_summary.c.agent_name,
     unique=True,
 )
 Index(
     "uq_ak_personal_definition",
-    agent_definitions.c.owner_id,
+    agent_definition_summary.c.owner_id,
     unique=True,
     postgresql_where=text("owner_type='user' AND agent_type='personal'"),
 )
 # 主表保存生命周期和当前名称索引，版本表保存可执行配置。
-agent_definition_versions = Table(
-    "ak_agent_definition_versions",
+agent_definition_detail = Table(
+    "ak_agent_definition_detail",
     metadata,
     Column(
         "definition_id",
         String(64),
-        ForeignKey("ak_agent_definitions.id"),
+        ForeignKey("ak_agent_definition_summary.id"),
         primary_key=True,
     ),
-    Column("config_version", BigInteger, primary_key=True),
+    Column("version", BigInteger, primary_key=True),
     Column("agent_name", String(128), nullable=False),
     Column("agent_display_name", String(128), nullable=False),
     Column("payload", JSONB, nullable=False),
@@ -110,8 +154,43 @@ agent_definition_versions = Table(
         nullable=False,
         server_default=text("now()"),
     ),
-    CheckConstraint("config_version > 0"),
+    CheckConstraint("version > 0"),
 )
+Index(
+    "ix_ak_agent_catalog_active",
+    agent_definition_summary.c.created_at.desc(),
+    agent_definition_summary.c.id.desc(),
+    postgresql_where=agent_definition_summary.c.deleted_at.is_(None),
+)
+Index(
+    "ix_ak_agent_owner_active",
+    agent_definition_summary.c.owner_type,
+    agent_definition_summary.c.owner_id,
+    agent_definition_summary.c.agent_type,
+    postgresql_where=agent_definition_summary.c.deleted_at.is_(None),
+)
+personal_agent_resources = Table(
+    "ak_personal_agent_resources",
+    metadata,
+    Column("user_id", String(128), nullable=False),
+    Column(
+        "agent_id",
+        String(64),
+        ForeignKey("ak_agent_definition_summary.id"),
+        primary_key=True,
+    ),
+    Column("resource_type", String(16), primary_key=True),
+    Column("resource_id", String(128), primary_key=True),
+    Column("is_enabled", Boolean, nullable=False),
+    *audit_columns(),
+    CheckConstraint("resource_type IN ('skill','mcp')"),
+)
+Index(
+    "ix_ak_personal_resources_user_type",
+    personal_agent_resources.c.user_id,
+    personal_agent_resources.c.resource_type,
+)
+
 team_definitions = Table(
     "ak_team_definitions",
     metadata,
@@ -122,7 +201,7 @@ team_definitions = Table(
     Column(
         "orchestrator_id",
         String(64),
-        ForeignKey("ak_agent_definitions.id"),
+        ForeignKey("ak_agent_definition_summary.id"),
         nullable=False,
     ),
     Column("is_enabled", Boolean, nullable=False),
@@ -193,8 +272,8 @@ Index(
     unique=True,
     postgresql_where=assets.c.is_shared_current,
 )
-grants = Table(
-    "ak_resource_grants",
+resource_access = Table(
+    "ak_resource_access",
     metadata,
     Column("id", String(64), primary_key=True),
     Column("principal_type", String(16), nullable=False),
@@ -207,8 +286,8 @@ grants = Table(
     Column("grant_source_type", String(16), nullable=False),
     Column("source_review_id", String(64)),
     Column("origin_key", String(192), nullable=False, server_default="manual"),
-    Column("root_grant_id", ForeignKey("ak_resource_grants.id"), index=True),
-    Column("parent_grant_id", ForeignKey("ak_resource_grants.id"), index=True),
+    Column("root_grant_id", ForeignKey("ak_resource_access.id"), index=True),
+    Column("parent_grant_id", ForeignKey("ak_resource_access.id"), index=True),
     Column("agent_id", String(64)),
     Column("team_id", String(64)),
     Column("granted_by", String(128), nullable=False),
@@ -235,7 +314,7 @@ grants = Table(
 Index(
     "uq_ak_active_grant_origin",
     *[
-        grants.c[c]
+        resource_access.c[c]
         for c in [
             "principal_type",
             "principal_id",
@@ -250,6 +329,16 @@ Index(
     ],
     unique=True,
     postgresql_where=text("revoked_at IS NULL"),
+)
+Index(
+    "ix_ak_access_resource_principal",
+    resource_access.c.resource_type,
+    resource_access.c.resource_id,
+    resource_access.c.principal_type,
+    resource_access.c.principal_id,
+    resource_access.c.resource_view_type,
+    postgresql_where=resource_access.c.revoked_at.is_(None)
+    & resource_access.c.root_grant_id.is_(None),
 )
 reviews = Table(
     "ak_share_reviews",
@@ -319,7 +408,7 @@ Index(
 )
 # File observations belong to projects, independently of session lifetime.
 file_fingerprints = Table(
-    "ak_workspace_file_fingerprints",
+    "ak_project_file_fingerprints",
     metadata,
     Column("project_id", String(128), primary_key=True),
     Column("area", String(16), primary_key=True),
@@ -328,10 +417,12 @@ file_fingerprints = Table(
     Column("size", BigInteger, nullable=False),
 )
 file_changes = Table(
-    "ak_workspace_file_changes",
+    "ak_project_file_changes",
     metadata,
     Column("change_id", BigInteger, primary_key=True, autoincrement=True),
     Column("project_id", String(128), nullable=False, index=True),
+    Column("session_id", String(128)),
+    Column("reply_id", String(128)),
     Column("area", String(16), nullable=False),
     Column("path", Text, nullable=False),
     Column("change_type", String(16), nullable=False),
@@ -343,6 +434,23 @@ file_changes = Table(
     ),
     Column("size", BigInteger),
     Column("previous_size", BigInteger),
+)
+
+Index(
+    "ix_ak_project_change_reply",
+    file_changes.c.project_id,
+    file_changes.c.session_id,
+    file_changes.c.reply_id,
+    file_changes.c.area,
+    file_changes.c.change_id,
+)
+
+Index(
+    "ix_ak_project_change_path",
+    file_changes.c.project_id,
+    file_changes.c.area,
+    file_changes.c.path,
+    file_changes.c.change_id,
 )
 
 # Upload bytes live in PostgreSQL, making jobs independent of process-local disks.
@@ -379,7 +487,7 @@ Index("ix_ak_skill_import_claim", skill_imports.c.status, skill_imports.c.availa
 Index("ix_ak_skill_import_owner", skill_imports.c.owner_id, skill_imports.c.created_at)
 
 reply_artifacts = Table(
-    "ak_reply_artifacts",
+    "ak_project_reply_artifacts",
     metadata,
     Column(
         "project_id",

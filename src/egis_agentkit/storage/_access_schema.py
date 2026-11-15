@@ -5,11 +5,11 @@ from sqlalchemy import inspect, text
 from ._access import GRANT_KEY
 
 ACCESS_TABLES = {
-    "grants": "ak_resource_grants",
+    "grants": "ak_resource_access",
     "reviews": "ak_share_reviews",
     "assets": "ak_resource_assets",
-    "agent": "ak_agent_definitions",
-    "agent_versions": "ak_agent_definition_versions",
+    "agent": "ak_agent_definition_summary",
+    "agent_versions": "ak_agent_definition_detail",
     "team": "ak_team_definitions",
     "team_versions": "ak_team_definition_versions",
 }
@@ -22,23 +22,27 @@ CURRENT_COLUMNS = {
 DIRECT_GRANTS = "revoked_at IS NULL AND grant_source_type IN ('share', 'manual')"
 
 
-def _qualified_tables(connection, schema):
+async def _qualified_tables(connection, schema):
+    from .migration._agent import agent_tables
+    actual = await agent_tables(connection, schema)
     quote = connection.dialect.identifier_preparer.quote_identifier
     return {
-        key: f"{quote(schema)}.{quote(name)}" for key, name in ACCESS_TABLES.items()
+        key: f"{quote(schema)}.{quote(actual.get(name, name))}" for key, name in ACCESS_TABLES.items()
     }
 
 
 async def _access_state(connection, schema):
+    from .migration._agent import agent_tables
+    actual = await agent_tables(connection, schema)
     def columns(sync):
         inspector = inspect(sync)
         names = set(inspector.get_table_names(schema=schema))
         return {
             key: {
-                column["name"] for column in inspector.get_columns(name, schema=schema)
+                column["name"] for column in inspector.get_columns(actual.get(name, name), schema=schema)
             }
             for key, name in ACCESS_TABLES.items()
-            if name in names
+            if actual.get(name, name) in names
         }
 
     existing = await connection.run_sync(columns)
@@ -90,15 +94,19 @@ async def _legacy_conflict(connection, table):
 
     for kind in ("agent", "team", "skill", "mcp"):
         if kind in ("agent", "team"):
+            current_agent = kind == "agent" and "ak_agent_definition_summary" in table[kind]
+            enabled = "head.deleted_at IS NULL" if current_agent else "head.is_enabled"
+            version = "version" if current_agent else "config_version"
+            owner = "owner_version" if current_agent else "config_version"
             valid = f"""
                 SELECT 1 FROM {table[kind]} AS head
                 JOIN {table[f"{kind}_versions"]} AS edition
                   ON edition.definition_id = head.id
                 WHERE head.id = grant_row.resource_id
-                  AND head.is_enabled
-                  AND edition.config_version::text = grant_row.resource_version
+                  AND {enabled}
+                  AND edition.{version}::text = grant_row.resource_version
                   AND (grant_row.resource_view_type <> 'system'
-                       OR edition.config_version = head.config_version)
+                       OR edition.{version} = head.{owner})
             """
         else:
             valid = f"""
@@ -133,7 +141,7 @@ async def check_access_upgrade(connection, schema):
     """预览稳定授权升级，检查是否存在无法自动决议的版本。"""
     state = await _access_state(connection, schema)
     if state == "pending" and await _legacy_conflict(
-        connection, _qualified_tables(connection, schema)
+        connection, await _qualified_tables(connection, schema)
     ):
         return "inconsistent"
     return state
@@ -146,7 +154,7 @@ async def upgrade_access_tables(connection, schema):
         raise ValueError("授权表结构不完整，无法自动升级")
     if state != "pending":
         return state
-    table = _qualified_tables(connection, schema)
+    table = await _qualified_tables(connection, schema)
     await connection.execute(
         text(f"LOCK TABLE {', '.join(table.values())} IN ACCESS EXCLUSIVE MODE")
     )

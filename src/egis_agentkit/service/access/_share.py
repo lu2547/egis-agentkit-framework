@@ -15,7 +15,7 @@ from egis_agentkit.service.access._permission import (
     PermissionService,
 )
 from egis_agentkit.storage.model import Grant, ShareReview, ShareTarget, User, utcnow
-from egis_agentkit.storage.model._base import publication_label
+from egis_agentkit.storage.model._base import publication_label, resource_available
 
 
 class ShareService:
@@ -117,7 +117,7 @@ class ShareService:
             raise NotFound()
         if (resource["owner_type"], resource["owner_id"]) != ("user", user.user_id):
             raise Forbidden("只能申请共享自己的资源")
-        if not resource["is_enabled"]:
+        if not resource_available(resource):
             raise Conflict("源资源已经停用")
         if resource.get("agent_type") in INTERNAL_AGENT_TYPES:
             raise Forbidden("该资源不能单独共享")

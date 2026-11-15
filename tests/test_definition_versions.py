@@ -3,13 +3,13 @@
 import pytest
 
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
-from egis_agentkit.service.team._definition import TeamDefinition
 from egis_agentkit.service._user import UserService
-from egis_agentkit.storage.model import Definition
+from egis_agentkit.service.team._definition import TeamDefinition
+from egis_agentkit.storage.model import AgentDefinition
 
 
 def expert():
-    return Definition(
+    return AgentDefinition(
         owner_id="alice",
         agent_name="writer",
         agent_display_name="写作专家",
@@ -21,7 +21,7 @@ def expert():
 async def test_agent_versions_preserve_configuration_after_an_update(storage):
     original = expert()
     async with storage.definition_write() as write:
-        await write.definitions.insert_definition(
+        await write.definitions.add_definition(
             original.model_dump(mode="json"), actor="alice"
         )
     updated = original.model_copy(
@@ -35,14 +35,14 @@ async def test_agent_versions_preserve_configuration_after_an_update(storage):
         current = await write.definitions.update_definition(
             original.id, updated.model_dump(mode="json"), actor="alice"
         )
-    assert current["config_version"] == 2
+    assert current["owner_version"] == 2
     repository = storage.definitions
     first = await repository.get_definition(original.id, version="1")
     assert first["agent_name"] == "writer"
     assert first["agent_display_name"] == "写作专家"
     assert first["payload"]["system_prompt"] == "旧版"
     assert (await repository.get_definition(original.id))["agent_name"] == "editor"
-    assert (await repository.read_view(original.id, "private", version=2))["payload"][
+    assert (await repository.get_definition_view(original.id, "private", version=2))["payload"][
         "system_prompt"
     ] == "新版"
     with pytest.raises(NotFound):
@@ -53,12 +53,12 @@ async def test_agent_versions_preserve_configuration_after_an_update(storage):
                 original.id, updated.model_dump(mode="json"), actor="alice"
             )
     async with storage.definition_write() as write:
-        await write.definitions.disable_definition(original.id, actor="alice")
+        await write.definitions.delete_definition(original.id, actor="alice")
     assert (await repository.get_definition(original.id, version=1))["payload"][
         "system_prompt"
     ] == "旧版"
     with pytest.raises(Forbidden):
-        await repository.read_view(original.id, "private", version=1)
+        await repository.get_definition_view(original.id, "private", version=1)
 
 
 @pytest.mark.asyncio
@@ -68,7 +68,7 @@ async def test_team_versions_keep_pinned_leader_and_expert_versions(storage):
     alice = await users.get("alice")
     original = expert()
     async with storage.definition_write() as write:
-        await write.definitions.insert_definition(
+        await write.definitions.add_definition(
             original.model_dump(mode="json"), actor=alice.user_id
         )
     teams = TeamDefinition(storage)
@@ -117,17 +117,11 @@ async def test_team_versions_keep_pinned_leader_and_expert_versions(storage):
     ]
 
 
-def test_agent_capabilities_own_native_record_and_personal_has_document_save():
-    from egis_agentkit.service.agent._definition_base import AgentDefinitionBase
-    from egis_agentkit.service.agent._expert_definition import ExpertDefinition
-    from egis_agentkit.service.agent._personal_definition import PersonalDefinition
-    from egis_agentkit.service.agent._remote_definition import RemoteDefinition
+def test_core_builds_native_record():
+    from egis_agentkit.core.agent._definition_base import AgentDefinitionBase
 
-    record = AgentDefinitionBase.make_record(
-        "alice", {"agent_name": "finance"}, source="team"
+    record = AgentDefinitionBase.build_agent(
+        "alice", {"agent_name": "finance", "payload": {"system_prompt": "财务专家"}}, source="team"
     )
     assert record.data.name == "finance"
     assert record.source == "team"
-    assert hasattr(PersonalDefinition, "save_documents")
-    assert not hasattr(PersonalDefinition, "save")
-    assert not issubclass(RemoteDefinition, ExpertDefinition)

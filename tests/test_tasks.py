@@ -4,8 +4,10 @@ from test_domain import expert, identities
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.extension._session_lock_override import ExecutionCoordinator
 from egis_agentkit.service._session import SessionService
-from egis_agentkit.service.agent._expert_definition import ExpertDefinition
+from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.team._definition import TeamDefinition
+
+from test_domain import agent_changes
 
 
 @pytest.mark.asyncio
@@ -13,14 +15,14 @@ async def test_new_tasks_have_distinct_native_sessions_and_owner_binding(
     storage, tmp_path
 ):
     _, _, alice, bob = await identities(storage)
-    source = await ExpertDefinition(storage).build(alice, expert())
+    source = await AgentManager(storage).add_definition(alice, expert())
     service = SessionService(storage, tmp_path)
-    first = await service.create(alice, source["id"], "private")
-    second = await service.create(alice, source["id"], "private")
+    first = await service.add_session(alice, source["id"], "private")
+    second = await service.add_session(alice, source["id"], "private")
     assert first["session_id"] != second["session_id"]
-    assert len(await service.list(alice)) == 2
+    assert len(await service.list_sessions(alice)) == 2
     with pytest.raises(Forbidden):
-        await service.get(bob, first["session_id"])
+        await service.get_session(bob, first["session_id"])
 
 
 @pytest.mark.asyncio
@@ -28,8 +30,8 @@ async def test_static_team_has_owned_orchestrator_and_new_member_states(
     storage, tmp_path
 ):
     _, _, alice, _ = await identities(storage)
-    agents = ExpertDefinition(storage)
-    member = await agents.build(alice, expert())
+    agents = AgentManager(storage)
+    member = await agents.add_definition(alice, expert())
     team = await TeamDefinition(storage).save(
         alice,
         {
@@ -47,10 +49,10 @@ async def test_static_team_has_owned_orchestrator_and_new_member_states(
     )
     changed = expert()
     changed.id = member["id"]
-    changed.config_version = member["config_version"]
+    changed.owner_version = member["owner_version"]
     changed.payload["system_prompt"] = "新版"
-    await agents.save(alice, changed)
-    task = await SessionService(storage, tmp_path).create(alice, team["id"], "private")
+    await agents.update_definition(alice, (changed).id, agent_changes(changed))
+    task = await SessionService(storage, tmp_path).add_session(alice, team["id"], "private")
     session = await storage.get_session("alice", task["agent_id"], task["session_id"])
     native_team = await storage.get_team("alice", session.team_id)
     assert native_team.leader_agent_id == task["agent_id"]
@@ -76,8 +78,8 @@ async def test_task_exposes_display_names_without_changing_runtime_identity(
     storage, tmp_path
 ):
     _, _, alice, _ = await identities(storage)
-    source = await ExpertDefinition(storage).build(alice, expert())
-    task = await SessionService(storage, tmp_path).create(
+    source = await AgentManager(storage).add_definition(alice, expert())
+    task = await SessionService(storage, tmp_path).add_session(
         alice, source["id"], "private"
     )
     assert (
@@ -99,7 +101,7 @@ async def test_task_delete_removes_only_owned_reply_associations_and_keeps_proje
     from egis_agentkit.storage import tables as t
 
     _, _, alice, _ = await identities(storage)
-    definition = await ExpertDefinition(storage).build(alice, expert())
+    definition = await AgentManager(storage).add_definition(alice, expert())
     service = SessionService(storage, tmp_path)
     if team_task:
         team = await TeamDefinition(storage).save(
@@ -117,10 +119,10 @@ async def test_task_delete_removes_only_owned_reply_associations_and_keeps_proje
                 ],
             },
         )
-        deleted = await service.create(alice, team["id"], "private")
+        deleted = await service.add_session(alice, team["id"], "private")
     else:
-        deleted = await service.create(alice, definition["id"], "private")
-    surviving = await service.create(alice, definition["id"], "private")
+        deleted = await service.add_session(alice, definition["id"], "private")
+    surviving = await service.add_session(alice, definition["id"], "private")
     assert deleted["project_id"] == surviving["project_id"]
     session_ids = [deleted["session_id"]]
     if team_task:
@@ -151,7 +153,7 @@ async def test_task_delete_removes_only_owned_reply_associations_and_keeps_proje
         area="artifacts",
     )
     async with InMemoryMessageBus() as bus:
-        await service.delete(alice, deleted["session_id"], bus)
+        await service.delete_session(alice, deleted["session_id"], bus)
     async with storage.engine.connect() as conn:
         associations = (
             (await conn.execute(select(t.reply_artifacts.c.session_id))).scalars().all()
@@ -188,9 +190,9 @@ async def test_session_delete_retries_without_losing_session_or_reply_rows(
             await super().log_trim(key, before_id)
 
     _, _, alice, _ = await identities(storage)
-    definition = await ExpertDefinition(storage).build(alice, expert())
+    definition = await AgentManager(storage).add_definition(alice, expert())
     service = SessionService(storage, tmp_path)
-    task = await service.create(alice, definition["id"], "private")
+    task = await service.add_session(alice, definition["id"], "private")
     sid = task["session_id"]
     async with storage.transaction() as conn:
         await conn.execute(
@@ -205,13 +207,13 @@ async def test_session_delete_retries_without_losing_session_or_reply_rows(
 
     async with FailingCleanupBus() as bus:
         with pytest.raises(RuntimeError, match="temporarily unavailable"):
-            await service.delete(alice, sid, bus)
+            await service.delete_session(alice, sid, bus)
         assert await storage.get_session(alice.user_id, task["agent_id"], sid)
         assert not await bus.is_locked(MessageBusKeys.session_lock(sid))
         async with storage.engine.connect() as conn:
             assert await conn.scalar(select(t.reply_artifacts.c.path)) == "report.md"
         bus.fail = False
-        await service.delete(alice, sid, bus)
+        await service.delete_session(alice, sid, bus)
     assert await storage.get_session(alice.user_id, task["agent_id"], sid) is None
     async with storage.engine.connect() as conn:
         assert await conn.scalar(select(t.reply_artifacts.c.path)) is None

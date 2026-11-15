@@ -8,10 +8,8 @@ from agentscope.message import ToolCallBlock
 from agentscope.state import AgentState
 from agentscope.tool import Read, Toolkit
 
-from egis_agentkit.extension._workspace_prompt_middleware_impl import (
-    WorkspacePromptMiddleware,
-)
-from egis_agentkit.extension._workspace_manager_impl import EgisLocalWorkspaceManager
+from egis_agentkit.service.workspace._local_manager import LocalWorkspaceManager
+from runtime_helpers import project_prompt
 from egis_agentkit.storage._message_bus import PostgresPrimitives
 
 FIXTURES = Path(__file__).parents[2] / "egis-agentkit-frontend/tests/fixtures"
@@ -19,8 +17,8 @@ MESSAGE = "Read 不支持解析此类二进制文件。"
 
 
 async def tools(root):
-    manager = EgisLocalWorkspaceManager(root)
-    workspace = await manager.get_workspace("alice", "agent", "session", "project")
+    manager = LocalWorkspaceManager(root)
+    workspace = await manager.get_workspace("alice", "agent", "session", project_id="project")
     read = next(tool for tool in await workspace.list_tools() if tool.name == "Read")
     assert type(read) is Read
     toolkit = Toolkit()
@@ -149,7 +147,7 @@ async def test_prompt_names_read_formats_without_upload_archive_instruction(tmp_
 
     work = tmp_path / ".work"
     work.mkdir()
-    prompt = await WorkspacePromptMiddleware(
+    prompt = await project_prompt(
         SimpleNamespace(workdir=work, artifacts_dir=tmp_path / "artifacts")
     ).on_system_prompt(None, "system")
     assert "uploads 归档路径" not in prompt

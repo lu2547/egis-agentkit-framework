@@ -10,7 +10,6 @@ from agentscope.permission import PermissionBehavior, PermissionDecision
 
 from egis_agentkit.errors import AgentKitError, Forbidden
 
-from ._workspace_prompt_middleware_impl import WorkspacePaths
 
 if TYPE_CHECKING:
     from agentscope.agent import Agent
@@ -25,6 +24,16 @@ DYNAMIC_TOOLS = [
     "ScheduleCreate",
     "ScheduleDelete",
 ]
+
+
+class ToolPaths(Protocol):
+    """工具策略所需的工作与交付目录，由调用方提供。"""
+
+    @property
+    def workdir(self) -> Path: ...
+
+    @property
+    def artifacts_dir(self) -> Path: ...
 
 
 class SkillAccess(Protocol):
@@ -43,7 +52,7 @@ class ToolAccessMiddleware(MiddlewareBase):
 
     def __init__(
         self,
-        scope: WorkspacePaths,
+        scope: ToolPaths,
         *,
         validate_access: Callable[[], Awaitable[None]],
         may_send_team_message: Callable[[], bool],

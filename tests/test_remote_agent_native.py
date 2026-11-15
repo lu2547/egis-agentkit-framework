@@ -17,12 +17,11 @@ from agentscope.message import TextBlock, ToolCallBlock
 from agentscope.model import ChatModelBase, ChatResponse
 from egis_agentkit_app.bootstrap import build_app
 from sqlalchemy import select
-
-from egis_agentkit.backend.nacos import NacosBootstrap, NacosClient
-from egis_agentkit.storage._remote_agent import remote_agent_runs
-
 from test_app_http import Config, app_snapshot
 from test_domain import identities
+
+from egis_agentkit.client.nacos import NacosBootstrap, NacosClient
+from egis_agentkit.storage._remote_agent import remote_agent_runs
 
 FINANCE = Path(__file__).resolve().parents[1] / "examples" / "remote_finance"
 
@@ -225,6 +224,17 @@ async def test_finance_through_native_chat_invite_and_teamsay(
                     return len(seen_reports) >= expected
 
                 await eventually(lambda: reports(1))
+
+                async def leader_idle():
+                    # 模型已收到报告不代表回复已结束；等待原生运行状态释放后再发送下一轮。
+                    response = await client.get(
+                        f"/sessions/{leader['session_id']}/messages",
+                        params={"agent_id": leader["agent_id"]},
+                    )
+                    assert response.status_code == 200, response.text
+                    return not response.json()["is_running"]
+
+                await eventually(leader_idle)
                 await chat(leader, "请组长追问")
                 await eventually(lambda: answers(member.session_id, 2))
                 await eventually(lambda: reports(2))
@@ -262,7 +272,7 @@ async def test_finance_through_native_chat_invite_and_teamsay(
                 assert stopped.is_success, stopped.text
                 provider_result = await asyncio.wait_for(asyncio.shield(job.result), 2)
                 assert provider_result["status"] == "cancelled"
-                persisted = await storage.remote_runs.get(job.request.run_id)
+                persisted = await storage.remote_runs.get_request(job.request.run_id)
                 assert persisted["result"]["status"] == "cancelled"
 
                 async def interrupted():

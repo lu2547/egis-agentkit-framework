@@ -1,107 +1,117 @@
 """保存 Agent 和 Team 的当前状态，并按版本读取不可变配置。"""
 
-from sqlalchemy import and_, func, select, text, tuple_, update
+from sqlalchemy import and_, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from egis_agentkit.backend._postgres import PostgresTransaction, transaction_connection
+from egis_agentkit.client._postgres import PostgresTransaction, transaction_connection
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
 from egis_agentkit.storage import tables as t
 from egis_agentkit.storage._access import AccessStorage
-from egis_agentkit.storage.model import Definition, utcnow
-from egis_agentkit.storage.model._base import publication_label
-from egis_agentkit.storage.model._definition import definition_options
+from egis_agentkit.storage.model import AgentDefinition, TeamDefinitionRecord, utcnow
+from egis_agentkit.storage.model._base import publication_label, resource_available
+from egis_agentkit.storage.model._definition import build_definition_options
 
 
-def definition_data(row: dict) -> dict:
-    """将存储记录转换为定义视图，并附上供引用使用的版本。"""
-    data = Definition.model_validate(
-        {k: row[k] for k in Definition.model_fields}
+def build_definition_data(row: dict) -> dict:
+    """按业务模型返回定义，统一提供资源引用使用的版本字段。"""
+    model = (
+        AgentDefinition if row["definition_type"] == "agent" else TeamDefinitionRecord
+    )
+    data = model.model_validate(
+        {key: row[key] for key in model.model_fields}
     ).model_dump(mode="json")
+    version = (
+        data["version"] if row["definition_type"] == "agent" else data["config_version"]
+    )
     return {
         **data,
-        "resource_version": str(data["config_version"]),
-        "version_label": publication_label(data["config_version"]),
+        "resource_version": str(version),
+        "version_label": publication_label(version),
     }
 
 
-def _definition_table(definition_type):
-    """按业务类型选择主表。"""
-    if definition_type == "agent":
-        return t.agent_definitions
-    if definition_type == "team":
-        return t.team_definitions
-    raise ValueError(f"Unknown definition type: {definition_type}")
+def _get_definition_table(definition_type):
+    """按业务类型选择汇总表。"""
+    return {"agent": t.agent_definition_summary, "team": t.team_definitions}[
+        definition_type
+    ]
 
 
-def _definition_record(table, row):
-    """补齐 Agent 和 Team 共用的字段。"""
-    values = {
+def _build_definition_record(table, row):
+    """为跨类型的资源读取补充统一引用字段。"""
+    if table is t.agent_definition_summary:
+        return {
+            **row,
+            "definition_type": "agent",
+            "resource_version": str(row["version"]),
+            "version_label": publication_label(row["version"]),
+        }
+    return {
         **row,
+        "definition_type": "team",
+        "agent_type": None,
+        "agent_name": None,
+        "agent_display_name": None,
         "resource_version": str(row["config_version"]),
         "version_label": publication_label(row["config_version"]),
     }
-    if table is t.agent_definitions:
-        return dict(
-            values, definition_type="agent", team_name=None, team_display_name=None
-        )
-    return dict(
-        values,
-        definition_type="team",
-        agent_type=None,
-        agent_name=None,
-        agent_display_name=None,
-    )
 
 
-def _version_table(table):
-    """找到 Agent 或 Team 主表对应的不可变版本表。"""
+def _get_version_table(table):
     return (
-        t.agent_definition_versions
-        if table is t.agent_definitions
+        t.agent_definition_detail
+        if table is t.agent_definition_summary
         else t.team_definition_versions
     )
 
 
-def _select_definition(table, version=None):
-    """从主表读取归属和状态，从版本表读取指定配置。"""
-    versions = _version_table(table)
-    kind = "agent" if table is t.agent_definitions else "team"
+def _build_definition_query(table, version=None):
+    """在数据库内关联汇总记录和指定版本明细。"""
+    details = _get_version_table(table)
+    agent = table is t.agent_definition_summary
     identity = (
         table.c.id,
         table.c.owner_type,
         table.c.owner_id,
-        table.c.is_enabled,
         table.c.created_by,
         table.c.created_at,
     )
-    if kind == "agent":
-        identity += (table.c.agent_type,)
-    position = table.c.config_version if version is None else version
-    updated_by, updated_at = table.c.updated_by, table.c.updated_at
-    if version is not None:
-        updated_by = versions.c.created_by.label("updated_by")
-        updated_at = versions.c.created_at.label("updated_at")
+    if agent:
+        identity += (
+            table.c.agent_type,
+            table.c.deleted_at,
+            table.c.owner_version,
+            table.c.shared_version,
+        )
+        selected = table.c.owner_version if version is None else version
+        version_column = details.c.version
+    else:
+        identity += (table.c.is_enabled,)
+        selected = table.c.config_version if version is None else version
+        version_column = details.c.config_version
+    kind = "agent" if agent else "team"
     return select(
         *identity,
-        versions.c[f"{kind}_name"],
-        versions.c[f"{kind}_display_name"],
-        versions.c.config_version,
-        versions.c.payload,
-        updated_by,
-        updated_at,
+        details.c[f"{kind}_name"],
+        details.c[f"{kind}_display_name"],
+        version_column,
+        details.c.payload,
+        (details.c.created_by if version is not None else table.c.updated_by).label(
+            "updated_by"
+        ),
+        (details.c.created_at if version is not None else table.c.updated_at).label(
+            "updated_at"
+        ),
     ).select_from(
         table.join(
-            versions,
-            and_(
-                versions.c.definition_id == table.c.id,
-                versions.c.config_version == position,
-            ),
+            details,
+            and_(details.c.definition_id == table.c.id, version_column == selected),
         )
     )
 
 
-def _version_number(version):
+def _validate_version_number(version):
     """把公开引用的十进制字符串转换为有效的数据库版本号。"""
     value = str(version)
     if (
@@ -121,12 +131,15 @@ class DefinitionStorage:
     def __init__(self, engine: AsyncEngine | PostgresTransaction):
         """使用连接池或调用方已经打开的事务。"""
         self.engine = engine
+        from .agent._definition import AgentDefinitionStorage
 
-    async def _first(self, statement, *, conn=None):
+        self.agents = AgentDefinitionStorage(engine)
+
+    async def _get_first_record(self, statement, *, conn=None):
         """读取查询返回的第一条记录。"""
         if conn is None:
             async with self.engine.connect() as connection:
-                return await self._first(statement, conn=connection)
+                return await self._get_first_record(statement, conn=connection)
         row = (await conn.execute(statement)).mappings().first()
         return dict(row) if row is not None else None
 
@@ -141,14 +154,14 @@ class DefinitionStorage:
                 )
         row = await self._find_definition(
             definition_id,
-            version=_version_number(version) if version is not None else None,
+            version=_validate_version_number(version) if version is not None else None,
             conn=conn,
         )
         if row is None:
             raise NotFound()
         return row
 
-    async def locked_definition(
+    async def get_locked_definition(
         self, definition_id: str, *, conn: AsyncConnection | None = None
     ) -> dict | None:
         """在当前事务锁定定义 ID 与已有主记录。"""
@@ -164,7 +177,7 @@ class DefinitionStorage:
         self, definition_id: str, *, conn: AsyncConnection | None = None
     ) -> dict:
         """在当前写事务内锁定已有定义，缺失时终止更新。"""
-        row = await self.locked_definition(definition_id, conn=conn)
+        row = await self.get_locked_definition(definition_id, conn=conn)
         if row is None:
             raise NotFound()
         return row
@@ -173,34 +186,34 @@ class DefinitionStorage:
         self, definition_id, *, conn, version=None, locked=False
     ):
         """跨两张主表查找定义，写入时只锁定主记录。"""
-        for table in (t.agent_definitions, t.team_definitions):
-            query = _select_definition(table, version).where(
+        for table in (t.agent_definition_summary, t.team_definitions):
+            query = _build_definition_query(table, version).where(
                 table.c.id == definition_id
             )
-            row = await self._first(
+            row = await self._get_first_record(
                 query.with_for_update(of=table) if locked else query, conn=conn
             )
             if row is not None:
-                return _definition_record(table, row)
+                return _build_definition_record(table, row)
         return None
 
-    async def approved_review(
+    async def get_approved_review(
         self, resource_id: str, *, resource_type: str | None = None, conn=None
     ) -> dict | None:
         """查询资源当前通过的共享审核。"""
-        return await AccessStorage(self.engine).approved_review(
+        return await AccessStorage(self.engine).get_approved_review(
             resource_id, resource_type=resource_type, conn=conn
         )
 
-    async def read_reference(self, reference: dict) -> dict:
+    async def get_definition_by_reference(self, reference: dict) -> dict:
         """读取已有会话保留的固定定义。"""
-        return await self.read_view(
+        return await self.get_definition_view(
             reference["definition_id"],
             reference["resource_view_type"],
-            **definition_options(reference),
+            **build_definition_options(reference),
         )
 
-    async def read_view(
+    async def get_definition_view(
         self,
         definition_id: str,
         view: str,
@@ -215,7 +228,7 @@ class DefinitionStorage:
         """按显式版本、授权或审批读取定义，调用方负责校验使用权。"""
         if conn is None:
             async with self.engine.connect() as connection:
-                return await self.read_view(
+                return await self.get_definition_view(
                     definition_id,
                     view,
                     version=version,
@@ -226,7 +239,7 @@ class DefinitionStorage:
                     conn=connection,
                 )
         row = await self.get_definition(definition_id, conn=conn)
-        if not row["is_enabled"]:
+        if not resource_available(row):
             raise Forbidden("资源已停用")
         if (view == "system") != (row["owner_type"] == "system"):
             raise Forbidden("资源视图不匹配")
@@ -250,7 +263,7 @@ class DefinitionStorage:
         elif review_id is not None:
             if view != "shared":
                 raise Forbidden("资源视图不匹配")
-            review = await access.approved_review(
+            review = await access.get_approved_review(
                 definition_id,
                 resource_type=row["definition_type"],
                 review_id=review_id,
@@ -260,20 +273,22 @@ class DefinitionStorage:
                 raise Forbidden("资源尚未通过共享审核")
             metadata["shared_review_id"] = review["review_id"]
         if view == "shared" and not dependency:
-            shared = await access.shared_version(row["definition_type"], definition_id, conn=conn)
+            shared = await access.shared_version(
+                row["definition_type"], definition_id, conn=conn
+            )
             if shared is None:
                 raise Forbidden("资源尚未共享")
             if not (allow_pinned and grant_id is not None and version is not None):
                 selected = shared
         if view == "system" and grant_id is not None and not allow_pinned:
-            selected = row["config_version"]
+            selected = row["resource_version"]
         if version is not None and str(version) != str(selected):
             raise Forbidden("资源版本与授权不匹配")
-        if selected is not None and str(row["config_version"]) != str(selected):
+        if selected is not None and str(row["resource_version"]) != str(selected):
             row = await self.get_definition(definition_id, version=selected, conn=conn)
-        if not row["is_enabled"]:
+        if not resource_available(row):
             raise Forbidden("资源已停用")
-        return {**definition_data(row), "resource_view_type": view, **metadata}
+        return {**build_definition_data(row), "resource_view_type": view, **metadata}
 
     async def list_versions(self, definition_id: str, *, conn=None) -> list[str]:
         """按版本从新到旧列出定义的版本号，调用方决定可见范围。"""
@@ -281,66 +296,64 @@ class DefinitionStorage:
             async with self.engine.connect() as connection:
                 return await self.list_versions(definition_id, conn=connection)
         definition = await self.get_definition(definition_id, conn=conn)
-        versions = _version_table(_definition_table(definition["definition_type"]))
+        versions = _get_version_table(
+            _get_definition_table(definition["definition_type"])
+        )
+        number = (
+            versions.c.version
+            if definition["definition_type"] == "agent"
+            else versions.c.config_version
+        )
         rows = await conn.execute(
-            select(versions.c.config_version)
+            select(number)
             .where(versions.c.definition_id == definition_id)
-            .order_by(versions.c.config_version.desc())
+            .order_by(number.desc())
         )
         return [str(version) for version in rows.scalars()]
 
-    async def grantable_versions(self, kind, *, excluded_agent_types):
-        """一次读取每项可独立授权的已启用定义。"""
-        identity = _definition_table(kind)
-        versions = _version_table(identity)
-        statement = (
-            select(
-                identity.c.id,
-                identity.c.owner_type,
-                identity.c.owner_id,
-                versions.c.config_version,
-                versions.c[f"{kind}_display_name"],
-            )
-            .join(versions, and_(
-                versions.c.definition_id == identity.c.id,
-                versions.c.config_version == func.coalesce(
-                    identity.c.shared_version, identity.c.config_version
-                ),
-            ))
-            .where(identity.c.is_enabled)
-            .order_by(identity.c.created_at.desc(), versions.c.config_version.desc())
+    async def list_grantable_versions(self, kind, *, excluded_agent_types):
+        """读取每项可独立授权的当前共享版本或所有者版本。"""
+        identity = _get_definition_table(kind)
+        owner = (
+            identity.c.owner_version if kind == "agent" else identity.c.config_version
         )
+        selected = func.coalesce(identity.c.shared_version, owner)
+        query = _build_definition_query(identity, selected)
         if kind == "agent":
-            statement = statement.where(
-                identity.c.agent_type.not_in(excluded_agent_types)
+            query = query.where(
+                identity.c.deleted_at.is_(None),
+                identity.c.agent_type.not_in(excluded_agent_types),
             )
-        async with self.engine.connect() as conn:
-            rows = await conn.execute(statement)
-            return [
-                {**row, "resource_version": str(row["config_version"])}
-                for row in rows.mappings()
-            ]
+        else:
+            query = query.where(identity.c.is_enabled)
+        async with self.engine.connect() as connection:
+            rows = (
+                await connection.execute(query.order_by(identity.c.created_at.desc()))
+            ).mappings()
+            return [_build_definition_record(identity, row) for row in rows]
 
-    async def read_catalog(
+    async def list_definitions_and_reviews(
         self, definition_type="agent", *, conn=None
     ) -> tuple[list[dict], dict[tuple[str, str], str]]:
         """读取当前定义及目录候选的各版本审核状态。"""
         if conn is None:
             async with self.engine.connect() as connection:
-                return await self.read_catalog(definition_type, conn=connection)
-        table = _definition_table(definition_type)
+                return await self.list_definitions_and_reviews(
+                    definition_type, conn=connection
+                )
+        table = _get_definition_table(definition_type)
         rows = [
-            _definition_record(table, row)
+            _build_definition_record(table, row)
             for row in (
                 await conn.execute(
-                    _select_definition(table).order_by(table.c.created_at.desc())
+                    _build_definition_query(table).order_by(table.c.created_at.desc())
                 )
             ).mappings()
         ]
-        states = await self._review_states(definition_type, rows, conn=conn)
+        states = await self._get_review_states(definition_type, rows, conn=conn)
         return rows, states
 
-    async def _review_states(self, kind, records, *, conn):
+    async def _get_review_states(self, kind, records, *, conn):
         """每个资源版本只取最近一条共享审核状态。"""
         if not records:
             return {}
@@ -375,78 +388,25 @@ class DefinitionStorage:
         )
         return {(identifier, version): status for identifier, version, status in rows}
 
-    async def page_agents(self, types, *, after, limit):
-        """按创建时间和 ID 读取一批候选定义及各版本的审核状态。"""
-        table = t.agent_definitions
-        position = tuple_(table.c.created_at, table.c.id)
-        query = _select_definition(table).where(
-            table.c.is_enabled, table.c.agent_type.in_(types)
-        )
-        if after is not None:
-            query = query.where(position < tuple_(*after))
-        async with self.engine.connect() as conn:
-            records = (
-                (
-                    await conn.execute(
-                        query.order_by(
-                            table.c.created_at.desc(), table.c.id.desc()
-                        ).limit(limit)
-                    )
-                )
-                .mappings()
-                .all()
-            )
-            states = await self._review_states("agent", records, conn=conn)
-            return [_definition_record(table, row) for row in records], states
+    async def get_or_add_personal(self, values, *, actor, conn=None):
+        return await self.agents.get_or_add_personal(values, actor=actor, conn=conn)
 
-    async def list_enabled_experts_after(self, after: str, *, limit: int) -> list[dict]:
-        """按 ID 扫描已启用专家的当前定义。"""
-        table = t.agent_definitions
-        async with self.engine.connect() as conn:
-            rows = await conn.execute(
-                _select_definition(table)
-                .where(
-                    table.c.agent_type.in_(("expert", "remote")),
-                    table.c.is_enabled,
-                    table.c.id > after,
-                )
-                .order_by(table.c.id)
-                .limit(limit)
-            )
-            return [_definition_record(table, row) for row in rows.mappings()]
-
-    async def ensure_personal(
-        self, values: dict, *, actor: str, conn: AsyncConnection | None = None
-    ):
-        """创建或读取个人助理，只锁当前定义。"""
-        if conn is None and isinstance(self.engine, AsyncEngine):
-            async with self.engine.begin() as connection:
-                return await self.ensure_personal(values, actor=actor, conn=connection)
-        conn = transaction_connection(self.engine, conn)
-        previous = await self.locked_definition(values["id"], conn=conn)
-        if previous is not None and (
-            previous["agent_type"] != "personal"
-            or previous["owner_id"] != values["owner_id"]
-        ):
-            raise Conflict("个人助理 ID 已被占用")
-        if previous is not None:
-            return previous
-        return await self._insert_first_version(values, actor=actor, conn=conn)
-
-    async def insert_definition(
+    async def add_definition(
         self, values: dict, *, actor: str, conn: AsyncConnection | None = None
     ) -> dict:
         """插入首版定义，在同一事务内保证 ID 全局唯一。"""
+        if values["definition_type"] == "agent":
+            return await self.agents.add_definition(values, actor=actor, conn=conn)
         conn = transaction_connection(self.engine, conn)
-        if await self.locked_definition(values["id"], conn=conn) is not None:
+        if await self.get_locked_definition(values["id"], conn=conn) is not None:
             raise Conflict("定义已存在")
-        return await self._insert_first_version(values, actor=actor, conn=conn)
+        return await self._add_first_version(values, actor=actor, conn=conn)
 
-    async def _insert_first_version(self, values, *, actor, conn) -> dict:
+    async def _add_first_version(self, values, *, actor, conn) -> dict:
         """持有定义锁时，在同一事务中写入主记录和首版。"""
         if values["config_version"] != 1:
             raise Conflict("新资源的 config_version 必须为 1")
-        table = _definition_table(values["definition_type"])
+        table = _get_definition_table(values["definition_type"])
         fields = {key: value for key, value in values.items() if key in table.c}
         if table is t.team_definitions:
             fields["orchestrator_id"] = values["payload"]["orchestrator"][
@@ -462,12 +422,12 @@ class DefinitionStorage:
                 updated_at=now,
             )
         )
-        await self._insert_version(table, values, 1, actor=actor, now=now, conn=conn)
+        await self._add_version(table, values, 1, actor=actor, now=now, conn=conn)
         return await self.get_definition(values["id"], conn=conn)
 
-    async def _insert_version(self, table, values, version, *, actor, now, conn):
+    async def _add_version(self, table, values, version, *, actor, now, conn):
         """只追加版本记录，已有版本没有更新入口。"""
-        versions = _version_table(table)
+        versions = _get_version_table(table)
         fields = {
             key: values[key]
             for key in (
@@ -498,10 +458,14 @@ class DefinitionStorage:
         conn: AsyncConnection | None = None,
     ) -> dict:
         """匹配当前版本后推进指针，并追加下一版定义配置。"""
+        if values["definition_type"] == "agent":
+            return await self.agents.update_definition(
+                definition_id, values, actor=actor, conn=conn
+            )
         conn = transaction_connection(self.engine, conn)
         expected = values["config_version"]
         kind = values["definition_type"]
-        table = _definition_table(kind)
+        table = _get_definition_table(kind)
         name = f"{kind}_name"
         identity = {"owner_type": values["owner_type"], "owner_id": values["owner_id"]}
         if kind == "agent":
@@ -529,20 +493,24 @@ class DefinitionStorage:
         )
         if result.rowcount != 1:
             raise Conflict()
-        await self._insert_version(
+        await self._add_version(
             table, values, expected + 1, actor=actor, now=now, conn=conn
         )
         return await self.get_definition(definition_id, conn=conn)
 
-    async def disable_definition(
+    async def delete_definition(
         self, definition_id: str, *, actor: str, conn: AsyncConnection | None = None
     ) -> None:
         """停用主记录并保留所有已发布配置。"""
         conn = transaction_connection(self.engine, conn)
-        record = await self.locked_definition(definition_id, conn=conn)
+        record = await self.get_locked_definition(definition_id, conn=conn)
         if record is None:
             raise NotFound()
-        table = _definition_table(record["definition_type"])
+        if record["definition_type"] == "agent":
+            return await self.agents.delete_definition(
+                definition_id, actor=actor, conn=conn
+            )
+        table = _get_definition_table(record["definition_type"])
         await conn.execute(
             update(table)
             .where(table.c.id == definition_id)

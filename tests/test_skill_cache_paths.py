@@ -5,13 +5,13 @@ import pytest
 from test_domain import COMPANY, identities
 from test_resources import archive, put_asset
 
-from egis_agentkit.errors import Forbidden
 from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.errors import Forbidden
+from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.agent._personal_manager import PersonalManager
 from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.service.resource._skill import skill_archive_digest
-from egis_agentkit.service.agent._expert_definition import ExpertDefinition
-from egis_agentkit.service.agent._personal_definition import PersonalDefinition
-from egis_agentkit.storage.model import Definition, Grant
+from egis_agentkit.storage.model import AgentDefinition, Grant
 
 
 @pytest.mark.asyncio
@@ -21,10 +21,10 @@ async def test_bound_agent_cache_shared_across_users_and_isolated_by_definition(
     _, admin, alice, bob = await identities(storage)
     resources = ResourceService(storage, tmp_path)
     await put_asset(storage, checksum=skill_archive_digest(archive()))
-    agents = ExpertDefinition(storage)
+    agents = AgentManager(storage)
 
     async def create(name):
-        data = Definition(
+        data = AgentDefinition(
             owner_type="system",
             owner_id="sys",
             agent_name=name,
@@ -40,7 +40,7 @@ async def test_bound_agent_cache_shared_across_users_and_isolated_by_definition(
                 ],
             },
         )
-        row = await agents.build(admin, data)
+        row = await agents.add_definition(admin, data)
         await GrantService(storage).grant(
             admin,
             Grant(
@@ -53,7 +53,7 @@ async def test_bound_agent_cache_shared_across_users_and_isolated_by_definition(
                 resource_owner_id="sys",
             ),
         )
-        snapshot = await storage.definitions.read_view(row["id"], "system")
+        snapshot = await storage.definitions.get_definition_view(row["id"], "system")
         return row, snapshot
 
     first, snap = await create("first")
@@ -103,9 +103,9 @@ async def test_private_skill_personal_and_unscoped_use_user_cache(storage, tmp_p
     )
     result = await resources.materialize_skill(alice, "report", "1.0.0")
     assert Path(result.dir).parent == tmp_path / "user" / "alice" / "skills" / "report"
-    await resources.installations.install(alice, "skill", "report", "1.0.0")
-    personal = await PersonalDefinition(storage).build(alice)
-    snapshot = await storage.definitions.read_view(personal["id"], "private")
+    await resources.install(alice, "skill", "report")
+    personal = await PersonalManager(storage).get_or_add_definition(alice)
+    snapshot = await storage.definitions.get_definition_view(personal["id"], "private")
     scope = SimpleNamespace(
         user_id="alice",
         definition=personal,
@@ -172,7 +172,7 @@ async def test_persisted_unsafe_asset_paths_are_rejected(
     "field,value",
     [
         ("id", "../escape"),
-        ("config_version", "../escape"),
+        ("version", "../escape"),
         ("id", ".."),
     ],
 )
@@ -184,9 +184,9 @@ async def test_unsafe_agent_cache_segments_are_rejected(
     _, admin, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
     await put_asset(storage, checksum=skill_archive_digest(archive()))
-    row = await ExpertDefinition(storage).build(
+    row = await AgentManager(storage).add_definition(
         admin,
-        Definition(
+        AgentDefinition(
             owner_type="system",
             owner_id="sys",
             agent_name="agent",
@@ -215,7 +215,7 @@ async def test_unsafe_agent_cache_segments_are_rejected(
             resource_owner_id="sys",
         ),
     )
-    snapshot = await storage.definitions.read_view(row["id"], "system")
+    snapshot = await storage.definitions.get_definition_view(row["id"], "system")
     definition = deepcopy(row)
     definition[field] = value
     scope = SimpleNamespace(
@@ -238,9 +238,9 @@ async def test_bound_agent_cache_rejects_symlinked_definition_ancestor(
     _, admin, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
     await put_asset(storage, checksum=skill_archive_digest(archive()))
-    row = await ExpertDefinition(storage).build(
+    row = await AgentManager(storage).add_definition(
         admin,
-        Definition(
+        AgentDefinition(
             owner_type="system",
             owner_id="sys",
             agent_name="agent",
@@ -269,7 +269,7 @@ async def test_bound_agent_cache_rejects_symlinked_definition_ancestor(
             resource_owner_id="sys",
         ),
     )
-    snapshot = await storage.definitions.read_view(row["id"], "system")
+    snapshot = await storage.definitions.get_definition_view(row["id"], "system")
     scope = SimpleNamespace(
         user_id="alice",
         definition=row,

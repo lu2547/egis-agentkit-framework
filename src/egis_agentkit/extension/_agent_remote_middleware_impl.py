@@ -1,25 +1,32 @@
 """实现 MiddlewareBase，在模型调用时执行远程专家并将结果交给原生流程。"""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
 import re
+from typing import Any, AsyncIterator, Awaitable, Callable, Sequence
 
+from agentscope.agent import Agent
 from agentscope.app._bus_ops import publish_session_event
 from agentscope.app._tool import TeamSay
-from agentscope.event import CustomEvent
+from agentscope.event import AgentEvent, CustomEvent
 from agentscope.message import Msg, TextBlock, ToolCallBlock, ToolResultState, URLSource
 from agentscope.middleware import MiddlewareBase
 from agentscope.model import ChatResponse
 from agentscope.tool import ToolResponse
+from sqlalchemy.engine import RowMapping
 
-from egis_agentkit.service.agent._remote_base import RemoteAgentBase
+from egis_agentkit.client.remote_agent._base import RemoteAgentClientBase
 from egis_agentkit.storage.model._remote_agent import (
     RemoteAttachmentRef,
     RemoteRunRequest,
     RemoteRunResult,
-    valid_endpoint,
 )
+from egis_agentkit.storage.model.agent._remote_config import validate_endpoint
+
+from ._remote_agent_callback import RemoteAgentRuntime
 
 logger = logging.getLogger(__name__)
 _TEAM_MESSAGE = re.compile(r'<team-message from="[^"]+">\n(.*)\n</team-message>$', re.S)
@@ -28,16 +35,27 @@ _REPORT_PREFIX = "remote-report-"
 
 class RemoteAgentMiddlewareImpl(MiddlewareBase):
     def __init__(
-        self, remote: RemoteAgentBase, session_id: str, leader_name: str | None
-    ):
+        self,
+        remote: RemoteAgentClientBase,
+        session_id: str,
+        leader_name: str | None,
+        *,
+        runtime: RemoteAgentRuntime,
+    ) -> None:
         super().__init__()
         self.remote = remote
+        self.runtime = runtime
         self.session_id, self.leader_name = session_id, leader_name
         self._messages: list[Msg] = []
         self._seen_sources: set[str] = set()
         self._request: RemoteRunRequest | None = None
 
-    async def on_reply(self, agent, input_kwargs, next_handler):
+    async def on_reply(
+        self,
+        agent: Agent,
+        input_kwargs: dict[str, Any],
+        next_handler: Callable[..., AsyncIterator[AgentEvent | Msg]],
+    ) -> AsyncIterator[AgentEvent | Msg]:
         inputs = input_kwargs.get("inputs")
         messages = inputs if isinstance(inputs, list) else [inputs]
         # Native input preparation rewrites unsupported media into workspace
@@ -59,7 +77,7 @@ class RemoteAgentMiddlewareImpl(MiddlewareBase):
         async for event in next_handler(**input_kwargs):
             yield event
 
-    def _next_request(self, context):
+    def _build_next_request(self, context: Sequence[Msg]) -> RemoteRunRequest | None:
         texts, source_ids, attachments = [], [], []
         for msg in self._messages:
             if msg.role != "user" or msg.id in self._seen_sources:
@@ -72,7 +90,7 @@ class RemoteAgentMiddlewareImpl(MiddlewareBase):
                 if not isinstance(block.source, URLSource):
                     continue
                 url = str(block.source.url)
-                if valid_endpoint(url, {"https"}):
+                if validate_endpoint(url, {"https"}):
                     attachments.append(
                         RemoteAttachmentRef(
                             ref=url,
@@ -115,7 +133,12 @@ class RemoteAgentMiddlewareImpl(MiddlewareBase):
             attachments=attachments,
         )
 
-    async def on_model_call(self, agent, input_kwargs, next_handler):
+    async def on_model_call(
+        self,
+        agent: Agent,
+        input_kwargs: dict[str, Any],
+        next_handler: Callable[..., Awaitable[ChatResponse]],
+    ) -> ChatResponse:
         reply_id = agent.state.reply_id
         reply_messages = [
             message
@@ -133,18 +156,18 @@ class RemoteAgentMiddlewareImpl(MiddlewareBase):
                 None,
             )
             if report_call is not None:
-                row = await self._report_row(report_call)
+                row = await self._get_report_record(report_call)
                 if not row or row["reported_at"] is None:
                     raise RuntimeError("远程专家结果未能通过 TeamSay 汇报给组长")
                 result = RemoteRunResult.model_validate(row["result"])
-                upcoming = self._next_request(agent.state.context)
+                upcoming = self._build_next_request(agent.state.context)
                 if upcoming is None:
                     return ChatResponse(
                         content=[TextBlock(text=result.output.text)], is_last=True
                     )
                 self._request = upcoming
         if self._request is None:
-            self._request = self._next_request(agent.state.context)
+            self._request = self._build_next_request(agent.state.context)
         if self._request is None:
             return ChatResponse(
                 content=[TextBlock(text="请提供要交给远程专家的任务。")], is_last=True
@@ -156,10 +179,10 @@ class RemoteAgentMiddlewareImpl(MiddlewareBase):
         ):
             raise RuntimeError("远程专家成员缺少已授权的原生 TeamSay")
 
-        async def progress(message):
+        async def progress(message: str) -> None:
             try:
                 await publish_session_event(
-                    self.remote.service.bus,
+                    self.runtime.bus,
                     self.session_id,
                     CustomEvent(
                         name="remote_agent_progress",
@@ -173,7 +196,7 @@ class RemoteAgentMiddlewareImpl(MiddlewareBase):
             except Exception:
                 logger.warning("Remote expert progress could not be published")
 
-        result = await self.remote.run(self._request, progress)
+        result = await self.runtime.send_request(self.remote, self._request, progress)
         if result.status == "timed_out":
             raise TimeoutError(result.error.message)
         if result.output is None:
@@ -198,9 +221,9 @@ class RemoteAgentMiddlewareImpl(MiddlewareBase):
             is_last=True,
         )
 
-    async def _report_row(self, tool_call):
+    async def _get_report_record(self, tool_call: ToolCallBlock) -> RowMapping | None:
         run_id = tool_call.id.removeprefix(_REPORT_PREFIX)
-        row = await self.remote.service.runs.get(run_id)
+        row = await self.runtime.runs.get_request(run_id)
         if row is not None and (
             row["conversation_id"] == self.session_id
             and row["connection_id"] == self.remote.connection_id
@@ -208,10 +231,15 @@ class RemoteAgentMiddlewareImpl(MiddlewareBase):
             return row
         return None
 
-    async def on_acting(self, agent, input_kwargs, next_handler):
+    async def on_acting(
+        self,
+        agent: Agent,
+        input_kwargs: dict[str, Any],
+        next_handler: Callable[..., AsyncIterator[ToolResponse]],
+    ) -> AsyncIterator[ToolResponse]:
         call = input_kwargs["tool_call"]
         row = (
-            await self._report_row(call)
+            await self._get_report_record(call)
             if self.leader_name is not None
             and call.name == "TeamSay"
             and call.id.startswith(_REPORT_PREFIX)
@@ -236,5 +264,5 @@ class RemoteAgentMiddlewareImpl(MiddlewareBase):
                 and isinstance(response, ToolResponse)
                 and response.state == ToolResultState.SUCCESS
             ):
-                await self.remote.service.runs.mark_reported(row["run_id"])
+                await self.runtime.runs.update_reported(row["run_id"])
             yield response

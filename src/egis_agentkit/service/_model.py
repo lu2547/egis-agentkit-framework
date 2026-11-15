@@ -7,7 +7,7 @@ from hashlib import sha256
 from agentscope.app.storage import ChatModelConfig
 from agentscope.credential import CredentialFactory
 
-from egis_agentkit.backend.nacos._settings import AgentKitConfig, ModelSpec
+from egis_agentkit.client.nacos._settings import AgentKitConfig, ModelSpec
 from egis_agentkit.errors import Forbidden, NotFound
 
 

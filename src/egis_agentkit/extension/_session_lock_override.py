@@ -10,17 +10,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agentscope.app.message_bus import MessageBusKeys
-from agentscope.app.storage import AgentData, AgentRecord, SessionRecord
+from agentscope.app.storage import AgentRecord, SessionRecord
 
-from egis_agentkit.backend.nacos._settings import AccessConfig, AgentKitConfig
+from egis_agentkit.client.nacos._settings import AccessConfig, AgentKitConfig
+from egis_agentkit.core.agent._definition_base import AgentDefinitionBase
+from egis_agentkit.core.agent._personal_definition import PersonalDefinition
 from egis_agentkit.errors import AgentKitError, Forbidden, NotFound
 from egis_agentkit.extension._message_bus_impl import EgisMessageBus
-from egis_agentkit.service._project import ProjectService
 from egis_agentkit.service._user import UserService
 from egis_agentkit.service.access._permission import PermissionService
+from egis_agentkit.service.agent._personal_manager import PersonalManager
+from egis_agentkit.service.project._project_manager import ProjectManager
 from egis_agentkit.service.team._collaboration import validate_collaborators
-from egis_agentkit.service.team._definition import team_member_definitions
-from egis_agentkit.storage._workspace import WorkspaceFiles
+from egis_agentkit.service.team._members import team_member_definitions
+from egis_agentkit.storage.project._files import ProjectFileStorage
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,7 @@ class ExecutionScope:
     collaborator_definitions: dict = field(default_factory=dict)
     member_definitions: dict = field(default_factory=dict)
     configuration: AgentKitConfig | None = None
+    preferences: dict[str, str] | None = None
 
 
 execution_scope: ContextVar[ExecutionScope | None] = ContextVar(
@@ -68,16 +72,20 @@ class ExecutionCoordinator:
         models=None,
         projects=None,
         users=None,
+        personal=None,
     ):
         self.storage = storage
-        self.files = WorkspaceFiles(Path(workspace_root))
+        self.files = ProjectFileStorage(Path(workspace_root))
         self.config_provider = config_provider
         self.models = models
+        self.personal = personal or PersonalManager(
+            storage, workspace_root=workspace_root, config=config_provider
+        )
         self.users = users if users is not None else UserService(storage)
         self.projects = (
             projects
             if projects is not None
-            else ProjectService(storage, workspace_root)
+            else ProjectManager(storage, workspace_root)
         )
 
     @asynccontextmanager
@@ -102,7 +110,7 @@ class ExecutionCoordinator:
         policies = configuration.access if configuration is not None else None
         permissions = PermissionService(self.storage, policies)
         # 普通回复、工具确认恢复和 Team 成员均使用会话绑定的版本。
-        root = await self.storage.definitions.read_reference(binding)
+        root = await self.storage.definitions.get_definition_by_reference(binding)
         members = await team_member_definitions(self.storage, root)
         definition = members.get(binding["agent_definition_id"])
         if definition is None:
@@ -146,6 +154,9 @@ class ExecutionCoordinator:
             collaborator_definitions=invited,
             member_definitions=members,
             configuration=configuration,
+            preferences=await self.personal.get_preferences(user)
+            if definition["agent_type"] == "personal"
+            else None,
         )
         async with projects.guard(user, project["id"]):
             await asyncio.to_thread(projects.initialize_files, user_id, project["id"])
@@ -203,17 +214,14 @@ class ScopedMessageBus(EgisMessageBus):
 
 
 def projected_agent(record: AgentRecord, scope: ExecutionScope) -> AgentRecord:
-    data = scope.definition
-    # 仅用固定的定义配置装配本轮 Agent，保留原生数据 ID。
-    return record.model_copy(
-        update={
-            "data": AgentData(
-                id=record.data.id,
-                name=data["agent_name"],
-                system_prompt=data["payload"]["system_prompt"],
-            )
-        },
-        deep=True,
+    definition = scope.definition
+    personal = definition["agent_type"] == "personal"
+    builder = PersonalDefinition if personal else AgentDefinitionBase
+    return builder.build_agent(
+        record.user_id,
+        definition,
+        record=record,
+        preferences=getattr(scope, "preferences", None),
     )
 
 

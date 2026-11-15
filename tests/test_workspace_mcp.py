@@ -6,7 +6,7 @@ from agentscope.mcp import HttpMCPConfig, MCPClient
 from test_domain import identities
 
 from egis_agentkit.extension._session_lock_override import execution_scope
-from egis_agentkit.extension._workspace_manager_impl import EgisLocalWorkspaceManager
+from egis_agentkit.service.workspace._local_manager import LocalWorkspaceManager
 
 
 @pytest.mark.asyncio
@@ -36,7 +36,7 @@ async def test_native_workspace_connects_and_reuses_stateful_mcp_per_session(
                 )
             ]
 
-    manager = EgisLocalWorkspaceManager(tmp_path, Resources())
+    manager = LocalWorkspaceManager(tmp_path, Resources())
     async with manager:
         first = None
         for sid in ("s1", "s1", "s2"):
