@@ -151,7 +151,7 @@ class ProjectManager:
 
         # 1. 先释放远程运行实例及其目录挂载，失败时保留项目记录以便重试。
         if self.workspaces is not None:
-            await self.workspaces.release_project(user_id, project_id)
+            await self.workspaces.destroy_workspaces(user_id, project_id)
 
         # 原生删除只清理借用专家的会话，借用的 Agent 由主会话持有。
         owned_projections = set()

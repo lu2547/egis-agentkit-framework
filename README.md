@@ -35,9 +35,9 @@ Agent 当前实现见 [Agent 管理与定义](./docs/Agent管理与定义.md)，
 
 项目共享工作空间与删除规则见 [文件生命周期](docs/session-files.md)。
 
-OpenSandbox Docker 工作区已通过 `SandboxManager` 接入，继承原生 `OpenSandboxWorkspaceManager`。缓存、并发复用、TTL、暂停和重连使用原生实现；企业扩展只负责项目归属、挂载和授权资源装配。运行容器按用户、项目、Agent、会话隔离，同一绑定复用环境；项目上传资料只读，`.work/`、`artifacts/` 可写，项目数据仍由文件存储共享和持久化，不新增工作区表。
+OpenSandbox Docker 工作区已通过 `EgisSandboxManager` 接入，继承原生 `OpenSandboxWorkspaceManager`。缓存、并发复用、TTL、暂停和重连使用原生实现；Manager 只负责执行绑定和实例生命周期；Core 负责项目挂载及工具执行。授权资源由 SessionService 调用 ResourceService.prepare_workspace 装载。运行容器按用户、项目、Agent、会话隔离，同一绑定复用环境；项目上传资料只读，`.work/`、`artifacts/` 可写，项目数据仍由文件存储共享和持久化，不新增工作区表。
 
-部署时安装 `uv sync --extra opensandbox`，在 Nacos `agentkit.workspace.runtime` 设置 `mode: opensandbox`，并填写示例中的 `opensandbox` 配置。`root` 是应用访问的持久根目录，`hostRoot` 是 Docker daemon 看到的同一份存储；两者可以不同，但相对目录必须一致。OpenSandbox 服务的 `storage.allowed_host_paths` 必须包含该宿主根目录；本地 compose 通过 `AGENTKIT_WORKSPACE_HOST_ROOT` 设置白名单和服务端只读挂载。API 进程使用 `apiKeyEnv` 引用的环境变量，不把密钥写进 Nacos。切换运行模式、镜像和挂载后需要重启 API。
+部署时安装 `uv sync --extra opensandbox`，在 Nacos `agentkit.workspace.runtime` 设置 `mode: opensandbox`，并填写示例中的 `opensandbox` 配置。`root` 是应用访问的持久根目录，`hostRoot` 是 Docker daemon 看到的同一份存储；两者可以不同，但相对目录必须一致。OpenSandbox 服务的 `storage.allowed_host_paths` 必须包含该宿主根目录；本地 compose 通过 `AGENTKIT_WORKSPACE_HOST_ROOT` 设置白名单和服务端只读挂载。API 进程使用 `apiKeyEnv` 引用的环境变量，不把密钥写进 Nacos。修改镜像和挂载后需要重启 API；仅支持 OpenSandbox Docker 运行时。
 
 工具通过 OpenSandbox Backend 执行；MCP 通过容器内原生网关连接，连接配置不写入 `.mcp`，网关临时内容只允许经过启动时验证为 tmpfs 的 `gatewayTmpDir`；技能在激活后暂存完整再安装，完成的同一内容直接复用，授权失效会移除运行副本。持久激活记录继续校验原资源内容。MCP 中的 `localhost` 指沙箱自身；访问宿主开发服务应使用沙箱可达地址。
 

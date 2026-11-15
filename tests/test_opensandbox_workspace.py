@@ -26,8 +26,8 @@ def configuration(tmp_path):
 
 
 def manager_type():
-    module = importlib.import_module("egis_agentkit.service.workspace._sandbox_manager")
-    return module.SandboxManager
+    module = importlib.import_module("egis_agentkit.service.workspace._egis_sandbox_manager")
+    return module.EgisSandboxManager
 
 
 async def initialized_provider(workspace):
@@ -85,7 +85,7 @@ async def test_project_mounts_expose_only_current_project_and_protect_inputs(
         workspace = await manager.get_workspace(
             "alice", "agent", "session", project_id="project"
         )
-        mounts = workspace.project_mounts()
+        mounts = workspace.build_project_mounts()
         sources = {
             mount.name: (mount.host.path, mount.mount_path, mount.read_only)
             for mount in mounts
@@ -136,8 +136,8 @@ async def test_activated_skill_is_published_inside_backend_without_exposing_othe
     from agentscope.skill import Skill
     from agentscope.tool import LocalBackend
 
-    from egis_agentkit.core.workspace._opensandbox_workspace import (
-        EgisOpenSandboxWorkspace,
+    from egis_agentkit.core.workspace._egis_sandbox_workspace import (
+        EgisSandboxWorkspace,
     )
     from egis_agentkit.storage.project._files import ProjectFileStorage
 
@@ -149,7 +149,7 @@ async def test_activated_skill_is_published_inside_backend_without_exposing_othe
     other = tmp_path / "app/common/private/secret.txt"
     other.parent.mkdir(parents=True)
     other.write_text("other-resource")
-    workspace = EgisOpenSandboxWorkspace(
+    workspace = EgisSandboxWorkspace(
         user_id="alice",
         agent_id="agent",
         project_id="project",
@@ -177,7 +177,7 @@ async def test_gateway_tools_keep_managed_connection_source():
     from agentscope.mcp import HttpMCPConfig
 
     module = importlib.import_module(
-        "egis_agentkit.extension._opensandbox_mcp_client_override"
+        "egis_agentkit.extension.workspace._opensandbox_mcp_client_override"
     )
 
     class ToolEndpoint:
@@ -211,10 +211,10 @@ async def test_skill_loader_publishes_runtime_path_but_persists_host_cache(tmp_p
     from agentscope.tool import LocalBackend
     from test_runtime_middleware_components import Resources, scope_at
 
-    from egis_agentkit.core.workspace._opensandbox_workspace import (
-        EgisOpenSandboxWorkspace,
+    from egis_agentkit.core.workspace._egis_sandbox_workspace import (
+        EgisSandboxWorkspace,
     )
-    from egis_agentkit.extension._skill_loader_impl import LiveSkillLoader
+    from egis_agentkit.extension.resource._skill_loader_impl import LiveSkillLoader
     from egis_agentkit.storage.project._files import ProjectFileStorage
 
     root = tmp_path / "app"
@@ -222,7 +222,7 @@ async def test_skill_loader_publishes_runtime_path_but_persists_host_cache(tmp_p
     source = Path(resources.materialized.dir)
     source.mkdir(parents=True)
     (source / "SKILL.md").write_text("Full report instructions")
-    workspace = EgisOpenSandboxWorkspace(
+    workspace = EgisSandboxWorkspace(
         user_id="alice",
         agent_id="agent-one",
         project_id="project-one",
@@ -287,18 +287,18 @@ async def test_bootstrap_selects_native_sandbox_manager(storage, tmp_path, monke
         owns_client=False,
     )
     assert isinstance(kit.workspace, OpenSandboxWorkspaceManager)
-    assert kit.workspace.resources is kit.services.resources
+    assert not hasattr(kit.workspace, "resources")
 
 
 def test_binding_metadata_obeys_opensandbox_label_contract(tmp_path):
     import re
 
-    from egis_agentkit.core.workspace._opensandbox_workspace import (
-        EgisOpenSandboxWorkspace,
+    from egis_agentkit.core.workspace._egis_sandbox_workspace import (
+        EgisSandboxWorkspace,
     )
     from egis_agentkit.storage.project._files import ProjectFileStorage
 
-    workspace = EgisOpenSandboxWorkspace(
+    workspace = EgisSandboxWorkspace(
         user_id="alice",
         agent_id="agent",
         project_id="project",
@@ -331,12 +331,12 @@ async def test_external_user_subject_remains_valid_provider_metadata(
 async def test_skill_partition_rejects_parent_segments(tmp_path, agent_id):
     from agentscope.skill import Skill
 
-    from egis_agentkit.core.workspace._opensandbox_workspace import (
-        EgisOpenSandboxWorkspace,
+    from egis_agentkit.core.workspace._egis_sandbox_workspace import (
+        EgisSandboxWorkspace,
     )
     from egis_agentkit.storage.project._files import ProjectFileStorage
 
-    workspace = EgisOpenSandboxWorkspace(
+    workspace = EgisSandboxWorkspace(
         user_id="alice",
         agent_id="agent",
         project_id="project",
@@ -359,10 +359,12 @@ async def test_gateway_tool_uses_same_resource_authorization_and_revocation(
 
     from test_domain import expert, identities
 
-    from egis_agentkit.extension._opensandbox_mcp_client_override import (
+    from egis_agentkit.extension.runtime._session_lock_override import (
+        ExecutionCoordinator,
+    )
+    from egis_agentkit.extension.workspace._opensandbox_mcp_client_override import (
         AuthorizedGatewayMCPClient,
     )
-    from egis_agentkit.extension._session_lock_override import ExecutionCoordinator
     from egis_agentkit.service._session import SessionService
     from egis_agentkit.service.agent._agent_manager import AgentManager
     from egis_agentkit.service.resource._catalog import ResourceService
@@ -441,7 +443,7 @@ async def test_agents_and_sessions_do_not_share_running_resources(
         assert (
             len({a.runtime_binding_id, b.runtime_binding_id, c.runtime_binding_id}) == 3
         )
-        assert a.project_mounts() == b.project_mounts() == c.project_mounts()
+        assert a.build_project_mounts() == b.build_project_mounts() == c.build_project_mounts()
 
 
 @pytest.mark.asyncio
@@ -451,15 +453,15 @@ async def test_skill_publication_reuses_complete_files_and_failure_preserves_the
     from agentscope.skill import Skill
     from agentscope.tool import LocalBackend
 
-    from egis_agentkit.core.workspace._opensandbox_workspace import (
-        EgisOpenSandboxWorkspace,
+    from egis_agentkit.core.workspace._egis_sandbox_workspace import (
+        EgisSandboxWorkspace,
     )
     from egis_agentkit.storage.project._files import ProjectFileStorage
 
     source = tmp_path / "app/common/report"
     source.mkdir(parents=True)
     (source / "SKILL.md").write_text("# Original")
-    workspace = EgisOpenSandboxWorkspace(
+    workspace = EgisSandboxWorkspace(
         user_id="alice",
         agent_id="agent",
         project_id="project",
@@ -492,8 +494,8 @@ async def test_gateway_credentials_use_memory_and_cleanup_on_failed_request(
     from agentscope.tool import ExecResult
     from agentscope.workspace._gateway_client import GatewayClient
 
-    from egis_agentkit.core.workspace._opensandbox_workspace import (
-        EgisOpenSandboxWorkspace,
+    from egis_agentkit.core.workspace._egis_sandbox_workspace import (
+        EgisSandboxWorkspace,
     )
     from egis_agentkit.storage.project._files import ProjectFileStorage
 
@@ -519,7 +521,7 @@ async def test_gateway_credentials_use_memory_and_cleanup_on_failed_request(
         workspace._gateway = GatewayClient(backend, workspace.gateway_port)
 
     monkeypatch.setattr(OpenSandboxWorkspace, "_setup_mcp_gateway", native_setup)
-    workspace = EgisOpenSandboxWorkspace(
+    workspace = EgisSandboxWorkspace(
         user_id="alice",
         agent_id="agent",
         project_id="project",
@@ -546,13 +548,13 @@ async def test_project_release_destroys_only_owned_provider_bindings(
 
     from opensandbox import SandboxManager as ProviderManager
 
-    from egis_agentkit.core.workspace._opensandbox_workspace import (
-        EgisOpenSandboxWorkspace,
+    from egis_agentkit.core.workspace._egis_sandbox_workspace import (
+        EgisSandboxWorkspace,
     )
 
     monkeypatch.setenv("TEST_SANDBOX_KEY", "test-only")
     manager = manager_type()(tmp_path, configuration(tmp_path))
-    owner = EgisOpenSandboxWorkspace._metadata_hash(b"alice")
+    owner = EgisSandboxWorkspace._hash_metadata(b"alice")
     closed, killed, pages = [], [], []
 
     class Provider:
@@ -577,6 +579,6 @@ async def test_project_release_destroys_only_owned_provider_bindings(
         return Provider()
 
     monkeypatch.setattr(ProviderManager, "create", connect)
-    await manager.release_project("alice", "project")
+    await manager.destroy_workspaces("alice", "project")
     assert killed == ["owned"] and closed == ["provider"]
     assert len(pages) == 1

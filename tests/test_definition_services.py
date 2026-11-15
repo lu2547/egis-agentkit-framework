@@ -5,24 +5,22 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
-from test_domain import COMPANY, expert, identities
+from test_domain import COMPANY, agent_changes, expert, identities
 from test_remote_agents import config as remote_config
 
-from egis_agentkit.service.access._grant import GrantService
-from egis_agentkit.service.access._permission import PermissionService
-from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.core.agent._expert_definition import ExpertDefinition
 from egis_agentkit.core.agent._orchestrator_definition import OrchestratorDefinition
 from egis_agentkit.core.agent._personal_definition import PersonalDefinition
 from egis_agentkit.core.agent._remote_definition import RemoteDefinition
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
+from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.service.access._permission import PermissionService
+from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.agent._personal_manager import PersonalManager
 from egis_agentkit.service.team._definition import TeamDefinition
 from egis_agentkit.storage._definition import DefinitionStorage
 from egis_agentkit.storage.model import AgentDefinition, Grant
-
-from test_domain import agent_changes
 
 
 def entry(module, symbol):
@@ -135,8 +133,8 @@ async def test_team_preserves_atomic_updates_and_owner_checks(storage):
     }
     team = await teams.save(alice, data)
     leader_id = team["payload"]["orchestrator"]["definition_id"]
-    data.update(id=team["id"], config_version=team["config_version"])
-    assert (await teams.save(alice, data))["config_version"] == 2
+    data.update(id=team["id"], owner_version=team["owner_version"])
+    assert (await teams.save(alice, data))["owner_version"] == 2
     with pytest.raises(Conflict):
         await teams.save(alice, data)
     assert (await storage.definitions.get_definition_view(leader_id, "private"))[
@@ -149,7 +147,7 @@ async def test_team_preserves_atomic_updates_and_owner_checks(storage):
             {
                 **data,
                 "id": None,
-                "config_version": 1,
+                "owner_version": 1,
                 "orchestrator_config": {
                     "agent_name": "rolled-back",
                     "agent_display_name": "Rolled back",
@@ -159,11 +157,11 @@ async def test_team_preserves_atomic_updates_and_owner_checks(storage):
     agents_after_conflict, _ = await storage.definitions.list_definitions_and_reviews("agent")
     assert {row["agent_name"] for row in agents_after_conflict} == {"leader", "writer"}
     with pytest.raises(Forbidden):
-        await teams.save(bob, {**data, "config_version": 2})
+        await teams.save(bob, {**data, "owner_version": 2})
     with pytest.raises(Forbidden):
         await teams.save(alice, {**data, "id": None, "members": data["members"] * 2})
     await teams.delete(alice, team["id"])
-    assert not (await storage.get_definition(team["id"]))["is_enabled"]
+    assert (await storage.get_definition(team["id"]))["deleted_at"] is not None
     assert (await storage.get_definition(leader_id))["deleted_at"] is not None
     assert (await storage.get_definition(member["id"]))["deleted_at"] is None
 
@@ -346,6 +344,7 @@ async def test_agent_query_pages_visible_rows_and_filters_definition_type(storag
     with pytest.raises(Forbidden):
         await experts.update_definition(alice, (native).id, agent_changes(native))
     from pydantic import ValidationError
+
     from egis_agentkit.storage.model.agent._update import AgentUpdate
 
     with pytest.raises(ValidationError):
@@ -431,7 +430,7 @@ async def test_team_manages_orchestrator_identity_and_versions(storage):
         {
             **data,
             "id": first["id"],
-            "config_version": first["config_version"],
+            "owner_version": first["owner_version"],
             "orchestrator_config": {
                 **data["orchestrator_config"],
                 "payload": {"system_prompt": "按任务分配专家"},

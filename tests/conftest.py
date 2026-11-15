@@ -3,6 +3,7 @@
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 import pytest_asyncio
 from dotenv import dotenv_values
 from sqlalchemy import text
@@ -42,3 +43,9 @@ async def storage():
     async with admin.begin() as conn:
         await conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
     await admin.dispose()
+
+
+@pytest.fixture(autouse=True)
+def sandbox_test_credentials(monkeypatch):
+    """只供显式 TEST_SANDBOX_KEY 配置使用，绝不读取真实部署密钥。"""
+    monkeypatch.setenv("TEST_SANDBOX_KEY", "test-only")

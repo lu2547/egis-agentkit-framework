@@ -16,11 +16,11 @@ from test_domain import expert, identities
 from egis_agentkit.client.nacos._settings import AccessConfig
 from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.extension import ToolAccessMiddleware
-from egis_agentkit.extension._session_lock_override import ExecutionCoordinator
-from egis_agentkit.extension._tool_access_callback import (
+from egis_agentkit.extension.resource._tool_access_callback import (
     team_prompt_middleware,
     tool_access_middleware,
 )
+from egis_agentkit.extension.runtime._session_lock_override import ExecutionCoordinator
 from egis_agentkit.service._session import SessionService
 from egis_agentkit.service._user import UserService
 from egis_agentkit.service.access._grant import GrantService
@@ -135,7 +135,7 @@ async def test_expert_cannot_lead_collaboration(storage, tmp_path):
 async def test_pending_invitation_runs_on_user_input_with_bound_native_worker(
     storage, tmp_path
 ):
-    from egis_agentkit.extension._team_invite_callback import apply_invitations
+    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
     from egis_agentkit.service.team._collaboration import validate_collaborators
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
@@ -257,7 +257,7 @@ async def test_pending_invitation_runs_on_user_input_with_bound_native_worker(
 async def test_revoked_pending_or_joined_collaborator_blocks_parent_execution(
     storage, tmp_path
 ):
-    from egis_agentkit.extension._team_invite_callback import apply_invitations
+    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
     from egis_agentkit.storage.model import Grant
 
     users, admin, alice, _ = await identities(storage)
@@ -436,8 +436,8 @@ async def test_collaboration_http_contract_stages_without_native_execution(
     storage, tmp_path
 ):
     import httpx
-    from egis_agentkit_app.controller.session import router
     from egis_agentkit_app.controller.base import current_user
+    from egis_agentkit_app.controller.session import router
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
 
@@ -487,7 +487,7 @@ async def test_collaboration_http_contract_stages_without_native_execution(
 async def test_invitation_delivery_failure_cleans_allocations_and_retries_same_request(
     storage, tmp_path
 ):
-    from egis_agentkit.extension._team_invite_callback import apply_invitations
+    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
 
     class FailedDeliveryBus(InMemoryMessageBus):
         fail = True
@@ -572,7 +572,7 @@ async def test_parent_cancel_finishes_native_invite_checkpoint_without_duplicate
 ):
     import asyncio
 
-    from egis_agentkit.extension._team_invite_callback import apply_invitations
+    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
 
     class PausedWakeBus(InMemoryMessageBus):
         def __init__(self):
@@ -638,7 +638,7 @@ async def test_parent_cancel_finishes_native_invite_checkpoint_without_duplicate
 async def test_replacing_or_clearing_prepared_request_never_invites_removed_experts(
     storage, tmp_path
 ):
-    from egis_agentkit.extension._team_invite_callback import apply_invitations
+    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     reviewer = await AgentManager(storage).add_definition(
@@ -693,7 +693,7 @@ async def test_replacing_or_clearing_prepared_request_never_invites_removed_expe
 async def test_failed_native_team_creation_removes_only_new_team_and_retries(
     storage, tmp_path, monkeypatch
 ):
-    from egis_agentkit.extension._team_invite_callback import apply_invitations
+    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     original = storage.set_session_team_id
@@ -751,7 +751,7 @@ async def test_recovery_delivers_task_when_native_membership_committed_before_in
     storage, tmp_path
 ):
     """Native membership alone cannot prove the initial task reached its inbox."""
-    from egis_agentkit.extension._team_invite_callback import apply_invitations
+    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     async with InMemoryMessageBus() as bus:

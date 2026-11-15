@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from agentscope.tool import ToolBase
 
+from egis_agentkit.extension.runtime._session_lock_override import bound_execution_scope
 from egis_agentkit.service._user import UserService
 from egis_agentkit.service.resource._catalog import ResourceService
-
-from ._session_lock_override import bound_execution_scope
 
 
 class BoundToolFactory:

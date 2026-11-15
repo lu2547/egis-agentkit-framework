@@ -29,6 +29,6 @@ def publication_label(revision: int) -> str:
 
 def resource_available(record: dict) -> bool:
     """按资源生命周期判断可用性；Agent 删除与安装项启停分别表达。"""
-    if record.get("definition_type") == "agent":
+    if record.get("definition_type") in ("agent", "team"):
         return record.get("deleted_at") is None
     return record["is_enabled"]

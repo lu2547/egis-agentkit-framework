@@ -82,15 +82,14 @@ def test_delivery_discovery_excludes_project_inputs_but_keeps_work_outputs(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_native_workspace_uses_project_scope_for_shared_sessions(tmp_path):
+async def test_native_workspace_uses_project_scope_for_shared_sessions(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
-    from egis_agentkit.extension._session_lock_override import execution_scope
-    from egis_agentkit.service.workspace._local_manager import (
-        LocalWorkspaceManager,
-    )
+    from runtime_helpers import sandbox_manager
 
-    manager = LocalWorkspaceManager(tmp_path)
+    from egis_agentkit.extension.runtime._session_lock_override import execution_scope
+
+    manager = sandbox_manager(tmp_path, monkeypatch)
     manager.files.initialize_project("alice", "project")
     scope = execution_scope.set(
         SimpleNamespace(user_id="alice", project_id="project", session_id="first")
@@ -107,7 +106,7 @@ async def test_native_workspace_uses_project_scope_for_shared_sessions(tmp_path)
         )
         assert first is not second
         assert first.workspace_id == second.workspace_id
-        assert first.current_project_id() == "project"
+        assert first.egis_project_id == "project"
         bash = next(tool for tool in await second.list_tools() if tool.name == "Bash")
         files_root = manager.files.project_root("alice", "project") / ".work"
         assert files_root.is_dir()

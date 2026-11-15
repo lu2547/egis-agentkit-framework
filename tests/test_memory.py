@@ -4,12 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 from agentscope.middleware import ReMeMiddleware
+from config_helpers import sandbox_runtime
 from runtime_helpers import session_middlewares
 
 from egis_agentkit.client.nacos import AgentKitConfig
 from egis_agentkit.client.nacos._settings import MemoryConfig
-from egis_agentkit.extension._personal_memory_callback import MemoryService
-from egis_agentkit.extension._session_lock_override import (
+from egis_agentkit.extension.personal._personal_memory_callback import MemoryService
+from egis_agentkit.extension.runtime._session_lock_override import (
     ExecutionScope,
     execution_scope,
 )
@@ -22,7 +23,7 @@ def memory_snapshot(tmp_path, **memory):
         {
             "revision": 1,
             "agent": {"personal": {"memory": memory}},
-            "workspace": {"runtime": {"root": str(tmp_path)}}, "project": {"upload": {"max_bytes": 20_971_520}},
+            "workspace": {"runtime": sandbox_runtime(tmp_path)}, "project": {"upload": {"max_bytes": 20_971_520}},
             "user": {
                 "identity": {
                     "mode": "demo",
@@ -64,8 +65,8 @@ def test_enabled_memory_rejects_missing_dependency(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_native_middleware_is_cached_per_user_and_closed(monkeypatch, tmp_path):
-    from egis_agentkit.extension import _personal_memory_callback as memory
-    from egis_agentkit.extension._personal_memory_callback import MemoryService
+    from egis_agentkit.extension.personal import _personal_memory_callback as memory
+    from egis_agentkit.extension.personal._personal_memory_callback import MemoryService
 
     monkeypatch.setattr(memory.importlib.util, "find_spec", lambda name: object())
     calls = []

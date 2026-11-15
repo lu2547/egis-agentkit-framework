@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, Self
+from typing import Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field
 
-from ._base import Model, new_id
+from ._base import Model
 
 ViewType = Literal["private", "system", "shared"]
 AgentType = Literal["personal", "expert", "remote", "orchestrator"]
@@ -29,25 +29,6 @@ class TeamPayload(Model):
     starter_prompts: list[str] = Field(default_factory=list, max_length=10)
     orchestrator: DefinitionRef
     members: list[DefinitionRef] = Field(min_length=1, max_length=20)
-
-
-class TeamDefinitionRecord(Model):
-    """Team 自身的持久化数据，Agent 采用独立模型。"""
-
-    id: str = Field(default_factory=new_id, max_length=64)
-    definition_type: Literal["team"] = "team"
-    owner_type: Literal["user", "system"] = "user"
-    owner_id: str = Field(min_length=1, max_length=128)
-    team_name: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,127}$")
-    team_display_name: str = Field(max_length=128)
-    is_enabled: bool = True
-    config_version: int = Field(default=1, ge=1)
-    payload: dict[str, Any]
-
-    @model_validator(mode="after")
-    def validate_payload(self) -> Self:
-        self.payload = TeamPayload.model_validate(self.payload).model_dump(mode="json")
-        return self
 
 
 def build_definition_reference(definition: dict[str, Any]) -> dict[str, Any]:

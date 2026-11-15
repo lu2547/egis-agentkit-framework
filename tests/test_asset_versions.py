@@ -4,7 +4,7 @@ import pytest
 from test_domain import identities
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.extension._demo_report_tool_impl import deploy_demo_report_tools
+from egis_agentkit.extension.demo._demo_report_tool_impl import deploy_demo_report_tools
 from egis_agentkit.service._user import UserService
 from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.storage.project._files import ProjectFileStorage

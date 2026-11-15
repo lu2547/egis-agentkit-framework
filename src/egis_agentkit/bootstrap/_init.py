@@ -14,16 +14,21 @@ from egis_agentkit.client.nacos import NacosClient, NacosConfigProvider
 from egis_agentkit.client.nacos._config import LivePolicies
 from egis_agentkit.core.agent._expert_definition import ExpertDefinition
 from egis_agentkit.core.agent._remote_definition import RemoteDefinition
-from egis_agentkit.extension._agent_tools_callback import BoundToolFactory
-from egis_agentkit.extension._demo_report_tool_impl import deploy_demo_report_tools
-from egis_agentkit.extension._personal_memory_callback import MemoryService
-from egis_agentkit.extension._remote_agent_callback import RemoteAgentRuntime
-from egis_agentkit.extension._resource_hubs_impl import LocalMCPHub, LocalSkillHub
-from egis_agentkit.extension._session_lock_override import (
+from egis_agentkit.extension.demo._demo_report_tool_impl import deploy_demo_report_tools
+from egis_agentkit.extension.personal._personal_memory_callback import MemoryService
+from egis_agentkit.extension.remote_agent._remote_agent_callback import (
+    RemoteAgentRuntime,
+)
+from egis_agentkit.extension.resource._resource_hubs_impl import (
+    LocalMCPHub,
+    LocalSkillHub,
+)
+from egis_agentkit.extension.runtime._agent_tools_callback import BoundToolFactory
+from egis_agentkit.extension.runtime._session_lock_override import (
     ExecutionCoordinator,
     ScopedMessageBus,
 )
-from egis_agentkit.extension._session_storage_override import ExecutionStorage
+from egis_agentkit.extension.runtime._session_storage_override import ExecutionStorage
 from egis_agentkit.service._composer import ComposerService
 from egis_agentkit.service._model import ModelService
 from egis_agentkit.service._session import SessionService
@@ -41,9 +46,8 @@ from egis_agentkit.service.project._project_manager import ProjectManager
 from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.service.resource._skill_import import SkillImportService
 from egis_agentkit.service.team._definition import TeamDefinition
-from egis_agentkit.service.workspace._local_manager import LocalWorkspaceManager
-from egis_agentkit.service.workspace._sandbox_manager import (
-    SandboxManager,
+from egis_agentkit.service.workspace._egis_sandbox_manager import (
+    EgisSandboxManager,
 )
 from egis_agentkit.storage import AgentKitStorage
 from egis_agentkit.storage.project._files import ProjectFileStorage
@@ -135,11 +139,7 @@ def init_agentkit(
     )
     files = ProjectFileStorage(root, config_provider=config)
     resources = ResourceService(storage, root, policies=policies, config=config)
-    workspace_manager = (
-        SandboxManager(root, workspace.runtime.opensandbox, resources)
-        if workspace.runtime.mode == "opensandbox"
-        else LocalWorkspaceManager(root, resources)
-    )
+    workspace_manager = EgisSandboxManager(root, workspace.runtime.opensandbox)
     projects = ProjectManager(
         storage,
         root,

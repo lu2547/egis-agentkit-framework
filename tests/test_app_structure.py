@@ -30,8 +30,8 @@ def test_business_controllers_own_their_http_models():
 def test_framework_http_adapters_do_not_depend_on_application():
     modules = (
         "egis_agentkit.client.identity",
-        "egis_agentkit.extension._http_identity_middleware_impl",
-        "egis_agentkit.extension._stream_ready_middleware_impl",
+        "egis_agentkit.extension.http._http_identity_middleware_impl",
+        "egis_agentkit.extension.http._stream_ready_middleware_impl",
     )
     for name in modules:
         spec = importlib.util.find_spec(name)

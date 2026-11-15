@@ -23,7 +23,7 @@ class PersonalResourceStorage:
         self, user_id: str, resource_type: str
     ) -> dict[str, dict[str, Any]]:
         """直接按用户和资源类型读取个人选择，不需要先构建定义。"""
-        table = t.personal_agent_resources
+        table = t.agent_personal_resources
         async with self.engine.connect() as connection:
             rows = (
                 (
@@ -50,7 +50,7 @@ class PersonalResourceStorage:
         actor: str,
     ) -> dict[str, Any]:
         """创建或更新唯一开关，审计时间由存储统一维护。"""
-        table = t.personal_agent_resources
+        table = t.agent_personal_resources
         now = utcnow()
         statement = insert(table).values(
             user_id=user_id,
@@ -84,7 +84,7 @@ class PersonalResourceStorage:
         actor: str,
     ) -> dict[str, Any]:
         """只更新已选资源的启停状态，未选择的资源不能被更新操作隐式添加。"""
-        table = t.personal_agent_resources
+        table = t.agent_personal_resources
         statement = (
             update(table)
             .where(
@@ -105,7 +105,7 @@ class PersonalResourceStorage:
         self, user_id: str, resource_type: str, resource_id: str
     ) -> None:
         """取消当前用户的资源选择，不修改资源或授权。"""
-        table = t.personal_agent_resources
+        table = t.agent_personal_resources
         async with self.engine.begin() as connection:
             await connection.execute(
                 delete(table).where(

@@ -1,6 +1,7 @@
 import httpx
 import pytest
 import yaml
+from config_helpers import sandbox_runtime
 
 from egis_agentkit.client.nacos import (
     NacosBootstrap,
@@ -40,7 +41,7 @@ def documents(revision=1):
         "agentkit.yaml": {
             "agentkit": {
                 "revision": revision,
-                "workspace": {"runtime": {"root": "/tmp/work"}}, "project": {"upload": {"maxBytes": 20_971_520}},
+                "workspace": {"runtime": sandbox_runtime("/tmp/work")}, "project": {"upload": {"maxBytes": 20_971_520}},
                 "user": {
                     "identity": {
                         "mode": "demo",

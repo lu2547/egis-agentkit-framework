@@ -2,22 +2,22 @@ import pytest
 import pytest_asyncio
 from agentscope.app.storage import AgentData, AgentRecord, SessionConfig
 from agentscope.message import ToolCallBlock, ToolCallState
-from test_domain import expert, identities
+from test_domain import agent_changes, expert, identities
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.extension._session_lock_override import (
+from egis_agentkit.extension.runtime._session_lock_override import (
     ExecutionCoordinator,
     execution_scope,
 )
 from egis_agentkit.service._session import SessionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 
-from test_domain import agent_changes
-
 
 @pytest_asyncio.fixture
 async def runtime_storage(storage):
-    from egis_agentkit.extension._session_storage_override import ExecutionStorage
+    from egis_agentkit.extension.runtime._session_storage_override import (
+        ExecutionStorage,
+    )
 
     async with ExecutionStorage("postgresql+asyncpg://unused", storage.engine) as projected:
         yield projected

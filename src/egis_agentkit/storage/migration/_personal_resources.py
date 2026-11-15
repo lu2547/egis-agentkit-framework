@@ -9,28 +9,36 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from egis_agentkit.storage import tables as t
 
+from ._table_names import RENAMES
+
 
 async def _upgrade_user_column(
-    connection: AsyncConnection, schema: str, summary: str, *, apply: bool = False
+    connection: AsyncConnection,
+    schema: str,
+    summary: str,
+    *,
+    apply: bool = False,
+    physical_table: str | None = None,
 ) -> Literal["pending", "current", "upgraded", "inconsistent"]:
     """补齐资源选择的用户归属与查询索引，错误归属禁止自动覆盖。"""
     # 1. 核对已有列、索引，以及个人助理与用户归属是否一致。
-    table = t.personal_agent_resources
+    table = t.agent_personal_resources
+    physical_table = physical_table or table.name
     columns = await connection.run_sync(
-        lambda conn: inspect(conn).get_columns(table.name, schema=schema)
+        lambda conn: inspect(conn).get_columns(physical_table, schema=schema)
     )
     user_column = next(
         (column for column in columns if column["name"] == "user_id"), None
     )
     indexes = await connection.run_sync(
-        lambda conn: inspect(conn).get_indexes(table.name, schema=schema)
+        lambda conn: inspect(conn).get_indexes(physical_table, schema=schema)
     )
     missing_indexes = {index.name for index in table.indexes} - {
         index["name"] for index in indexes
     }
     needs_column = user_column is None or user_column["nullable"]
     quote = connection.dialect.identifier_preparer.quote_identifier
-    resource_table = f"{quote(schema)}.{quote(table.name)}"
+    resource_table = f"{quote(schema)}.{quote(physical_table)}"
     summary_table = f"{quote(schema)}.{quote(summary)}"
     wrong_user = (
         " OR (r.user_id IS NOT NULL AND r.user_id <> a.owner_id)"
@@ -118,9 +126,20 @@ async def migrate_personal_resources(
                 .all()
             )
             legacy.extend((kind, native, dict(row)) for row in rows)
-    exists = t.personal_agent_resources.name in names
+    target = t.agent_personal_resources.name
+    actual = (
+        target
+        if target in names
+        else next(
+            (old for old, new in RENAMES.items() if new == target and old in names),
+            None,
+        )
+    )
+    # 预览时也读取尚未改名的物理表，不能跳过已有记录的用户归属检查。
     user_state = (
-        await _upgrade_user_column(connection, schema, summary) if exists else "pending"
+        await _upgrade_user_column(connection, schema, summary, physical_table=actual)
+        if actual is not None
+        else "pending"
     )
     if user_state == "inconsistent":
         if apply:
@@ -129,8 +148,10 @@ async def migrate_personal_resources(
     pending = user_state == "pending" or bool(legacy)
     if not apply:
         return "pending" if pending else "current"
+    if actual is not None and actual != target:
+        raise ValueError("个人资源表名需要先通过 upgrade-db 改名")
     await connection.run_sync(
-        lambda conn: t.personal_agent_resources.create(conn, checkfirst=True)
+        lambda conn: t.agent_personal_resources.create(conn, checkfirst=True)
     )
     await _upgrade_user_column(connection, schema, summary, apply=True)
     selected = {}
@@ -138,7 +159,7 @@ async def migrate_personal_resources(
         selected[(row["agent_id"], kind, row["payload"]["card_id"])] = row
     for (agent_id, kind, identifier), row in selected.items():
         statement = (
-            insert(t.personal_agent_resources)
+            insert(t.agent_personal_resources)
             .values(
                 user_id=row["user_id"],
                 agent_id=agent_id,

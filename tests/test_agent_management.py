@@ -4,16 +4,14 @@ import importlib
 
 import pytest
 from sqlalchemy import event, inspect, text
-from test_domain import COMPANY, expert, identities
+from test_domain import COMPANY, agent_changes, expert, identities
 from test_resources import put_asset
 
+from egis_agentkit.errors import Conflict, Forbidden, NotFound
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._share import ShareService
-from egis_agentkit.errors import Conflict, Forbidden, NotFound
 from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.storage.model import Grant, ResourceRef
-
-from test_domain import agent_changes
 
 
 def agent_manager(storage):

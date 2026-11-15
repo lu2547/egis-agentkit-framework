@@ -9,8 +9,8 @@ from egis_agentkit.errors import Forbidden
 from egis_agentkit.extension import (
     SkillBindingMiddleware,
 )
-from egis_agentkit.extension._skill_loader_impl import LiveSkillLoader
-from egis_agentkit.extension._tool_access_callback import (
+from egis_agentkit.extension.resource._skill_loader_impl import LiveSkillLoader
+from egis_agentkit.extension.resource._tool_access_callback import (
     team_prompt_middleware,
     tool_access_middleware,
 )

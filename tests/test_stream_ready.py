@@ -4,12 +4,12 @@ from contextlib import aclosing
 import pytest
 from agentscope.app.message_bus import MessageBusKeys
 
-from egis_agentkit.extension._session_lock_override import ScopedMessageBus
+from egis_agentkit.extension.runtime._session_lock_override import ScopedMessageBus
 
 
 @pytest.mark.asyncio
 async def test_idle_sse_flushes_only_after_real_subscription_ready():
-    from egis_agentkit.extension._stream_ready_middleware_impl import StreamReady
+    from egis_agentkit.extension.http._stream_ready_middleware_impl import StreamReady
 
     callback_ran = asyncio.Event()
     response = asyncio.Queue()

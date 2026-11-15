@@ -5,7 +5,7 @@ import hashlib
 import json
 
 
-def _encode(value: object) -> str:
+def _encode_workspace_identity(value: object) -> str:
     return (
         base64.b32encode(
             hashlib.sha256(
@@ -19,7 +19,7 @@ def _encode(value: object) -> str:
 
 def workspace_id_for(user_id: str) -> str:
     """同一用户跨项目、Agent、会话始终取得同一个工作区身份。"""
-    return _encode(["user-workspace", user_id])
+    return _encode_workspace_identity(["user-workspace", user_id])
 
 
 def sandbox_binding_for(

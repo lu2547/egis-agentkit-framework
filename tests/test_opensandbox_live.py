@@ -26,11 +26,11 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
     from opensandbox.models.sandboxes import SandboxFilter
 
     from egis_agentkit.client.nacos._settings import OpenSandboxConfig
-    from egis_agentkit.extension._opensandbox_mcp_client_override import (
+    from egis_agentkit.extension.workspace._opensandbox_mcp_client_override import (
         AuthorizedGatewayMCPClient,
     )
-    from egis_agentkit.service.workspace._sandbox_manager import (
-        SandboxManager,
+    from egis_agentkit.service.workspace._egis_sandbox_manager import (
+        EgisSandboxManager,
     )
 
     root = Path(os.environ["AGENTKIT_TEST_OPENSANDBOX_ROOT"]).resolve()
@@ -44,19 +44,19 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
         ),
     )
     if os.environ.get("AGENTKIT_TEST_OPENSANDBOX_IMAGE"):
-        from egis_agentkit.core.workspace._opensandbox_workspace import (
-            EgisOpenSandboxWorkspace,
+        from egis_agentkit.core.workspace._egis_sandbox_workspace import (
+            EgisSandboxWorkspace,
         )
 
         def reject_runtime_install(self):
             raise AssertionError("预构建镜像不能在会话请求内联网安装依赖")
 
         monkeypatch.setattr(
-            EgisOpenSandboxWorkspace, "_bootstrap_commands", reject_runtime_install
+            EgisSandboxWorkspace, "_bootstrap_commands", reject_runtime_install
         )
     project_id = "test-sandbox-" + uuid4().hex
     other_id = "test-sandbox-" + uuid4().hex
-    manager = SandboxManager(root, settings)
+    manager = EgisSandboxManager(root, settings)
     manager.files.initialize_project("sandbox-test", project_id)
     manager.files.initialize_project("sandbox-test", other_id)
     source = root / "common" / project_id
@@ -182,7 +182,7 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
                 == b"sandbox output"
             )
             sandbox_id = workspace._sandbox.id
-            await manager.close(workspace.workspace_id)
+            await manager.close_workspaces(workspace.workspace_id)
             again = await manager.get_workspace(
                 "sandbox-test", "agent", "session", project_id=project_id
             )
@@ -191,7 +191,7 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
                 await again.get_backend().read_file(str(probe / "artifacts/result.txt"))
                 == b"sandbox output"
             )
-            await manager.release_project("sandbox-test", project_id)
+            await manager.destroy_workspaces("sandbox-test", project_id)
             manager.files.remove_project("sandbox-test", project_id)
             assert not probe.exists()
             print(
@@ -220,7 +220,7 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
 @pytest.mark.asyncio
 async def test_real_docker_recovers_missing_sandbox_without_losing_project_files():
     from egis_agentkit.client.nacos._settings import OpenSandboxConfig
-    from egis_agentkit.service.workspace._sandbox_manager import SandboxManager
+    from egis_agentkit.service.workspace._egis_sandbox_manager import EgisSandboxManager
 
     root = Path(os.environ["AGENTKIT_TEST_OPENSANDBOX_ROOT"]).resolve()
     settings = OpenSandboxConfig(
@@ -230,7 +230,7 @@ async def test_real_docker_recovers_missing_sandbox_without_losing_project_files
         keepalive_interval_seconds=0.05,
     )
     project_id = "test-recover-" + uuid4().hex
-    manager = SandboxManager(root, settings)
+    manager = EgisSandboxManager(root, settings)
     manager.files.initialize_project("sandbox-test", project_id)
     manager.files.write(
         "sandbox-test", project_id, "input.txt", b"persistent input", area="uploads"
@@ -244,7 +244,7 @@ async def test_real_docker_recovers_missing_sandbox_without_losing_project_files
                 "sandbox-test", "agent", "session", project_id=project_id
             )
             original_id = workspace.sandbox_id
-            async with manager.keep_alive(workspace):
+            async with manager.renew_workspace(workspace):
                 before = await workspace._sandbox.get_info()
                 await asyncio.sleep(settings.keepalive_interval_seconds * 2)
                 after = await workspace._sandbox.get_info()
@@ -274,5 +274,5 @@ async def test_real_docker_recovers_missing_sandbox_without_losing_project_files
                 == b"persistent result"
             )
         finally:
-            await manager.release_project("sandbox-test", project_id)
+            await manager.destroy_workspaces("sandbox-test", project_id)
             manager.files.remove_project("sandbox-test", project_id)

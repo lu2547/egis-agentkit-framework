@@ -7,8 +7,8 @@ import pytest
 from sqlalchemy import select
 from test_domain import identities
 
-from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.errors import Conflict, Forbidden
+from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.service.resource._skill import _archive_files, skill_archive_digest

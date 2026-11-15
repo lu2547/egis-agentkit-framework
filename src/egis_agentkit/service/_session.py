@@ -28,18 +28,18 @@ from egis_agentkit.errors import Conflict, Forbidden, InvalidRequest, NotFound
 from egis_agentkit.extension import (
     SkillBindingMiddleware,
 )
-from egis_agentkit.extension._agent_remote_middleware_impl import (
+from egis_agentkit.extension.remote_agent._agent_remote_middleware_impl import (
     RemoteAgentMiddlewareImpl,
 )
-from egis_agentkit.extension._runtime_callback_middleware_impl import (
-    RuntimeCallbackMiddleware,
-)
-from egis_agentkit.extension._session_lock_override import bound_execution_scope
-from egis_agentkit.extension._skill_loader_impl import LiveSkillLoader
-from egis_agentkit.extension._tool_access_callback import (
+from egis_agentkit.extension.resource._skill_loader_impl import LiveSkillLoader
+from egis_agentkit.extension.resource._tool_access_callback import (
     team_prompt_middleware,
     tool_access_middleware,
 )
+from egis_agentkit.extension.runtime._runtime_callback_middleware_impl import (
+    RuntimeCallbackMiddleware,
+)
+from egis_agentkit.extension.runtime._session_lock_override import bound_execution_scope
 from egis_agentkit.service._reply import build_branch_context
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.agent._agent_manager import get_definition_for_execution
@@ -658,6 +658,9 @@ class SessionService:
         """组合已绑定会话的运行回调、授权、资源和远程执行扩展。"""
         scope = bound_execution_scope(user_id, agent_id, session_id)
         user = await users.get(user_id)
+        if resources is not None:
+            # 原生 ChatService 随后才收集 Workspace 工具与 MCP，必须先完成授权装载。
+            await resources.prepare_workspace(user, scope, workspace)
         policies = scope.policies
         personal = scope.definition["agent_type"] == "personal"
         skills = (
@@ -667,10 +670,9 @@ class SessionService:
         )
 
         async def authorize_tool(agent, tool, parameters=None):
-            if parameters is not None:
-                if workspace_manager is not None:
-                    await workspace_manager.refresh_resources(workspace)
             current_user = await users.get(user_id)
+            if parameters is not None:
+                await resources.prepare_workspace(current_user, scope, workspace)
             if await resources.authorize_mcp_tool(current_user, scope, tool):
                 return
             await resources.tool_registry.authorize(
@@ -684,8 +686,8 @@ class SessionService:
             else None
         )
         reply = partial(file_changes.on_reply, scope)
-        if workspace_manager is not None and hasattr(workspace_manager, "keep_alive"):
-            reply = partial(workspace_manager.on_reply, workspace, reply)
+        if workspace_manager is not None:
+            reply = partial(self._on_workspace_reply, workspace_manager, workspace, reply)
         result: list[MiddlewareBase] = [
             RuntimeCallbackMiddleware(
                 reply=reply,
@@ -733,3 +735,11 @@ class SessionService:
         if personal and memory is not None:
             result.append(await memory.for_user(user))
         return result
+
+    async def _on_workspace_reply(
+        self, manager, workspace, handler, agent, input_kwargs, next_handler
+    ):
+        """在整个回复流期间持有沙箱租约，项目产物仍由原回复回调处理。"""
+        async with manager.renew_workspace(workspace):
+            async for event in handler(agent, input_kwargs, next_handler):
+                yield event

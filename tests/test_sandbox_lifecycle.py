@@ -64,7 +64,7 @@ async def test_missing_cached_sandbox_is_rebuilt_with_original_project_files(
         )
         assert recovered is not old
         assert handle.closed
-        assert recovered.project_mounts() == old.project_mounts()
+        assert recovered.build_project_mounts() == old.build_project_mounts()
         assert (
             await recovered.get_backend().read_file(
                 str(manager.files.project_root("alice", "project") / "input.txt")
@@ -103,7 +103,7 @@ async def test_active_reply_is_not_evicted_but_idle_workspace_can_be(sandbox_man
             "alice", "agent", "session", project_id="project"
         )
         handle = workspace._sandbox
-        async with manager.keep_alive(workspace):
+        async with manager.renew_workspace(workspace):
             manager._cache[workspace.runtime_binding_id] = (
                 workspace,
                 time.monotonic() - manager._ttl - 1,
@@ -137,7 +137,7 @@ async def test_active_reply_renews_provider_deadline_and_stops_after_completion(
             "alice", "agent", "session", project_id="project"
         )
         handle = workspace._sandbox
-        async with manager.keep_alive(workspace):
+        async with manager.renew_workspace(workspace):
             handle.expires_at = 0
             handle.renewed.clear()
             await asyncio.wait_for(handle.renewed.wait(), timeout=1)
@@ -165,7 +165,7 @@ async def test_missing_sandbox_during_reply_stops_execution_instead_of_replaying
         )
         completed = False
         with pytest.raises(SandboxApiException):
-            async with manager.keep_alive(workspace):
+            async with manager.renew_workspace(workspace):
                 workspace._sandbox.failure = 404
                 await asyncio.wait_for(asyncio.Event().wait(), timeout=1)
                 completed = True
@@ -186,7 +186,7 @@ async def test_session_reply_wiring_protects_workspace_until_stream_finishes(
     from runtime_helpers import session_middlewares
     from test_runtime_middleware_components import Changes, Users, scope_at
 
-    from egis_agentkit.extension._session_lock_override import execution_scope
+    from egis_agentkit.extension.runtime._session_lock_override import execution_scope
 
     async with sandbox_manager as manager:
         workspace = await manager.get_workspace(
@@ -238,7 +238,7 @@ async def test_reply_exception_is_preserved_and_workspace_becomes_idle(sandbox_m
             "alice", "agent", "session", project_id="project"
         )
         with pytest.raises(ValueError, match="reply failed"):
-            async with manager.keep_alive(workspace):
+            async with manager.renew_workspace(workspace):
                 raise ValueError("reply failed")
         manager._cache[workspace.runtime_binding_id] = (
             workspace,
@@ -257,7 +257,7 @@ async def test_cancelled_reply_releases_workspace_for_idle_collection(sandbox_ma
         entered = asyncio.Event()
 
         async def reply():
-            async with manager.keep_alive(workspace):
+            async with manager.renew_workspace(workspace):
                 entered.set()
                 await asyncio.Event().wait()
 

@@ -10,8 +10,8 @@ ACCESS_TABLES = {
     "assets": "ak_resource_assets",
     "agent": "ak_agent_definition_summary",
     "agent_versions": "ak_agent_definition_detail",
-    "team": "ak_team_definitions",
-    "team_versions": "ak_team_definition_versions",
+    "team": "ak_team_definition_summary",
+    "team_versions": "ak_team_definition_detail",
 }
 CURRENT_COLUMNS = {
     "reviews": {"review_type"},
@@ -24,22 +24,33 @@ DIRECT_GRANTS = "revoked_at IS NULL AND grant_source_type IN ('share', 'manual')
 
 async def _qualified_tables(connection, schema):
     from .migration._agent import agent_tables
+    from .migration._team import team_tables
+
     actual = await agent_tables(connection, schema)
+    actual.update(await team_tables(connection, schema))
     quote = connection.dialect.identifier_preparer.quote_identifier
     return {
-        key: f"{quote(schema)}.{quote(actual.get(name, name))}" for key, name in ACCESS_TABLES.items()
+        key: f"{quote(schema)}.{quote(actual.get(name, name))}"
+        for key, name in ACCESS_TABLES.items()
     }
 
 
 async def _access_state(connection, schema):
     from .migration._agent import agent_tables
+    from .migration._team import team_tables
+
     actual = await agent_tables(connection, schema)
+    actual.update(await team_tables(connection, schema))
+
     def columns(sync):
         inspector = inspect(sync)
         names = set(inspector.get_table_names(schema=schema))
         return {
             key: {
-                column["name"] for column in inspector.get_columns(actual.get(name, name), schema=schema)
+                column["name"]
+                for column in inspector.get_columns(
+                    actual.get(name, name), schema=schema
+                )
             }
             for key, name in ACCESS_TABLES.items()
             if actual.get(name, name) in names
@@ -94,10 +105,12 @@ async def _legacy_conflict(connection, table):
 
     for kind in ("agent", "team", "skill", "mcp"):
         if kind in ("agent", "team"):
-            current_agent = kind == "agent" and "ak_agent_definition_summary" in table[kind]
-            enabled = "head.deleted_at IS NULL" if current_agent else "head.is_enabled"
-            version = "version" if current_agent else "config_version"
-            owner = "owner_version" if current_agent else "config_version"
+            current_definition = f"ak_{kind}_definition_summary" in table[kind]
+            enabled = (
+                "head.deleted_at IS NULL" if current_definition else "head.is_enabled"
+            )
+            version = "version" if current_definition else "config_version"
+            owner = "owner_version" if current_definition else "config_version"
             valid = f"""
                 SELECT 1 FROM {table[kind]} AS head
                 JOIN {table[f"{kind}_versions"]} AS edition

@@ -8,7 +8,7 @@ from agentscope.app._bus_ops import publish_session_event
 from agentscope.app._router._session import stream_session_events
 from agentscope.app.message_bus import MessageBusKeys
 
-from egis_agentkit.extension._message_bus_impl import EgisMessageBus
+from egis_agentkit.core.message_bus import EgisMessageBus
 
 
 class SessionStorage:

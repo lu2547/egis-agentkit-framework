@@ -1,8 +1,10 @@
 """覆盖原生 Agent 和 Session 读取，提供锁内已解析的配置。"""
 
+from egis_agentkit.extension.runtime._session_lock_override import (
+    execution_scope,
+    projected_agent,
+)
 from egis_agentkit.storage._postgres import AgentKitStorage
-
-from ._session_lock_override import execution_scope, projected_agent
 
 
 class ExecutionStorage(AgentKitStorage):

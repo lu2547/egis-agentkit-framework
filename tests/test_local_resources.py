@@ -180,7 +180,7 @@ async def test_oauth_state_credentials_refresh_and_revocation_are_isolated(
     import httpx
     from cryptography.fernet import Fernet
 
-    from egis_agentkit.service.resource._connector_auth import MCPAuthorizationService
+    from egis_agentkit.core.mcp import MCPAuthorization
     from egis_agentkit.storage.model import Grant
 
     _, admin, alice, bob = await identities(storage)
@@ -244,8 +244,8 @@ async def test_oauth_state_credentials_refresh_and_revocation_are_isolated(
 
     key = Fernet.generate_key()
     resources = ResourceService(storage, tmp_path, credential_key=key)
-    resources.mcp_authorization = MCPAuthorizationService(
-        storage,
+    resources.mcp_authorization = MCPAuthorization(
+        storage.mcp_credentials,
         key=key,
         redirect_uri="https://app.example.com/connectors",
         transport=httpx.MockTransport(request),
@@ -322,23 +322,21 @@ async def test_oauth_state_credentials_refresh_and_revocation_are_isolated(
 
 @pytest.mark.asyncio
 async def test_system_default_workspace_tools_load_without_installation_or_grant(
-    storage, tmp_path
+    storage, tmp_path, monkeypatch
 ):
     from types import SimpleNamespace
 
     from agentscope.tool import Bash, Read, Toolkit
+    from runtime_helpers import sandbox_manager
     from test_read_tool_guard import execute
 
     from egis_agentkit.errors import Conflict
-    from egis_agentkit.extension._session_lock_override import execution_scope
-    from egis_agentkit.service.workspace._local_manager import (
-        LocalWorkspaceManager,
-    )
+    from egis_agentkit.extension.runtime._session_lock_override import execution_scope
 
     _, admin, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
     await resources.seed_builtin_tools()
-    manager = LocalWorkspaceManager(tmp_path, resources=resources)
+    manager = sandbox_manager(tmp_path, monkeypatch)
     scope = SimpleNamespace(
         user_id=alice.user_id,
         session_id="one",
@@ -349,6 +347,7 @@ async def test_system_default_workspace_tools_load_without_installation_or_grant
     token = execution_scope.set(scope)
     try:
         workspace = await manager.get_workspace(alice.user_id, "agent", "one")
+        await resources.prepare_workspace(alice, scope, workspace)
         tools = {tool.name: tool for tool in await workspace.list_tools()}
         assert "Read" in tools and ("Bash" in tools or "PowerShell" in tools)
         tool = tools["Read"]
@@ -508,7 +507,9 @@ async def test_native_mcp_uses_each_users_encrypted_api_key(
             )
             asset = await resources._asset("mcp", "actual-mcp", "1.0.0")
             auth = resources.mcp_authorization
-            persisted = await auth.storage.read(user.user_id, auth._connection(asset))
+            persisted = await storage.mcp_credentials.read(
+                user.user_id, auth._connection(asset)
+            )
             assert f"key-{user.user_id}".encode() not in persisted["credential"]
             ref = [
                 {

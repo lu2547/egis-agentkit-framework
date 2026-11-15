@@ -1,4 +1,11 @@
-"""Skill、MCP 和 Function Tool 目录及使用。"""
+"""管理技能、连接器和工具资源，向会话提供已经授权的运行声明。
+
+核心能力
+- 维护资源目录、发布版本和个人安装开关。
+- 读取技能内容及缓存，解析连接器配置和认证凭据。
+- prepare_workspace 在工具集收集前装载授权结果，工具执行前再次刷新。
+- 资源归属和授权仍由权限服务校验，Workspace 只接收装载结果。
+"""
 
 from __future__ import annotations
 
@@ -23,6 +30,7 @@ from egis_agentkit.client.nacos._settings import (
     DEFAULT_SKILL_ARCHIVE_MAX_BYTES,
     SkillArchiveConfig,
 )
+from egis_agentkit.core.mcp import MCPAuthorization
 from egis_agentkit.errors import AgentKitError, Conflict, Forbidden, NotFound
 from egis_agentkit.service._user import UserService, require_admin
 from egis_agentkit.service.access._grant import GrantService
@@ -40,7 +48,6 @@ from egis_agentkit.storage.model import (
 from egis_agentkit.storage.model._base import publication_label, resource_available
 
 from ._connector import AuthorizedMCPClient, LocalMCPRegistry
-from ._connector_auth import MCPAuthorizationService
 from ._skill import (
     LocalSkillRegistry,
     _archive_files,
@@ -121,7 +128,7 @@ class ResourceService:
         credential_key=None,
         config=None,
     ):
-        from egis_agentkit.extension._resource_hubs_impl import (
+        from egis_agentkit.extension.resource._resource_hubs_impl import (
             LocalMCPHub,
             LocalSkillHub,
         )
@@ -137,14 +144,56 @@ class ResourceService:
         self.mcp_registry = LocalMCPRegistry(storage.assets)
         self.skill_hub = LocalSkillHub(self)
         self.mcp_hub = LocalMCPHub(self)
-        self.mcp_authorization = MCPAuthorizationService(
-            storage, key=credential_key, config=config
+        self.mcp_authorization = MCPAuthorization(
+            storage.mcp_credentials, key=credential_key, config=config
         )
         self.tool_registry = FunctionToolRegistry(self)
         self.personal = PersonalManager(
             storage, workspace_root=workspace_root, config=config
         )
         self.tool_registry.bind_default_configuration()
+
+    async def prepare_workspace(self, user, scope, workspace):
+        """在工具集收集前及每次工具执行前刷新当前会话的工具与连接器授权。"""
+        if scope is None or (
+            scope.user_id,
+            scope.project_id,
+            scope.agent_id,
+            scope.session_id,
+        ) != (
+            workspace.egis_user_id,
+            workspace.egis_project_id,
+            workspace.egis_agent_id,
+            workspace.egis_session_id,
+        ):
+            raise Forbidden("资源装配缺少一致的会话上下文")
+        if user.user_id != scope.user_id:
+            raise Forbidden("资源装配用户与会话不一致")
+        # 1. 个人助理使用当前安装项，专家使用定义中的固定绑定。
+        refs = scope.definition["payload"].get("bindings", [])
+        if scope.definition["agent_type"] == "personal":
+            selected = await self.selected_for_personal(user, "mcp", enabled_only=True)
+            refs = [
+                {
+                    key: row[key]
+                    for key in ("resource_type", "resource_id", "resource_version")
+                }
+                for row in selected.values()
+            ]
+        # 2. 重新解析连接器授权和凭据；不可用连接器不进入本轮工具集。
+        mcps = await self.mcps_for_refs(
+            user, refs, authorization_scope=scope, skip_unavailable=True
+        )
+        # 3. 筛选默认工具后交给 Core 装载，Core 不承担权限查询。
+        tools = []
+        for tool in await workspace.get_builtin_tools():
+            try:
+                await self.tool_registry.authorize(user, scope, None, tool)
+            except AgentKitError:
+                continue
+            tools.append(tool)
+        workspace.configure_workspace_resources(tools=tools, mcps=mcps)
+        await workspace.list_mcps(agent_id=scope.agent_id, session_id=scope.session_id)
 
     async def selected_for_personal(
         self, user, resource_type, rows=None, *, enabled_only=False, resource_ids=None
@@ -904,7 +953,7 @@ class ResourceService:
         return await self._save(user, "skill", data, **kwargs)
 
     async def save_mcp(self, user, data):
-        config = MCPAuthorizationService.validate_config(data.get("config"))
+        config = MCPAuthorization.validate_config(data.get("config"))
         return await self._save(user, "mcp", data, config=config)
 
     async def skill_descriptors(self, user, refs, authorization_scope=None):

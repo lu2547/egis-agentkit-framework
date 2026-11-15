@@ -87,7 +87,6 @@ class GrantService:
     def _grantable_row(kind, identifier, row, name):
         revision = (
             row.get("version")
-            or row.get("config_version")
             or row.get("publication_revision")
         )
         return {

@@ -1,13 +1,11 @@
 import pytest
-from test_domain import expert, identities
+from test_domain import agent_changes, expert, identities
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.extension._session_lock_override import ExecutionCoordinator
+from egis_agentkit.extension.runtime._session_lock_override import ExecutionCoordinator
 from egis_agentkit.service._session import SessionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.team._definition import TeamDefinition
-
-from test_domain import agent_changes
 
 
 @pytest.mark.asyncio

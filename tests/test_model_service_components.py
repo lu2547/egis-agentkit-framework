@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 from agentscope.app.storage import AsyncSQLAlchemyStorage, ChatModelConfig
 from agentscope.credential import CredentialFactory
+from config_helpers import sandbox_runtime
 
 from egis_agentkit.client.nacos._settings import AgentKitConfig, ModelSpec
 from egis_agentkit.errors import Forbidden, NotFound
@@ -31,7 +32,7 @@ def snapshot(*, version=1, default_key="a", specs=None, **policies):
     return AgentKitConfig.model_validate(
         {
             "revision": version,
-            "workspace": {"runtime": {"root": "/tmp/model-components"}}, "project": {"upload": {"max_bytes": 20_971_520}},
+            "workspace": {"runtime": sandbox_runtime("/tmp/model-components")}, "project": {"upload": {"max_bytes": 20_971_520}},
             "user": {
                 "identity": {
                     "mode": "demo",

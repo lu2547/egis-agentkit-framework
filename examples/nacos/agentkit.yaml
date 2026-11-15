@@ -189,7 +189,7 @@ agentkit:
   workspace:
     runtime:
       root: /srv/agentkit/workspace
-      mode: local
+      mode: opensandbox
       opensandbox:
         domain: 127.0.0.1:8090
         hostRoot: /srv/agentkit/workspace

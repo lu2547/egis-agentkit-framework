@@ -40,7 +40,9 @@ class AccessStorage:
     async def list_grants(self) -> list[dict]:
         async with self.engine.connect() as conn:
             rows = await conn.execute(
-                select(t.resource_access).order_by(t.resource_access.c.granted_at.desc(), t.resource_access.c.id)
+                select(t.resource_access).order_by(
+                    t.resource_access.c.granted_at.desc(), t.resource_access.c.id
+                )
             )
             return [dict(row) for row in rows.mappings()]
 
@@ -80,7 +82,10 @@ class AccessStorage:
 
     @staticmethod
     def _get_definition_table(kind):
-        return {"agent": t.agent_definition_summary, "team": t.team_definitions}.get(kind)
+        return {
+            "agent": t.agent_definition_summary,
+            "team": t.team_definition_summary,
+        }.get(kind)
 
     async def set_shared_version(self, kind, identifier, version, *, conn=None):
         """切换共享配置，同时结束其他发布版本的当前审核状态。"""
@@ -266,7 +271,10 @@ class AccessStorage:
         await conn.execute(
             update(t.resource_access)
             .where(
-                or_(t.resource_access.c.id == grant_id, t.resource_access.c.root_grant_id == grant_id),
+                or_(
+                    t.resource_access.c.id == grant_id,
+                    t.resource_access.c.root_grant_id == grant_id,
+                ),
                 t.resource_access.c.revoked_at.is_(None),
             )
             .values(revoked_at=now, revoked_by=actor)
@@ -319,7 +327,10 @@ class AccessStorage:
             update(t.resource_access)
             .where(t.resource_access.c.id.in_(select(branch.c.id)))
             .values(revoked_at=utcnow(), revoked_by=actor)
-            .returning(t.resource_access.c.grant_source_type, t.resource_access.c.source_review_id)
+            .returning(
+                t.resource_access.c.grant_source_type,
+                t.resource_access.c.source_review_id,
+            )
         )
         reviews = [
             row.source_review_id for row in rows if row.grant_source_type == "share"

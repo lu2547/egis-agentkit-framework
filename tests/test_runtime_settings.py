@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 from agentscope.app.message_bus import MessageBusKeys
 from agentscope.permission import PermissionMode
+from config_helpers import sandbox_runtime
 from test_domain import expert, identities
 
 from egis_agentkit.client.nacos._settings import (
@@ -11,8 +12,8 @@ from egis_agentkit.client.nacos._settings import (
     SessionConfig,
     SessionPermissionsConfig,
 )
+from egis_agentkit.core.message_bus import EgisMessageBus
 from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.extension._message_bus_impl import EgisMessageBus
 from egis_agentkit.service._session import SessionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 
@@ -98,7 +99,7 @@ async def test_model_update_resolves_and_persists_native_config(
         return AgentKitConfig.model_validate(
             {
                 "revision": 1,
-                "workspace": {"runtime": {"root": str(tmp_path)}}, "project": {"upload": {"max_bytes": 20_971_520}},
+                "workspace": {"runtime": sandbox_runtime(tmp_path)}, "project": {"upload": {"max_bytes": 20_971_520}},
                 "user": {
                     "identity": {
                         "mode": "demo",

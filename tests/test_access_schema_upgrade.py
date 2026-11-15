@@ -2,14 +2,12 @@
 
 import pytest
 from sqlalchemy import text
-from test_domain import expert, identities
+from test_domain import agent_changes, expert, identities
 
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.storage.model import Grant
-
-from test_domain import agent_changes
 
 
 @pytest.mark.asyncio
@@ -42,7 +40,7 @@ async def test_access_upgrade_preserves_root_and_rejects_conflicting_versions(st
             text("ALTER TABLE ak_agent_definition_summary DROP COLUMN shared_version")
         )
         await conn.execute(
-            text("ALTER TABLE ak_team_definitions DROP COLUMN shared_version")
+            text("ALTER TABLE ak_team_definition_summary DROP COLUMN shared_version")
         )
         await conn.execute(
             text(

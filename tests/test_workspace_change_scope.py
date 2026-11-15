@@ -9,11 +9,11 @@ from agentscope.app.middleware import ToolOffloadMiddleware
 from agentscope.event import ReplyEndEvent
 from agentscope.message import TextBlock
 from agentscope.tool import ToolResponse
+from runtime_helpers import file_middleware
 from sqlalchemy import select, text
 from test_domain import expert, identities
 from test_workspace_service import make_workspace
 
-from runtime_helpers import file_middleware
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.storage.model import _tables as tables
 

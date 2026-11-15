@@ -20,8 +20,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 metadata = MetaData()
 
 # 反馈保留问题和回答快照，删除原会话后仍能由管理员处理。
-session_reply_feedback = Table(
-    "ak_session_reply_feedback",
+feedback = Table(
+    "ak_feedback",
     metadata,
     Column("id", String(64), primary_key=True),
     Column("user_id", String(128), nullable=False),
@@ -51,16 +51,16 @@ session_reply_feedback = Table(
     ),
 )
 Index(
-    "uq_ak_reply_feedback_user_reply",
-    session_reply_feedback.c.user_id,
-    session_reply_feedback.c.session_id,
-    session_reply_feedback.c.reply_id,
+    "uq_ak_feedback_user_reply",
+    feedback.c.user_id,
+    feedback.c.session_id,
+    feedback.c.reply_id,
     unique=True,
 )
 Index(
-    "ix_ak_reply_feedback_created",
-    session_reply_feedback.c.created_at.desc(),
-    session_reply_feedback.c.id.desc(),
+    "ix_ak_feedback_created",
+    feedback.c.created_at.desc(),
+    feedback.c.id.desc(),
 )
 
 
@@ -169,8 +169,8 @@ Index(
     agent_definition_summary.c.agent_type,
     postgresql_where=agent_definition_summary.c.deleted_at.is_(None),
 )
-personal_agent_resources = Table(
-    "ak_personal_agent_resources",
+agent_personal_resources = Table(
+    "ak_agent_personal_resources",
     metadata,
     Column("user_id", String(128), nullable=False),
     Column(
@@ -186,13 +186,13 @@ personal_agent_resources = Table(
     CheckConstraint("resource_type IN ('skill','mcp')"),
 )
 Index(
-    "ix_ak_personal_resources_user_type",
-    personal_agent_resources.c.user_id,
-    personal_agent_resources.c.resource_type,
+    "ix_ak_agent_personal_resources_user_type",
+    agent_personal_resources.c.user_id,
+    agent_personal_resources.c.resource_type,
 )
 
-team_definitions = Table(
-    "ak_team_definitions",
+team_definition_summary = Table(
+    "ak_team_definition_summary",
     metadata,
     Column("id", String(64), primary_key=True),
     Column("owner_type", String(16), nullable=False),
@@ -204,30 +204,30 @@ team_definitions = Table(
         ForeignKey("ak_agent_definition_summary.id"),
         nullable=False,
     ),
-    Column("is_enabled", Boolean, nullable=False),
-    Column("config_version", BigInteger, nullable=False),
+    Column("deleted_at", DateTime(timezone=True)),
+    Column("owner_version", BigInteger, nullable=False),
     Column("shared_version", BigInteger),
     *audit_columns(),
     CheckConstraint("owner_type IN ('user','system')"),
-    CheckConstraint("config_version > 0"),
+    CheckConstraint("owner_version > 0"),
 )
 Index(
     "uq_ak_team_definition_name",
-    team_definitions.c.owner_type,
-    team_definitions.c.owner_id,
-    team_definitions.c.team_name,
+    team_definition_summary.c.owner_type,
+    team_definition_summary.c.owner_id,
+    team_definition_summary.c.team_name,
     unique=True,
 )
-team_definition_versions = Table(
-    "ak_team_definition_versions",
+team_definition_detail = Table(
+    "ak_team_definition_detail",
     metadata,
     Column(
         "definition_id",
         String(64),
-        ForeignKey("ak_team_definitions.id"),
+        ForeignKey("ak_team_definition_summary.id"),
         primary_key=True,
     ),
-    Column("config_version", BigInteger, primary_key=True),
+    Column("version", BigInteger, primary_key=True),
     Column("team_name", String(128), nullable=False),
     Column("team_display_name", String(128), nullable=False),
     Column("payload", JSONB, nullable=False),
@@ -238,7 +238,19 @@ team_definition_versions = Table(
         nullable=False,
         server_default=text("now()"),
     ),
-    CheckConstraint("config_version > 0"),
+    CheckConstraint("version > 0"),
+)
+Index(
+    "ix_ak_team_catalog_active",
+    team_definition_summary.c.created_at.desc(),
+    team_definition_summary.c.id.desc(),
+    postgresql_where=team_definition_summary.c.deleted_at.is_(None),
+)
+Index(
+    "ix_ak_team_owner_active",
+    team_definition_summary.c.owner_type,
+    team_definition_summary.c.owner_id,
+    postgresql_where=team_definition_summary.c.deleted_at.is_(None),
 )
 assets = Table(
     "ak_resource_assets",

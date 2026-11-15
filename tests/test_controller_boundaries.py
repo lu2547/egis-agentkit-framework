@@ -10,18 +10,16 @@ from egis_agentkit_app.bootstrap import _router as manager_router
 from egis_agentkit_app.controller.base import current_user
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from test_domain import COMPANY, expert, identities
+from test_domain import COMPANY, agent_changes, expert, identities
 from test_workspace_service import make_workspace
 
+from egis_agentkit.errors import AgentKitError, Forbidden, NotFound
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._share import ShareService
-from egis_agentkit.errors import AgentKitError, Forbidden, NotFound
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.agent._personal_manager import PersonalManager
 from egis_agentkit.service.team._definition import TeamDefinition
 from egis_agentkit.storage.model import Grant
-
-from test_domain import agent_changes
 
 
 def test_manager_openapi_carries_optional_recipient_in_share_requests():

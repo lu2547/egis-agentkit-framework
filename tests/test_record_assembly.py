@@ -5,7 +5,7 @@ def test_agent_factory_prepares_invitable_team_record_and_projects_pinned_data()
     from types import SimpleNamespace
 
     from egis_agentkit.core.agent._definition_base import AgentDefinitionBase
-    from egis_agentkit.extension._session_lock_override import projected_agent
+    from egis_agentkit.extension.runtime._session_lock_override import projected_agent
 
     agent = AgentDefinitionBase.build_agent(
         "alice",

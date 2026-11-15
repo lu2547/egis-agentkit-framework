@@ -81,15 +81,15 @@ async def test_personal_resource_user_upgrade_uses_owner_and_preserves_switches(
     async with storage.engine.begin() as connection:
         schema = await connection.scalar(text("SELECT current_schema()"))
         columns = await connection.run_sync(
-            lambda conn: inspect(conn).get_columns("ak_personal_agent_resources")
+            lambda conn: inspect(conn).get_columns("ak_agent_personal_resources")
         )
         if any(column["name"] == "user_id" for column in columns):
             await connection.execute(
-                text("ALTER TABLE ak_personal_agent_resources DROP COLUMN user_id")
+                text("ALTER TABLE ak_agent_personal_resources DROP COLUMN user_id")
             )
         # 操作者可以与资源归属不同，回填必须取个人助理的 owner_id。
         await connection.execute(
-            text("UPDATE ak_personal_agent_resources SET created_by='admin'")
+            text("UPDATE ak_agent_personal_resources SET created_by='admin'")
         )
         assert await migrate_personal_resources(connection, schema) == "pending"
         assert (
@@ -135,12 +135,12 @@ async def test_personal_switches_are_independent_and_follow_current_shared_versi
     assert selected["report"]["resource_version"] == "2.0.0"
     async with storage.engine.connect() as connection:
         rows = (
-            (await connection.execute(select(t.personal_agent_resources)))
+            (await connection.execute(select(t.agent_personal_resources)))
             .mappings()
             .all()
         )
         columns = await connection.run_sync(
-            lambda conn: inspect(conn).get_columns("ak_personal_agent_resources")
+            lambda conn: inspect(conn).get_columns("ak_agent_personal_resources")
         )
     assert len(rows) == 2
     assert not {"version", "resource_version", "payload"} & {
@@ -181,7 +181,7 @@ async def test_personal_switch_upgrade_keeps_latest_choice_and_other_hubs(
         )
     async with storage.engine.begin() as connection:
         schema = await connection.scalar(text("SELECT current_schema()"))
-        await connection.run_sync(lambda conn: t.personal_agent_resources.drop(conn))
+        await connection.run_sync(lambda conn: t.agent_personal_resources.drop(conn))
         assert await migrate_personal_resources(connection, schema) == "pending"
         assert (
             await migrate_personal_resources(connection, schema, apply=True)

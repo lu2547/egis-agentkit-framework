@@ -2,9 +2,9 @@ import pytest
 from agentscope.app.message_bus import MessageBusKeys
 from test_domain import expert, identities
 
-from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.service._session import SessionService
+from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
@@ -62,8 +62,8 @@ async def test_workspace_http_routes_and_project_upload_persist(storage, tmp_pat
     changes = ProjectFileManager(storage, tmp_path)
     from types import SimpleNamespace
 
-    from egis_agentkit.service.project._file_manager import ProjectFileManager
     from egis_agentkit.service.project._document_preview import DocumentPreviewService
+    from egis_agentkit.service.project._file_manager import ProjectFileManager
 
     files = ProjectFileStorage(tmp_path)
     app.state.egis_services = SimpleNamespace(
@@ -140,7 +140,7 @@ async def test_workspace_http_routes_and_project_upload_persist(storage, tmp_pat
 
 @pytest.mark.asyncio
 async def test_team_delete_rejects_member_run_then_cascades(storage, tmp_path):
-    from egis_agentkit.extension._message_bus_impl import EgisMessageBus
+    from egis_agentkit.core.message_bus import EgisMessageBus
     from egis_agentkit.service.team._definition import TeamDefinition
 
     _, _, alice, _ = await identities(storage)
@@ -231,7 +231,7 @@ async def test_task_dto_reads_persisted_native_plan(storage, tmp_path):
 
 @pytest.mark.asyncio
 async def test_owner_can_delete_after_system_agent_grant_revoked(storage, tmp_path):
-    from egis_agentkit.extension._message_bus_impl import EgisMessageBus
+    from egis_agentkit.core.message_bus import EgisMessageBus
     from egis_agentkit.storage.model import Grant
 
     users, admin, alice, bob = await identities(storage)

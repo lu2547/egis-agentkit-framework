@@ -21,9 +21,7 @@ def build_definition_data(row: dict) -> dict:
     data = model.model_validate(
         {key: row[key] for key in model.model_fields}
     ).model_dump(mode="json")
-    version = (
-        data["version"] if row["definition_type"] == "agent" else data["config_version"]
-    )
+    version = data["version"]
     return {
         **data,
         "resource_version": str(version),
@@ -33,7 +31,7 @@ def build_definition_data(row: dict) -> dict:
 
 def _get_definition_table(definition_type):
     """按业务类型选择汇总表。"""
-    return {"agent": t.agent_definition_summary, "team": t.team_definitions}[
+    return {"agent": t.agent_definition_summary, "team": t.team_definition_summary}[
         definition_type
     ]
 
@@ -53,8 +51,8 @@ def _build_definition_record(table, row):
         "agent_type": None,
         "agent_name": None,
         "agent_display_name": None,
-        "resource_version": str(row["config_version"]),
-        "version_label": publication_label(row["config_version"]),
+        "resource_version": str(row["version"]),
+        "version_label": publication_label(row["version"]),
     }
 
 
@@ -62,7 +60,7 @@ def _get_version_table(table):
     return (
         t.agent_definition_detail
         if table is t.agent_definition_summary
-        else t.team_definition_versions
+        else t.team_definition_detail
     )
 
 
@@ -76,20 +74,14 @@ def _build_definition_query(table, version=None):
         table.c.owner_id,
         table.c.created_by,
         table.c.created_at,
+        table.c.deleted_at,
+        table.c.owner_version,
+        table.c.shared_version,
     )
     if agent:
-        identity += (
-            table.c.agent_type,
-            table.c.deleted_at,
-            table.c.owner_version,
-            table.c.shared_version,
-        )
-        selected = table.c.owner_version if version is None else version
-        version_column = details.c.version
-    else:
-        identity += (table.c.is_enabled,)
-        selected = table.c.config_version if version is None else version
-        version_column = details.c.config_version
+        identity += (table.c.agent_type,)
+    selected = table.c.owner_version if version is None else version
+    version_column = details.c.version
     kind = "agent" if agent else "team"
     return select(
         *identity,
@@ -186,7 +178,7 @@ class DefinitionStorage:
         self, definition_id, *, conn, version=None, locked=False
     ):
         """跨两张主表查找定义，写入时只锁定主记录。"""
-        for table in (t.agent_definition_summary, t.team_definitions):
+        for table in (t.agent_definition_summary, t.team_definition_summary):
             query = _build_definition_query(table, version).where(
                 table.c.id == definition_id
             )
@@ -299,11 +291,7 @@ class DefinitionStorage:
         versions = _get_version_table(
             _get_definition_table(definition["definition_type"])
         )
-        number = (
-            versions.c.version
-            if definition["definition_type"] == "agent"
-            else versions.c.config_version
-        )
+        number = versions.c.version
         rows = await conn.execute(
             select(number)
             .where(versions.c.definition_id == definition_id)
@@ -314,18 +302,15 @@ class DefinitionStorage:
     async def list_grantable_versions(self, kind, *, excluded_agent_types):
         """读取每项可独立授权的当前共享版本或所有者版本。"""
         identity = _get_definition_table(kind)
-        owner = (
-            identity.c.owner_version if kind == "agent" else identity.c.config_version
-        )
+        owner = identity.c.owner_version
         selected = func.coalesce(identity.c.shared_version, owner)
-        query = _build_definition_query(identity, selected)
+        query = _build_definition_query(identity, selected).where(
+            identity.c.deleted_at.is_(None)
+        )
         if kind == "agent":
             query = query.where(
-                identity.c.deleted_at.is_(None),
                 identity.c.agent_type.not_in(excluded_agent_types),
             )
-        else:
-            query = query.where(identity.c.is_enabled)
         async with self.engine.connect() as connection:
             rows = (
                 await connection.execute(query.order_by(identity.c.created_at.desc()))
@@ -404,11 +389,11 @@ class DefinitionStorage:
 
     async def _add_first_version(self, values, *, actor, conn) -> dict:
         """持有定义锁时，在同一事务中写入主记录和首版。"""
-        if values["config_version"] != 1:
-            raise Conflict("新资源的 config_version 必须为 1")
+        if values["owner_version"] != 1:
+            raise Conflict("新资源的 owner_version 必须为 1")
         table = _get_definition_table(values["definition_type"])
         fields = {key: value for key, value in values.items() if key in table.c}
-        if table is t.team_definitions:
+        if table is t.team_definition_summary:
             fields["orchestrator_id"] = values["payload"]["orchestrator"][
                 "definition_id"
             ]
@@ -442,7 +427,7 @@ class DefinitionStorage:
         await conn.execute(
             insert(versions).values(
                 definition_id=values["id"],
-                config_version=version,
+                version=version,
                 **fields,
                 created_by=actor,
                 created_at=now,
@@ -463,30 +448,25 @@ class DefinitionStorage:
                 definition_id, values, actor=actor, conn=conn
             )
         conn = transaction_connection(self.engine, conn)
-        expected = values["config_version"]
+        expected = values["owner_version"]
         kind = values["definition_type"]
         table = _get_definition_table(kind)
         name = f"{kind}_name"
         identity = {"owner_type": values["owner_type"], "owner_id": values["owner_id"]}
-        if kind == "agent":
-            identity["agent_type"] = values["agent_type"]
-        else:
-            identity["orchestrator_id"] = values["payload"]["orchestrator"][
-                "definition_id"
-            ]
+        identity["orchestrator_id"] = values["payload"]["orchestrator"]["definition_id"]
         now = utcnow()
         result = await conn.execute(
             update(table)
             .where(
                 table.c.id == definition_id,
                 table.c.id == values["id"],
-                table.c.config_version == expected,
+                table.c.owner_version == expected,
+                table.c.deleted_at.is_(None),
                 *(table.c[key] == value for key, value in identity.items()),
             )
             .values(
                 **{name: values[name]},
-                is_enabled=values["is_enabled"],
-                config_version=expected + 1,
+                owner_version=expected + 1,
                 updated_by=actor,
                 updated_at=now,
             )
@@ -501,7 +481,7 @@ class DefinitionStorage:
     async def delete_definition(
         self, definition_id: str, *, actor: str, conn: AsyncConnection | None = None
     ) -> None:
-        """停用主记录并保留所有已发布配置。"""
+        """标记定义删除并保留所有已发布配置。"""
         conn = transaction_connection(self.engine, conn)
         record = await self.get_locked_definition(definition_id, conn=conn)
         if record is None:
@@ -513,6 +493,6 @@ class DefinitionStorage:
         table = _get_definition_table(record["definition_type"])
         await conn.execute(
             update(table)
-            .where(table.c.id == definition_id)
-            .values(is_enabled=False, updated_by=actor, updated_at=utcnow())
+            .where(table.c.id == definition_id, table.c.deleted_at.is_(None))
+            .values(deleted_at=utcnow(), updated_by=actor, updated_at=utcnow())
         )

@@ -32,8 +32,8 @@ from egis_agentkit.client.remote_agent._factory import (
 from egis_agentkit.client.remote_agent._http_callback import (
     CallbackHTTPRemoteAgentClient,
 )
+from egis_agentkit.core.message_bus import EgisMessageBus
 from egis_agentkit.errors import AgentKitError, Conflict
-from egis_agentkit.extension._message_bus_impl import EgisMessageBus
 from egis_agentkit.storage._remote_agent import RemoteRunStorage
 from egis_agentkit.storage.model._remote_agent import RemoteRunRequest, RemoteRunResult
 from egis_agentkit.storage.model.agent._remote_config import (

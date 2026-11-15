@@ -1,4 +1,15 @@
-"""管理连接器凭据、OAuth 授权、刷新和撤销。"""
+"""实现 MCP 连接认证，供资源管理与会话运行复用。
+
+核心能力
+- validate_config 校验连接的认证方式及对应配置。
+- set_api_key、status 保存个人 API Key 并读取连接认证状态。
+- start、callback 完成 OAuth 服务发现、PKCE 和授权码交换。
+- headers 生成请求头，按需串行刷新过期令牌。
+- revoke 清除本地凭据，并尝试撤销提供方令牌。
+
+凭据按用户和连接版本隔离；持久化及事务锁交给注入的凭据存储。
+平台资源使用权限由管理入口与 Access 校验。
+"""
 
 from __future__ import annotations
 
@@ -18,12 +29,14 @@ from egis_agentkit.client.nacos._settings import (
     ConnectorOAuthConfig,
 )
 from egis_agentkit.errors import AgentKitError, Forbidden
+from egis_agentkit.storage._resource import MCPCredentialStorage
 from egis_agentkit.storage.model import (
     utcnow,
 )
 
 
 def _https(url):
+    """解析 OAuth 端点，拒绝明文连接及携带用户信息的 URL。"""
     if not isinstance(url, str) or any(ord(character) <= 32 for character in url):
         raise ValueError("MCP OAuth URL is required")
     parsed = urlsplit(url)
@@ -42,18 +55,29 @@ def _https(url):
 
 
 def _origin(parsed):
+    """取得协议、主机和有效端口，用于验证元数据来源。"""
     return parsed.scheme, parsed.hostname, parsed.port or 443
 
 
 def _digest(value):
+    """计算连接身份或 OAuth state 的不可逆摘要。"""
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-class MCPAuthorizationService:
+class MCPAuthorization:
+    """实现 MCP 认证及凭据生命周期，复用独立的凭据存储。"""
+
     def __init__(
-        self, storage, *, key=None, redirect_uri=None, transport=None, config=None
+        self,
+        credentials: MCPCredentialStorage,
+        *,
+        key=None,
+        redirect_uri=None,
+        transport=None,
+        config=None,
     ):
-        self.storage = storage.mcp_credentials
+        """注入凭据存储和认证配置，初始化加密器及 HTTP 传输。"""
+        self.credentials = credentials
         self.config = config
         value = key or os.environ.get(self.settings.credential_key_env)
         self.cipher = Fernet(value) if value else None
@@ -62,6 +86,7 @@ class MCPAuthorizationService:
 
     @property
     def settings(self) -> ConnectorOAuthConfig:
+        """取得当前已校验的认证配置，保留配置更新后的实时限额。"""
         if self.config is None:
             return ConnectorOAuthConfig(
                 redirect_uri_env="AGENTKIT_MCP_OAUTH_REDIRECT_URI"
@@ -70,6 +95,8 @@ class MCPAuthorizationService:
 
     @staticmethod
     def validate_config(config):
+        """按认证方式校验配置，只接受该方式支持的字段。"""
+        # 1. 限定受管 MCP 的传输协议和认证方式。
         fields = {
             "transport",
             "url",
@@ -89,6 +116,7 @@ class MCPAuthorizationService:
         if method not in ("none", "api_key", "oauth"):
             raise ValueError("Unknown MCP authentication method")
         config["auth_type"] = method
+        # 2. 校验 API Key 请求头或 OAuth 客户端参数。
         allowed = {"transport", "url", "auth_type"}
         if method != "none":
             _https(config.get("url"))
@@ -127,12 +155,14 @@ class MCPAuthorizationService:
         return config
 
     def _config(self, asset, expected=None):
+        """读取资源版本中的连接配置，并核对本次操作的认证方式。"""
         config = asset["payload"].get("config", {})
         if expected is not None and config.get("auth_type") != expected:
             raise ValueError("MCP connection authentication method does not match")
         return config
 
     def _connection(self, asset):
+        """将资源 ID、版本及端点摘要组合为独立的连接身份。"""
         return _digest(
             json.dumps(
                 [
@@ -144,11 +174,13 @@ class MCPAuthorizationService:
         )
 
     def _encrypt(self, value):
+        """将凭据和待完成的 OAuth 流程加密后交给存储。"""
         if self.cipher is None:
             raise AgentKitError("MCP 凭证存储未配置", 503)
         return self.cipher.encrypt(json.dumps(value).encode())
 
     def _decrypt(self, value):
+        """还原加密内容；密钥缺失或密文无效时要求重新认证。"""
         if self.cipher is None:
             raise AgentKitError("MCP 凭证存储未配置", 503)
         try:
@@ -157,6 +189,7 @@ class MCPAuthorizationService:
             raise AgentKitError("MCP 凭证不可读取，请重新授权", 503) from None
 
     def _http(self, settings):
+        """为一次认证请求创建限时客户端，禁止自动跟随重定向。"""
         return httpx.AsyncClient(
             transport=self.transport,
             timeout=settings.timeout_seconds,
@@ -165,6 +198,7 @@ class MCPAuthorizationService:
 
     @staticmethod
     def _header_value(value):
+        """校验密钥或令牌可安全放入 HTTP 请求头。"""
         if (
             not isinstance(value, str)
             or not value
@@ -175,18 +209,22 @@ class MCPAuthorizationService:
         return value
 
     async def set_api_key(self, user, asset, *, key):
+        """校验并加密保存当前用户对该连接版本的 API Key。"""
+        # 1. 核对认证方式并加密凭据。
         self._config(asset, "api_key")
         credential = self._encrypt({"key": self._header_value(key)})
         identity = user.user_id, self._connection(asset)
-        async with self.storage.write() as credentials:
+        # 2. 由 Storage 锁定该用户的连接凭据并原子写入。
+        async with self.credentials.write() as credentials:
             await credentials.lock(*identity)
             await credentials.update(*identity, credential=credential)
         return {"authorized": True}
 
     async def status(self, user, asset):
+        """读取当前用户的连接认证状态，仅返回状态而不暴露凭据。"""
         settings = self.settings
         method = self._config(asset).get("auth_type", "none")
-        row = await self.storage.read(user.user_id, self._connection(asset))
+        row = await self.credentials.read(user.user_id, self._connection(asset))
         authorized = method == "none"
         if row and row["credential"]:
             credential = self._decrypt(row["credential"])
@@ -196,6 +234,8 @@ class MCPAuthorizationService:
         return {"auth_type": method, "authorized": authorized}
 
     async def _discover(self, http, config):
+        """发现受保护资源及授权服务器，验证资源身份和 PKCE 能力。"""
+        # 1. 从认证挑战或约定地址发现受保护资源元数据。
         resource = config["url"]
         server = _https(resource)
         probe = await http.get(resource)
@@ -223,6 +263,7 @@ class MCPAuthorizationService:
                 dict.fromkeys([well_known + server.path.rstrip("/"), well_known])
             )
         metadata = await self._metadata(http, candidates)
+        # 2. 核对元数据的资源身份，取得授权服务器地址。
         registered_resource = _https(metadata.get("resource"))
         if _origin(registered_resource) != _origin(server) or (
             registered_resource.path.rstrip("/") != server.path.rstrip("/")
@@ -248,6 +289,7 @@ class MCPAuthorizationService:
                 root + path + "/.well-known/openid-configuration",
             ],
         )
+        # 3. 验证授权服务器身份、必要端点和 PKCE S256。
         if authorization.get("issuer") != issuer or "S256" not in authorization.get(
             "code_challenge_methods_supported", []
         ):
@@ -268,6 +310,7 @@ class MCPAuthorizationService:
 
     @staticmethod
     async def _metadata(http, urls):
+        """依次读取候选元数据地址，返回首个成功的 JSON 对象。"""
         for url in dict.fromkeys(urls):
             response = await http.get(url, headers={"Accept": "application/json"})
             if response.status_code == 200:
@@ -277,6 +320,8 @@ class MCPAuthorizationService:
         raise ValueError("MCP OAuth metadata could not be discovered")
 
     async def start(self, user, asset):
+        """发现 OAuth 提供方，保存待完成流程并生成用户授权地址。"""
+        # 1. 校验客户端部署配置，生成 state 和 PKCE 挑战。
         settings = self.settings
         config = self._config(asset, "oauth")
         redirect_uri = self.redirect_uri or settings.redirect_uri
@@ -292,6 +337,7 @@ class MCPAuthorizationService:
             .decode()
             .rstrip("=")
         )
+        # 2. 发现授权服务器；未提供客户端 ID 时按其声明注册公开客户端。
         try:
             async with self._http(settings) as http:
                 server, scope = await self._discover(http, config)
@@ -315,6 +361,7 @@ class MCPAuthorizationService:
                     raise ValueError("OAuth public client registration is required")
         except (httpx.HTTPError, ValueError, TypeError, AttributeError):
             raise AgentKitError("MCP OAuth 服务发现或注册失败", 502) from None
+        # 3. 构建授权地址及完成回调所需的加密上下文。
         params = {
             "response_type": "code",
             "client_id": client_id,
@@ -342,7 +389,8 @@ class MCPAuthorizationService:
             "code_verifier": verifier,
         }
         identity = user.user_id, self._connection(asset)
-        async with self.storage.write() as credentials:
+        # 4. 原子保存 state 摘要和有效期，原始凭据不写入公开资源配置。
+        async with self.credentials.write() as credentials:
             await credentials.lock(*identity)
             await credentials.update(
                 *identity,
@@ -354,11 +402,13 @@ class MCPAuthorizationService:
         return {"authorization_url": url, "state": state}
 
     async def callback(self, user, asset, *, state, code):
+        """验证一次性 state，将授权码交换成当前用户的连接令牌。"""
         settings = self.settings
         identity = user.user_id, self._connection(asset)
         self._config(asset, "oauth")
         credential = None
-        async with self.storage.write() as credentials:
+        # 1. 锁定该用户的连接，验证 state 及有效期。
+        async with self.credentials.write() as credentials:
             row = await credentials.lock(*identity)
             if (
                 not row["oauth_state_hash"]
@@ -367,6 +417,7 @@ class MCPAuthorizationService:
             ):
                 raise Forbidden("OAuth state 已失效")
             pending = self._decrypt(row["oauth_pending"])
+            # 2. 消费待完成流程，拒绝重复使用同一个授权回调。
             await credentials.update(
                 *identity,
                 oauth_state_hash=None,
@@ -374,7 +425,7 @@ class MCPAuthorizationService:
                 oauth_expires_at=None,
             )
             if code:
-                # 交换与写回同一凭据，防止并发撤销后重新写入令牌。
+                # 3. 交换与写回保持在同一凭据锁内，防止并发撤销后重新写入。
                 credential = await self._exchange(
                     pending,
                     settings,
@@ -392,6 +443,7 @@ class MCPAuthorizationService:
         return {"authorized": True}
 
     async def _exchange(self, details, settings, **params):
+        """交换授权码或刷新令牌，验证令牌类型、内容及有效期。"""
         try:
             async with self._http(settings) as http:
                 response = await http.post(
@@ -429,19 +481,22 @@ class MCPAuthorizationService:
 
     @staticmethod
     def _fresh(credential, settings):
+        """判断令牌是否仍在配置的提前刷新窗口之外。"""
         return (
             credential.get("expires_at", 0)
             > utcnow().timestamp() + settings.refresh_window_seconds
         )
 
     async def headers(self, user, asset):
+        """取得认证请求头；令牌将过期时在凭据锁内完成一次刷新。"""
+        # 1. 无认证直接返回；其他方式读取当前用户、当前连接版本的凭据。
         settings = self.settings
         config = self._config(asset)
         method = config.get("auth_type", "none")
         if method == "none":
             return {}
         identity = user.user_id, self._connection(asset)
-        row = await self.storage.read(*identity)
+        row = await self.credentials.read(*identity)
         credential = (
             self._decrypt(row["credential"]) if row and row["credential"] else None
         )
@@ -453,8 +508,9 @@ class MCPAuthorizationService:
             return {
                 header: "Bearer " + key if header.lower() == "authorization" else key
             }
+        # 2. 过期前重新加锁读取，复用其他并发请求已经刷新的令牌。
         if not self._fresh(credential, settings):
-            async with self.storage.write() as credentials:
+            async with self.credentials.write() as credentials:
                 row = await credentials.lock(*identity)
                 credential = (
                     self._decrypt(row["credential"]) if row["credential"] else None
@@ -474,16 +530,19 @@ class MCPAuthorizationService:
                         *identity,
                         credential=self._encrypt(credential) if credential else None,
                     )
+        # 3. 拒绝失效凭据，只将可用令牌交给调用方装配连接。
         if not credential or credential["expires_at"] <= utcnow().timestamp():
             raise Forbidden("MCP 授权已过期，请重新授权")
         return {"Authorization": "Bearer " + credential["access_token"]}
 
     async def revoke(self, user, asset):
+        """先清除本地认证状态，再尝试撤销提供方令牌。"""
         settings = self.settings
         if not user.is_enabled:
             raise Forbidden()
         identity = user.user_id, self._connection(asset)
-        async with self.storage.write() as credentials:
+        # 1. 在凭据锁内清空令牌及待完成流程，本地撤销立即生效。
+        async with self.credentials.write() as credentials:
             row = await credentials.lock(*identity)
             encrypted = row["credential"]
             await credentials.update(
@@ -493,6 +552,7 @@ class MCPAuthorizationService:
                 oauth_pending=None,
                 oauth_expires_at=None,
             )
+        # 2. 提供方撤销失败不恢复本地凭据，结果中标明远端撤销状态。
         try:
             credential = self._decrypt(encrypted) if encrypted else None
         except AgentKitError:

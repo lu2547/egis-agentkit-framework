@@ -1,13 +1,11 @@
 """真实 PG 中升级 Agent 表名和版本字段，保留定义、共享与授权。"""
 
 from sqlalchemy import text
-from test_domain import COMPANY, expert, identities
+from test_domain import COMPANY, agent_changes, expert, identities
 
 from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.storage._schema import upgrade_schema
-
-from test_domain import agent_changes
 
 
 async def test_agent_upgrade_preserves_versions_access_and_deleted_state(storage):

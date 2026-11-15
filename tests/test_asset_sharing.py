@@ -2,8 +2,8 @@ import pytest
 from sqlalchemy import select
 from test_domain import COMPANY, identities
 
-from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.errors import Conflict, Forbidden
+from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.storage import tables as t
 

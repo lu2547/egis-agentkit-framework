@@ -3,16 +3,18 @@ from pathlib import Path
 import pytest
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import Read
+from runtime_helpers import project_prompt
 from test_domain import expert, identities
 
-from egis_agentkit.service.access._permission import PermissionService
-from egis_agentkit.extension._session_lock_override import (
+from egis_agentkit.extension.resource._tool_access_callback import (
+    tool_access_middleware,
+)
+from egis_agentkit.extension.runtime._session_lock_override import (
     ExecutionCoordinator,
     execution_scope,
 )
-from egis_agentkit.extension._tool_access_callback import tool_access_middleware
-from runtime_helpers import project_prompt
 from egis_agentkit.service._session import SessionService
+from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 
 

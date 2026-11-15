@@ -13,7 +13,6 @@ from egis_agentkit.errors import AgentKitError, Conflict, Forbidden, NotFound
 from egis_agentkit.service._session import SessionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.project._document_preview import DocumentPreviewService
-from egis_agentkit.service.project._file_manager import ProjectFileManager
 from egis_agentkit.service.project._project_manager import ProjectManager
 from egis_agentkit.storage.project._files import ProjectFileStorage
 

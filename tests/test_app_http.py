@@ -4,13 +4,14 @@ from functools import partial
 
 import httpx
 import pytest
+from config_helpers import sandbox_runtime
 from egis_agentkit_app.bootstrap import build_app
 from test_domain import identities
 
 from egis_agentkit.client.nacos import AgentKitConfig, NacosBootstrap, NacosClient
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.extension._agent_tools_callback import BoundToolFactory
-from egis_agentkit.extension._session_storage_override import ExecutionStorage
+from egis_agentkit.extension.runtime._agent_tools_callback import BoundToolFactory
+from egis_agentkit.extension.runtime._session_storage_override import ExecutionStorage
 
 
 class Config:
@@ -30,7 +31,7 @@ def app_snapshot(tmp_path, **domains):
         {
             "revision": 1,
             "client": {"postgres": {"connection": {"url_env": "TEST_DB_URL"}}},
-            "workspace": {"runtime": {"root": str(tmp_path)}},
+            "workspace": {"runtime": sandbox_runtime(tmp_path)},
             "project": {
                 "upload": {"max_bytes": 20_971_520},
                 "download": {"secret_env": "TEST_DOWNLOAD"},

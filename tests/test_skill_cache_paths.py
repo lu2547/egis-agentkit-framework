@@ -5,8 +5,8 @@ import pytest
 from test_domain import COMPANY, identities
 from test_resources import archive, put_asset
 
-from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.errors import Forbidden
+from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.agent._personal_manager import PersonalManager
 from egis_agentkit.service.resource._catalog import ResourceService

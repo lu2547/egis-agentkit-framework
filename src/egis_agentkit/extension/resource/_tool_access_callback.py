@@ -4,9 +4,8 @@ from egis_agentkit.extension import (
     TeamPromptMiddleware,
     ToolAccessMiddleware,
 )
+from egis_agentkit.extension.team._team_invite_callback import apply_invitations
 from egis_agentkit.service.team._collaboration import collaborators, team_say_allowed
-
-from ._team_invite_callback import apply_invitations
 
 
 def tool_access_callbacks(user, scope, permissions):

@@ -10,7 +10,6 @@ from agentscope.permission import PermissionBehavior, PermissionDecision
 
 from egis_agentkit.errors import AgentKitError, Forbidden
 
-
 if TYPE_CHECKING:
     from agentscope.agent import Agent
     from agentscope.skill import Skill

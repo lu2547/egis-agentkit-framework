@@ -8,6 +8,7 @@ from egis_agentkit.errors import Conflict, Forbidden, InvalidRequest, NotFound
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.storage.model import TeamDefinitionRecord, new_id
+from egis_agentkit.storage.model._base import resource_available
 from egis_agentkit.storage.model._definition import EXPERT_TYPES
 
 
@@ -100,7 +101,7 @@ class TeamDefinition:
     async def versions(self, user, identifier: str) -> list[dict]:
         """列出用户有权维护或独立使用的专家团版本。"""
         source = await self._team_definition(identifier)
-        if not source["is_enabled"]:
+        if not resource_available(source):
             raise Forbidden("资源已停用")
         return await self.permissions.definition_versions(user, source)
 
@@ -109,7 +110,7 @@ class TeamDefinition:
         rows, states = await self.repository.list_definitions_and_reviews("team")
         result = []
         for row in rows:
-            if not row["is_enabled"]:
+            if not resource_available(row):
                 continue
             try:
                 value = await self._describe(user, row)
@@ -120,7 +121,7 @@ class TeamDefinition:
         return result
 
     async def delete(self, user, identifier: str) -> None:
-        """在同一事务中停用专家团及其主理人。"""
+        """在同一事务中标记专家团及其主理人删除，并撤销授权。"""
         async with self.storage.definition_write() as write:
             row = await write.definitions.get_locked_definition(identifier)
             if row is None or row["definition_type"] != "team":
@@ -166,13 +167,15 @@ class TeamDefinition:
             previous = await write.definitions.get_locked_definition(identifier)
             if previous and previous["definition_type"] != "team":
                 raise Forbidden("该 ID 已由 Agent 定义使用")
+            if previous and not resource_available(previous):
+                raise Forbidden("专家团已删除")
             if previous and (previous["owner_type"], previous["owner_id"]) != (
                 owner_type,
                 owner_id,
             ):
                 raise Forbidden("不能改变专家团归属")
-            expected = previous["config_version"] if previous else 1
-            if data.get("config_version", 1) != expected:
+            expected = previous["owner_version"] if previous else 1
+            if data.get("owner_version", 1) != expected:
                 raise Conflict("专家团配置已变更，请刷新后重试")
             orch = data["orchestrator_config"]
             # 只解析一次成员配置，将实际获准使用的版本保存到专家团。
@@ -232,7 +235,7 @@ class TeamDefinition:
                 owner_id=owner_id,
                 team_name=data["team_name"],
                 team_display_name=data["team_display_name"],
-                config_version=data.get("config_version", 1),
+                owner_version=data.get("owner_version", 1),
                 payload={
                     **{
                         k: data.get("payload", {}).get(k, default)

@@ -146,7 +146,11 @@ class AgentDefinitionStorage:
             raise Conflict("新 Agent 的 owner_version 必须为 1")
         previous = await self.get_locked_definition(definition_values["id"], conn=conn)
         team_exists = await conn.scalar(
-            select(exists().where(t.team_definitions.c.id == definition_values["id"]))
+            select(
+                exists().where(
+                    t.team_definition_summary.c.id == definition_values["id"]
+                )
+            )
         )
         if previous is not None or team_exists:
             raise Conflict("定义已存在")

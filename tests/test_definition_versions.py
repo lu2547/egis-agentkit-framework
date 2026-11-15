@@ -91,7 +91,7 @@ async def test_team_versions_keep_pinned_leader_and_expert_versions(storage):
         {
             **data,
             "id": first["id"],
-            "config_version": first["config_version"],
+            "owner_version": first["owner_version"],
             "members": [{**member, "resource_version": "1"}],
             "orchestrator_config": {
                 "agent_name": "leader",
@@ -100,7 +100,7 @@ async def test_team_versions_keep_pinned_leader_and_expert_versions(storage):
         },
     )
     third = await teams.save(
-        alice, {**data, "id": first["id"], "config_version": second["config_version"]}
+        alice, {**data, "id": first["id"], "owner_version": second["owner_version"]}
     )
     historical = await teams.read(alice, first["id"], version="1")
     assert not historical["is_editable"]

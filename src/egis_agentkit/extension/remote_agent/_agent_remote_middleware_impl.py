@@ -19,14 +19,15 @@ from agentscope.tool import ToolResponse
 from sqlalchemy.engine import RowMapping
 
 from egis_agentkit.client.remote_agent._base import RemoteAgentClientBase
+from egis_agentkit.extension.remote_agent._remote_agent_callback import (
+    RemoteAgentRuntime,
+)
 from egis_agentkit.storage.model._remote_agent import (
     RemoteAttachmentRef,
     RemoteRunRequest,
     RemoteRunResult,
 )
 from egis_agentkit.storage.model.agent._remote_config import validate_endpoint
-
-from ._remote_agent_callback import RemoteAgentRuntime
 
 logger = logging.getLogger(__name__)
 _TEAM_MESSAGE = re.compile(r'<team-message from="[^"]+">\n(.*)\n</team-message>$', re.S)

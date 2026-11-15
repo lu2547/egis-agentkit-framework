@@ -15,8 +15,8 @@ from agentscope.app.storage import AgentRecord, SessionRecord
 from egis_agentkit.client.nacos._settings import AccessConfig, AgentKitConfig
 from egis_agentkit.core.agent._definition_base import AgentDefinitionBase
 from egis_agentkit.core.agent._personal_definition import PersonalDefinition
+from egis_agentkit.core.message_bus import EgisMessageBus
 from egis_agentkit.errors import AgentKitError, Forbidden, NotFound
-from egis_agentkit.extension._message_bus_impl import EgisMessageBus
 from egis_agentkit.service._user import UserService
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.agent._personal_manager import PersonalManager

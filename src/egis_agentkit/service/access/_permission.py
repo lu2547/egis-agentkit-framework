@@ -135,7 +135,7 @@ class PermissionService:
         if view == "system" and not (editable or decision.is_allowed):
             raise Forbidden()
         current = version is None or str(
-            source.get("owner_version", source.get("config_version"))
+            source["owner_version"]
         ) == str(version)
         return DefinitionAccess(
             view, editable and current and view != "shared", decision

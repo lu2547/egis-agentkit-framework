@@ -25,14 +25,14 @@ from runtime_helpers import file_middleware, project_prompt, session_middlewares
 import egis_agentkit.extension as components
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.extension import RuntimeCallbackMiddleware
-from egis_agentkit.extension._agent_tools_callback import BoundToolFactory
-from egis_agentkit.extension._session_lock_override import (
-    ExecutionScope,
-    execution_scope,
-)
-from egis_agentkit.extension._tool_access_callback import (
+from egis_agentkit.extension.resource._tool_access_callback import (
     team_prompt_middleware,
     tool_access_middleware,
+)
+from egis_agentkit.extension.runtime._agent_tools_callback import BoundToolFactory
+from egis_agentkit.extension.runtime._session_lock_override import (
+    ExecutionScope,
+    execution_scope,
 )
 
 
@@ -50,11 +50,11 @@ from egis_agentkit.extension import (
     ToolAccessMiddleware,
     UserPreferenceMiddleware,
 )
-from egis_agentkit.extension._skill_loader_impl import LiveSkillLoader
+from egis_agentkit.extension.resource._skill_loader_impl import LiveSkillLoader
 
 forbidden = (
     "egis_agentkit.service",
-    "egis_agentkit.extension._session_lock_override",
+    "egis_agentkit.extension.runtime._session_lock_override",
     "egis_agentkit_app",
 )
 loaded = sorted(
@@ -126,6 +126,10 @@ class Resources:
         self.installed = []
         self.scopes = []
 
+    async def prepare_workspace(self, user, scope, workspace):
+        """替代业务资源装载，独立测试使用真实 ResourceService 验证其实现。"""
+        assert user.user_id == scope.user_id
+
     @property
     def personal(self):
         return self
@@ -179,7 +183,7 @@ class Permissions:
 def skill_loader(user, scope, resources):
     # Fail with a useful assertion before importing a not-yet-created package.
     component("SkillBindingMiddleware")
-    from egis_agentkit.extension._skill_loader_impl import LiveSkillLoader
+    from egis_agentkit.extension.resource._skill_loader_impl import LiveSkillLoader
 
     return LiveSkillLoader(user, scope, resources)
 

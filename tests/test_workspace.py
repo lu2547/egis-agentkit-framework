@@ -113,12 +113,10 @@ def test_discovery_preserves_newer_artifact_and_requires_explicit_code_delivery(
 
 
 @pytest.mark.asyncio
-async def test_shared_native_workspace_initializes_each_project_directory(tmp_path):
-    from egis_agentkit.service.workspace._local_manager import (
-        LocalWorkspaceManager,
-    )
+async def test_shared_native_workspace_requires_explicit_project_binding(tmp_path, monkeypatch):
+    from runtime_helpers import sandbox_manager
 
-    manager = LocalWorkspaceManager(tmp_path)
+    manager = sandbox_manager(tmp_path, monkeypatch)
     try:
         with pytest.raises(NotFound):
             await manager.get_workspace("alice", "agent", "s1")

@@ -16,6 +16,7 @@ from agentscope.formatter import OpenAIChatFormatter
 from agentscope.message import TextBlock, ToolCallBlock
 from agentscope.model import ChatModelBase, ChatResponse
 from egis_agentkit_app.bootstrap import build_app
+from runtime_helpers import stub_sandbox_provider
 from sqlalchemy import select
 from test_app_http import Config, app_snapshot
 from test_domain import identities
@@ -69,6 +70,7 @@ async def eventually(predicate):
 async def test_finance_through_native_chat_invite_and_teamsay(
     protocol, storage, tmp_path, monkeypatch
 ):
+    stub_sandbox_provider(monkeypatch)
     _, admin, _, _ = await identities(storage)
     monkeypatch.setenv("TEST_DB_URL", "postgresql+asyncpg://unused")
     monkeypatch.setenv("TEST_DOWNLOAD", "download-secret-with-more-than-thirty-two-bytes")

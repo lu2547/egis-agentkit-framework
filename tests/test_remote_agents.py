@@ -55,7 +55,9 @@ async def test_remote_definition_cannot_be_registered_by_an_ordinary_user(storag
 
 
 async def test_sync_transport_reuses_id_on_retry_and_reuses_saved_result(storage, monkeypatch):
-    from egis_agentkit.extension._remote_agent_callback import RemoteAgentRuntime
+    from egis_agentkit.extension.remote_agent._remote_agent_callback import (
+        RemoteAgentRuntime,
+    )
 
     monkeypatch.setenv("EGIS_REMOTE_AGENT_TEST_TOKEN", "finance-token")
     attempts = []
@@ -89,7 +91,9 @@ async def test_sync_transport_reuses_id_on_retry_and_reuses_saved_result(storage
 
 async def test_callback_checks_connection_signature_and_accepts_exact_replay(storage, monkeypatch):
     from egis_agentkit.errors import AgentKitError
-    from egis_agentkit.extension._remote_agent_callback import RemoteAgentRuntime
+    from egis_agentkit.extension.remote_agent._remote_agent_callback import (
+        RemoteAgentRuntime,
+    )
 
     monkeypatch.setenv("EGIS_REMOTE_AGENT_TEST_TOKEN", "finance-token")
     monkeypatch.setenv("EGIS_REMOTE_AGENT_TEST_CALLBACK_SECRET", "finance-callback-secret-32-characters")
@@ -150,7 +154,9 @@ async def test_callback_checks_connection_signature_and_accepts_exact_replay(sto
 
 
 async def test_callback_timeout_is_terminal_and_stops_resubmission(storage, monkeypatch):
-    from egis_agentkit.extension._remote_agent_callback import RemoteAgentRuntime
+    from egis_agentkit.extension.remote_agent._remote_agent_callback import (
+        RemoteAgentRuntime,
+    )
 
     monkeypatch.setenv("EGIS_REMOTE_AGENT_TEST_TOKEN", "finance-token")
     monkeypatch.setenv("EGIS_REMOTE_AGENT_TEST_CALLBACK_SECRET", "finance-callback-secret-32-characters")
@@ -182,7 +188,9 @@ async def test_callback_timeout_is_terminal_and_stops_resubmission(storage, monk
 async def test_websocket_reconnect_preserves_id_and_cancel_is_acknowledged(storage, monkeypatch):
     from websockets.asyncio.server import serve
 
-    from egis_agentkit.extension._remote_agent_callback import RemoteAgentRuntime
+    from egis_agentkit.extension.remote_agent._remote_agent_callback import (
+        RemoteAgentRuntime,
+    )
 
     monkeypatch.setenv("EGIS_REMOTE_AGENT_TEST_TOKEN", "finance-token")
     submitted = []
@@ -238,7 +246,9 @@ async def test_websocket_does_not_forward_credentials_to_redirect_targets(storag
 
     from websockets.asyncio.server import serve
 
-    from egis_agentkit.extension._remote_agent_callback import RemoteAgentRuntime
+    from egis_agentkit.extension.remote_agent._remote_agent_callback import (
+        RemoteAgentRuntime,
+    )
 
     monkeypatch.setenv("EGIS_REMOTE_AGENT_TEST_TOKEN", "finance-token")
     paths = []

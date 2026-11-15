@@ -1,16 +1,14 @@
 """用同一资源的多个版本和授权路径验证审核、使用与撤销。"""
 
 import pytest
-from test_domain import expert, identities
+from test_domain import agent_changes, expert, identities
 
+from egis_agentkit.errors import Forbidden
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._share import ShareService
-from egis_agentkit.errors import Forbidden
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.storage.model import Asset, Grant, Group, ShareTarget
-
-from test_domain import agent_changes
 
 
 @pytest.mark.asyncio

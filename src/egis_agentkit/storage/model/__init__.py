@@ -5,7 +5,6 @@ from ._base import Model, new_id, utcnow
 from ._definition import (
     AgentType,
     DefinitionRef,
-    TeamDefinitionRecord,
     TeamPayload,
     ViewType,
 )
@@ -14,6 +13,7 @@ from ._user import Group, User
 from .agent._definition import AgentDefinition
 from .agent._payload import AgentPayload
 from .agent._update import AgentUpdate
+from .team._definition import TeamDefinitionRecord
 
 __all__ = [
     "AgentType",

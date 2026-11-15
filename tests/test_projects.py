@@ -362,7 +362,7 @@ async def test_default_project_cannot_be_deleted_even_after_rename(storage, tmp_
     from egis_agentkit.errors import Forbidden
 
     _, _, alice, _ = await identities(storage)
-    workspaces = SimpleNamespace(release_project=AsyncMock())
+    workspaces = SimpleNamespace(destroy_workspaces=AsyncMock())
     projects = ProjectManager(storage, tmp_path, workspaces=workspaces)
     default = await projects.default(alice)
     source = await AgentManager(storage).add_definition(alice, expert())
@@ -383,4 +383,4 @@ async def test_default_project_cannot_be_deleted_even_after_rename(storage, tmp_
         == b"keep"
     )
     assert await sessions.get_session_record(alice, session["session_id"])
-    workspaces.release_project.assert_not_awaited()
+    workspaces.destroy_workspaces.assert_not_awaited()

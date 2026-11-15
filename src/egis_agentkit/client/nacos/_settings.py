@@ -365,14 +365,12 @@ class OpenSandboxConfig(ConfigModel):
 
 class WorkspaceRuntimeConfig(ConfigModel):
     root: NonEmptyString
-    mode: Literal["local", "opensandbox"] = "local"
-    opensandbox: OpenSandboxConfig | None = None
+    mode: Literal["opensandbox"] = "opensandbox"
+    opensandbox: OpenSandboxConfig
 
     @model_validator(mode="after")
     def validate_provider(self):
-        if self.mode == "opensandbox" and self.opensandbox is None:
-            raise ValueError("opensandbox 模式必须提供连接和挂载配置")
-        if self.mode == "opensandbox" and not PurePosixPath(self.root).is_absolute():
+        if not PurePosixPath(self.root).is_absolute():
             raise ValueError("opensandbox 模式的 workspace root 必须是绝对路径")
         return self
 

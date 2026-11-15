@@ -40,7 +40,7 @@ async def test_project_management_uses_core_project_rules(
 async def test_same_user_two_projects_keep_one_workspace_identity(storage, tmp_path):
     from test_domain import expert, identities
 
-    from egis_agentkit.core.workspace._opensandbox_workspace import workspace_id_for
+    from egis_agentkit.core.workspace._egis_sandbox_workspace import workspace_id_for
     from egis_agentkit.service._session import SessionService
     from egis_agentkit.service.agent._agent_manager import AgentManager
     from egis_agentkit.service.project._project_manager import ProjectManager
@@ -75,20 +75,20 @@ def test_sandbox_management_and_execution_have_distinct_owners():
     from agentscope.app.workspace_manager import OpenSandboxWorkspaceManager
     from agentscope.workspace import OpenSandboxWorkspace
 
-    from egis_agentkit.core.workspace._opensandbox_workspace import (
-        EgisOpenSandboxWorkspace,
+    from egis_agentkit.core.workspace._egis_sandbox_workspace import (
+        EgisSandboxWorkspace,
     )
-    from egis_agentkit.service.workspace._sandbox_manager import SandboxManager
+    from egis_agentkit.service.workspace._egis_sandbox_manager import EgisSandboxManager
 
-    assert issubclass(SandboxManager, OpenSandboxWorkspaceManager)
-    assert issubclass(EgisOpenSandboxWorkspace, OpenSandboxWorkspace)
+    assert issubclass(EgisSandboxManager, OpenSandboxWorkspaceManager)
+    assert issubclass(EgisSandboxWorkspace, OpenSandboxWorkspace)
 
 
 def test_generic_runtime_callback_has_no_project_or_storage_dependencies():
     import ast
     from pathlib import Path
 
-    from egis_agentkit.extension import _runtime_callback_middleware_impl
+    from egis_agentkit.extension.runtime import _runtime_callback_middleware_impl
 
     source = Path(_runtime_callback_middleware_impl.__file__).read_text()
     imports = [
@@ -97,7 +97,7 @@ def test_generic_runtime_callback_has_no_project_or_storage_dependencies():
         if isinstance(node, ast.ImportFrom)
     ]
     assert imports == ["agentscope.middleware"]
-    extension = Path(_runtime_callback_middleware_impl.__file__).parent
+    extension = Path(_runtime_callback_middleware_impl.__file__).parent.parent
     assert not (extension / "_workspace_prompt_middleware_impl.py").exists()
     assert not (extension / "_workspace_file_changes_middleware_impl.py").exists()
     assert not (extension / "_session_middlewares_callback.py").exists()
@@ -148,7 +148,7 @@ async def test_project_deletion_releases_runtime_mounts_before_removing_files(
     released = []
 
     class Workspaces:
-        async def release_project(self, user_id, project_id):
+        async def destroy_workspaces(self, user_id, project_id):
             released.append((user_id, project_id))
 
     files = ProjectFileStorage(tmp_path)

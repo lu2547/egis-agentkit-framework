@@ -5,7 +5,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from egis_agentkit.errors import InvalidRequest
 from egis_agentkit.storage.model import new_id, utcnow
-from egis_agentkit.storage.model._tables import session_reply_feedback as feedback
+from egis_agentkit.storage.model._tables import feedback
 
 
 class SessionFeedbackStorage:
