@@ -163,7 +163,12 @@ def init_agentkit(
         root,
         sandbox_settings,
         client_factory=sandbox_client_factory,
-        read_guard_factory=partial(ReadToolGuardMiddleware, settings=workspace.read_guard),
+        bus=bus,
+        probe=workspace.probe,
+        lock=workspace.lock,
+        read_guard_factory=partial(
+            ReadToolGuardMiddleware, settings=workspace.read_guard
+        ),
     )
     projects = ProjectManager(
         storage,

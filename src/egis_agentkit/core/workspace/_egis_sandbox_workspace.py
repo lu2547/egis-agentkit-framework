@@ -29,12 +29,16 @@ from agentscope.workspace._gateway_client import GatewayMCPClient
 from agentscope.workspace._sandboxed_base import SandboxedWorkspaceBase
 from agentscope.workspace._utils import _GATEWAY_BASE_REQUIREMENTS, UV_VERSION
 
-from egis_agentkit.client.nacos._settings import SandboxWorkspaceConfig
+from egis_agentkit.client.nacos._settings import (
+    SandboxWorkspaceConfig,
+    WorkspaceProbeConfig,
+)
 from egis_agentkit.client.sandbox import SandboxClient, SandboxMount
 from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
 from ._identity import sandbox_binding_for, workspace_id_for
+from ._readiness import WorkspaceReadiness
 from ._sandbox_backend import SandboxBackend
 
 
@@ -52,6 +56,7 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
         files: ProjectFileStorage,
         settings: SandboxWorkspaceConfig,
         client: SandboxClient,
+        probe: WorkspaceProbeConfig | None = None,
         session_id: str = "",
         runtime_binding_id: str | None = None,
         read_guard_factory=None,
@@ -77,6 +82,8 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
             raise Forbidden("工作区标识与用户不一致")
         self._mcp_client_factory = mcp_client_factory
         self.settings = settings
+        self.probe_settings = probe if probe is not None else WorkspaceProbeConfig()
+        self.readiness = WorkspaceReadiness(self)
         self._skill_publication_lock = asyncio.Lock()
         self._bootstrap_cmd_timeout = settings.bootstrap_timeout_seconds
         self.client = client
@@ -123,6 +130,22 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
         """仅暴露中立实例 ID，不向调用方交出提供方 SDK 对象。"""
         return self.client.instance_id
 
+    async def check_ready(self, *, full=False):
+        """核验实例、执行链和持久存储；具体检查由就绪能力组合，失败不交付环境。"""
+        await self.readiness.check_ready(full=full)
+
+    async def disconnect_workspace(self):
+        """只释放本节点句柄，不暂停实例或注销其他节点正在使用的 MCP。"""
+        if self._gateway is not None:
+            await self._gateway.aclose()
+            self._gateway = None
+        self._mcp_instances.clear()
+        self._mcp_last_used.clear()
+        self.egis_mcp_clients.clear()
+        self._backend = None
+        self.is_alive = False
+        await self.client.close()
+
     async def renew_workspace(self):
         """延长当前实例有效期，明确失效时由 Manager 决定是否重建。"""
         if self.client.instance_id is None:
@@ -131,7 +154,7 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
 
     @classmethod
     async def destroy_sandbox_instances(
-        cls, user_id: str, project_id: str, *, client: SandboxClient
+        cls, user_id: str, project_id: str, *, client: SandboxClient, guard_instance
     ) -> None:
         """检查全部实例归属后销毁；不查询项目数据库或删除持久文件。"""
         metadata = {
@@ -145,8 +168,15 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
                 for info in instances
             ):
                 raise Forbidden("沙箱归属与待删除项目不一致")
-            for identifier in sorted({info.id for info in instances}):
-                await client.destroy_instance(identifier)
+            # 所有权和运行绑定必须全部校验完，才允许进入任何一个销毁操作。
+            if any(
+                not info.metadata.get("agentscope.workspace.id") for info in instances
+            ):
+                raise Forbidden("沙箱缺少运行绑定，拒绝无锁销毁")
+            owned = {info.id: info for info in instances}
+            for identifier, info in sorted(owned.items()):
+                async with guard_instance(info.metadata["agentscope.workspace.id"]):
+                    await client.destroy_instance(identifier)
         finally:
             await client.close()
 
@@ -217,15 +247,22 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
             await self.get_backend().delete_path(destination + ".complete")
 
     async def close_workspace(self):
-        """先注销企业连接，再由原生能力暂停沙箱并释放 SDK 句柄。"""
+        """持有租约时注销连接并暂停；取消意味着可能失锁，此时只断开本地句柄。"""
+        cancelled = False
         try:
             await self._close_all_mcp_instances()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
             self.egis_mcp_clients.clear()
-            try:
-                await super().close()
-            finally:
-                await self.client.close()
+            if cancelled:
+                await self.disconnect_workspace()
+            else:
+                try:
+                    await super().close()
+                finally:
+                    await self.client.close()
 
     # 内部辅助方法：元数据编码、技能文件发布与 MCP 分区校验。
 

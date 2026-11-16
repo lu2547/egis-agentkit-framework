@@ -41,6 +41,10 @@ def manager_type():
             "client_factory", partial(OpenSandboxClient, settings, api_key="test-only")
         )
         kwargs.setdefault("read_guard_factory", ReadToolGuardMiddleware)
+        from runtime_helpers import workspace_dependencies
+
+        for key, value in workspace_dependencies().items():
+            kwargs.setdefault(key, value)
         return module.EgisSandboxManager(root, settings, **kwargs)
 
     return factory
@@ -49,6 +53,7 @@ def manager_type():
 async def initialized_provider(workspace):
     """替代远程创建，保留 Manager 所需的真实 SDK 生命周期接口。"""
     workspace.is_alive = True
+    workspace.check_ready = AsyncMock()
     workspace.client._sandbox = SimpleNamespace(
         id="test-instance", renew=AsyncMock(), pause=AsyncMock(), close=AsyncMock()
     )
@@ -129,13 +134,17 @@ async def test_failed_provision_is_not_cached_and_can_retry(tmp_path, monkeypatc
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise RuntimeError("provider unavailable")
+            from egis_agentkit.client.sandbox import SandboxConnectionError
+
+            raise SandboxConnectionError()
         await initialized_provider(workspace)
 
     monkeypatch.setattr(EgisSandboxWorkspace, "initialize", initialize)
     manager = manager_type()(tmp_path / "app", configuration(tmp_path))
     async with manager:
-        with pytest.raises(RuntimeError, match="provider unavailable"):
+        from egis_agentkit.client.sandbox import SandboxConnectionError
+
+        with pytest.raises(SandboxConnectionError):
             await manager.get_workspace(
                 "alice", "agent", "session", project_id="project"
             )
@@ -592,7 +601,10 @@ async def test_project_release_destroys_only_owned_provider_bindings(
                 sandbox_infos=[
                     SimpleNamespace(
                         id="owned",
-                        metadata=query.metadata,
+                        metadata={
+                            **query.metadata,
+                            "agentscope.workspace.id": "test-binding",
+                        },
                         status=SimpleNamespace(state="running"),
                     )
                 ],

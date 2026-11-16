@@ -271,6 +271,8 @@ class ProjectFileManager:
             if depth > limits.max_depth:
                 raise Conflict("文件目录过深，无法完整记录变更")
             for name in os.listdir(fd):
+                if name.casefold() == self.files.PROBE_DIRECTORY:
+                    continue
                 count += 1
                 if count > limits.max_entries:
                     raise Conflict("文件数量超过变更记录扫描限制")

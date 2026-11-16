@@ -26,7 +26,7 @@ from egis_agentkit.client.nacos._settings import OpenSandboxConfig
 from egis_agentkit.errors import AgentKitError, Conflict, Forbidden
 
 from ._models import SandboxInstance, SandboxMount
-from ._protocol import SandboxInstanceNotFound
+from ._protocol import SandboxConnectionError, SandboxInstanceNotFound
 
 UNKNOWN_EXIT_CODE = -1
 
@@ -100,7 +100,7 @@ class OpenSandboxClient:
                 raise Forbidden("沙箱服务拒绝当前访问") from None
             raise AgentKitError("沙箱服务请求失败", 502) from None
         except httpx.HTTPError:
-            raise AgentKitError("沙箱连接超时或暂时不可用", 503) from None
+            raise SandboxConnectionError() from None
         except SandboxException:
             raise AgentKitError("沙箱服务内部异常或就绪超时", 502) from None
 
@@ -170,13 +170,17 @@ class OpenSandboxClient:
                 self._sandbox = await Sandbox.resume(
                     sandbox_id=instance.id,
                     connection_config=self._connection(),
-                    resume_timeout=timedelta(seconds=self.settings.timeout_seconds),
+                    resume_timeout=timedelta(
+                        seconds=self.settings.ready_timeout_seconds
+                    ),
                 )
             elif instance.state == "running":
                 self._sandbox = await Sandbox.connect(
                     sandbox_id=instance.id,
                     connection_config=self._connection(),
-                    connect_timeout=timedelta(seconds=self.settings.timeout_seconds),
+                    connect_timeout=timedelta(
+                        seconds=self.settings.ready_timeout_seconds
+                    ),
                 )
             else:
                 raise Conflict("当前沙箱状态不支持恢复")
@@ -184,6 +188,22 @@ class OpenSandboxClient:
     async def renew_instance(self, timeout_seconds):
         async with self._request():
             await self._sandbox.renew(timedelta(seconds=timeout_seconds))
+
+    async def check_connection(self, *, reconnect=False):
+        """控制面状态和执行面分别核验；不因网络失败创建新实例。"""
+        if self._sandbox is None:
+            raise SandboxInstanceNotFound()
+        async with self._request():
+            instance = self._instance(await self._sandbox.get_info())
+            if instance.state != "running":
+                return instance
+            if reconnect:
+                previous = self._sandbox
+                await self.connect_instance(instance)
+                await previous.close()
+            if not await self._sandbox.is_healthy():
+                raise SandboxConnectionError()
+            return instance
 
     async def close_instance(self):
         """暂停保留文件；即使暂停失败也释放本进程连接，失败继续向上抛出。"""

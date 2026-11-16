@@ -54,7 +54,9 @@ def session_middlewares(storage, *, users, file_changes, root=Path("."), **kwarg
 
 def tools_callback(resources=None, users=None):
     """直接绑定 Service 方法，测试与真实 App 使用相同的工具装配能力。"""
-    return partial(SessionService(None, Path('.')).build_tools, resources=resources, users=users)
+    return partial(
+        SessionService(None, Path(".")).build_tools, resources=resources, users=users
+    )
 
 
 def stub_sandbox_provider(monkeypatch):
@@ -73,6 +75,7 @@ def stub_sandbox_provider(monkeypatch):
         Path(workspace.workdir).mkdir(parents=True, exist_ok=True)
         workspace._backend = LocalBackend()
         workspace.is_alive = True
+        workspace.check_ready = AsyncMock()
         workspace.client._sandbox = SimpleNamespace(
             id="test-instance", renew=AsyncMock(), pause=AsyncMock(), close=AsyncMock()
         )
@@ -97,4 +100,25 @@ def sandbox_manager(root, monkeypatch):
         settings,
         client_factory=partial(OpenSandboxClient, settings, api_key="test-only"),
         read_guard_factory=ReadToolGuardMiddleware,
+        **workspace_dependencies(),
+    )
+
+
+def workspace_dependencies():
+    """轻量单节点测试明确使用原生内存总线，集群正确性由独立 PG 用例验证。"""
+    import sys
+
+    from egis_agentkit.client.nacos._settings import (
+        WorkspaceLockConfig,
+        WorkspaceProbeConfig,
+    )
+    from egis_agentkit.core.message_bus import EgisMessageBus
+
+    return dict(
+        bus=EgisMessageBus(deployment_mode="standalone"),
+        probe=WorkspaceProbeConfig(
+            storage_python=sys.executable,
+            runtime_commands=[[sys.executable, "-c", "import sys"]],
+        ),
+        lock=WorkspaceLockConfig(),
     )

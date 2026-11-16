@@ -7,7 +7,7 @@ import pytest
 from agentscope.message import ToolCallBlock
 from agentscope.state import AgentState
 from agentscope.tool import Read, Toolkit
-from runtime_helpers import project_prompt, sandbox_manager
+from runtime_helpers import project_prompt, sandbox_manager, workspace_dependencies
 
 from egis_agentkit.middleware.workspace._workspace_read_guard_middleware_impl import (
     ReadToolGuardMiddleware,
@@ -233,6 +233,7 @@ async def test_nacos_guard_limits_control_actual_workspace_read(
         tmp_path,
         config.runtime.opensandbox,
         read_guard_factory=partial(ReadToolGuardMiddleware, settings=config.read_guard),
+        **workspace_dependencies(),
         client_factory=partial(
             OpenSandboxClient, config.runtime.opensandbox, api_key="test-only"
         ),

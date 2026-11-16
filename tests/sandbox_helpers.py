@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+from dataclasses import replace
 
 from agentscope.tool import ExecResult, LocalBackend
 
@@ -55,6 +56,7 @@ class TestSandboxClient:
 
     async def connect_instance(self, instance):
         self.instance_id = instance.id
+        self.instances[instance.id] = replace(instance, state="running")
         self.events.append(("connect", instance.id))
 
     async def renew_instance(self, timeout_seconds):
@@ -67,9 +69,22 @@ class TestSandboxClient:
         self.events.append(("renew", self.instance_id))
         self.renewed.set()
 
+    async def check_connection(self, *, reconnect=False):
+        from egis_agentkit.client.sandbox import SandboxInstanceNotFound
+
+        if self.failure:
+            raise self.failure
+        if self.instance_id not in self.instances:
+            raise SandboxInstanceNotFound()
+        return self.instances[self.instance_id]
+
     async def close_instance(self):
         if self.instance_id is not None:
             self.events.append(("pause", self.instance_id))
+            if self.instance_id in self.instances:
+                self.instances[self.instance_id] = replace(
+                    self.instances[self.instance_id], state="paused"
+                )
         self.instance_id = None
 
     async def close(self):

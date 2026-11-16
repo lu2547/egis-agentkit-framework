@@ -3,6 +3,7 @@
 import asyncio
 import time
 from datetime import timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 from agentscope.tool import LocalBackend
@@ -45,6 +46,7 @@ def sandbox_manager(tmp_path, monkeypatch):
     async def initialize(workspace):
         workspace.client._sandbox = ProviderHandle()
         workspace._backend = LocalBackend()
+        workspace.check_ready = AsyncMock()
 
     monkeypatch.setattr(EgisSandboxWorkspace, "initialize", initialize)
     return manager_type()(tmp_path / "app", configuration(tmp_path))

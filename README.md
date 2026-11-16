@@ -91,3 +91,17 @@ Workspace/Project 的职责、目录、表结构和运行顺序见 [Workspace与
 外部系统连接与配置入口见 [Client 接入](docs/Client接入.md)。
 
 Core、Service、Middleware 的能力归属、依赖方向和原生接入流程见 [框架分层](ARCHITECTURE.md)。隔离工作区运行集成测试时，可用 `AGENTKIT_TEST_PG_ENV` 指定现有测试数据库环境文件；测试始终创建独立临时 schema，不清理业务表。
+
+### Workspace 就绪检查和跨节点保护
+
+Nacos `agentkit.workspace.probe` 配置轻量/完整检查间隔、单阶段超时、网络重连次数及环境命令；`agentkit.workspace.lock` 配置分布式实例租约和等待预算。两组属于固定装配配置，修改后需要重启 API。
+
+- 创建、恢复后完整验证实例归属、执行通道、网关、Python/依赖和 NAS；缓存命中仍确认当前实例，命令/网关和完整检查分别按配置间隔复核。
+- NAS 使用 `.work/.agentkit-probes` 和 `artifacts/.agentkit-probes` 下的独立随机文件，执行宿主写/沙箱读、沙箱写/宿主读。保留目录不进入项目列表、变更扫描或自动交付，失败和取消只清理自己的文件。
+- Client 的 `check_connection(reconnect=False)` 返回当前 `SandboxInstance` 并验证命令通道。网络重试只连接原实例，不重放业务命令。只有明确不存在才创建；确认暂停则恢复；其他实例状态、认证、环境和存储故障拒绝使用。
+- `WorkspaceReadiness` 在 Core 组合检查，`WorkspaceProbeError` 保留 `stage/reason/retryable`。非临时的初始化检查错误按配置短路，避免反复初始化同一个错误环境。
+- 集群中，同一运行绑定的构建、复核、暂停和回复使用保护复用现有 PG 总线租约。进程内锁仅保护本节点缓存，不承担跨节点互斥。失锁取消受保护执行，不重放命令。
+- 空闲回收还检查原生 Session 分布式锁，覆盖工具装配到回复结束；本节点关闭时若另一节点仍在使用，只断开本地句柄，不暂停共享实例或注销远端 MCP。项目删除继续使用 PG 项目生命周期锁和 Session 锁后再销毁实例。
+- `standalone` 明确是单节点模式；多实例部署使用 `cluster`。API `/health/ready` 仍表示 API/PG/消息总线就绪，不将单个 Workspace 的故障升级为整个 API 的存活失败。
+
+若从示例工具拆包前的开发库升级，先运行 `python scripts/align_tool_deployments.py` 预览；确认是纯部署地址移动后，使用 `--apply --database <目标库名>` 应用。脚本校验原内容及签名并在同一事务更新，运行时仍保留不可变版本校验。

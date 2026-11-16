@@ -1,5 +1,6 @@
 """Service 组织项目释放，Core 执行沙箱销毁；普通关闭保持暂停语义。"""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -33,8 +34,9 @@ async def test_service_releases_cached_handles_then_delegates_destruction_to_cor
     )
     manager._cache = {"owned": (owned, 0), "other": (other, 0)}
 
-    async def destroy(user_id, project_id, *, client):
+    async def destroy(user_id, project_id, *, client, guard_instance):
         assert (user_id, project_id) == ("alice", "project")
+        assert callable(guard_instance)
         assert isinstance(client, OpenSandboxClient)
         assert client.settings is manager.settings
         events.append("destroy")
@@ -64,12 +66,16 @@ async def test_core_validates_all_pages_before_destroying_owned_running_and_paus
     metadata = {
         "agentkit.user.hash": EgisSandboxWorkspace._hash_metadata(b"alice"),
         "agentkit.project.id": "project",
+        "agentscope.workspace.id": "test-binding",
     }
     events = []
 
     async def listing(query):
         assert query.states == [SandboxState.RUNNING, SandboxState.PAUSED]
-        assert query.metadata == metadata
+        assert query.metadata == {
+            "agentkit.user.hash": metadata["agentkit.user.hash"],
+            "agentkit.project.id": "project",
+        }
         page = query.page or 1
         events.append(f"page-{page}")
         actual = (
@@ -106,11 +112,15 @@ async def test_core_validates_all_pages_before_destroying_owned_running_and_paus
                 "alice",
                 "project",
                 client=OpenSandboxClient(settings, api_key="test-only"),
+                guard_instance=lambda identifier: nullcontext(),
             )
         provider.kill_sandbox.assert_not_awaited()
     else:
         await method(
-            "alice", "project", client=OpenSandboxClient(settings, api_key="test-only")
+            "alice",
+            "project",
+            client=OpenSandboxClient(settings, api_key="test-only"),
+            guard_instance=lambda identifier: nullcontext(),
         )
         assert events[:2] == ["page-1", "page-2"]
         assert set(events[2:]) == {"instance-1", "instance-2"}
@@ -128,6 +138,7 @@ async def test_core_propagates_provider_failure_and_closes_client(
     metadata = {
         "agentkit.user.hash": EgisSandboxWorkspace._hash_metadata(b"alice"),
         "agentkit.project.id": "project",
+        "agentscope.workspace.id": "test-binding",
     }
     provider = SimpleNamespace(
         list_sandbox_infos=AsyncMock(
@@ -154,6 +165,7 @@ async def test_core_propagates_provider_failure_and_closes_client(
             "alice",
             "project",
             client=OpenSandboxClient(configuration(tmp_path), api_key="test-only"),
+            guard_instance=lambda identifier: nullcontext(),
         )
     assert provider.close.await_count == (
         1 if failure_stage == "list_sandbox_infos" else 2

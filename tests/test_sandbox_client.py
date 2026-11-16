@@ -140,3 +140,29 @@ async def test_non_http_sdk_failure_is_sanitized_and_never_marked_as_missing(tmp
         await client.renew_instance(60)
     assert not isinstance(error.value, SandboxInstanceNotFound)
     assert "private-upstream-detail" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_connection_probe_checks_runtime_instead_of_only_renewing(tmp_path):
+    from egis_agentkit.client.nacos._settings import OpenSandboxConfig
+    from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
+    from egis_agentkit.errors import AgentKitError
+
+    client = OpenSandboxClient(
+        OpenSandboxConfig(domain="localhost:8090", host_root=str(tmp_path)),
+        api_key="test-only",
+    )
+    client._sandbox = SimpleNamespace(
+        id="live",
+        get_info=AsyncMock(
+            return_value=SimpleNamespace(
+                id="live",
+                status=SimpleNamespace(state="Running"),
+                metadata={"owner": "alice"},
+            )
+        ),
+        is_healthy=AsyncMock(return_value=False),
+        renew=AsyncMock(),
+    )
+    with pytest.raises(AgentKitError):
+        await client.check_connection()

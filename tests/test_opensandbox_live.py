@@ -11,6 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from egis_agentkit.middleware.workspace._workspace_read_guard_middleware_impl import (
     ReadToolGuardMiddleware,
@@ -61,12 +62,24 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
         )
     project_id = "test-sandbox-" + uuid4().hex
     other_id = "test-sandbox-" + uuid4().hex
+    from egis_agentkit.client.nacos._settings import (
+        WorkspaceLockConfig,
+        WorkspaceProbeConfig,
+    )
     from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
+    from egis_agentkit.core.message_bus import EgisMessageBus
 
+    engine = create_async_engine(
+        os.environ["AGENTKIT_DATABASE_URL"], hide_parameters=True
+    )
+    bus = EgisMessageBus(deployment_mode="cluster", engine=engine)
     manager = EgisSandboxManager(
         root,
         settings,
         read_guard_factory=ReadToolGuardMiddleware,
+        bus=bus,
+        probe=WorkspaceProbeConfig(),
+        lock=WorkspaceLockConfig(),
         client_factory=partial(
             OpenSandboxClient, settings, api_key=os.environ[settings.api_key_env]
         ),
@@ -229,6 +242,7 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
             shutil.rmtree(probe)
         shutil.rmtree(other_root)
         shutil.rmtree(source)
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -244,12 +258,24 @@ async def test_real_docker_recovers_missing_sandbox_without_losing_project_files
         renew_interval_seconds=0.05,
     )
     project_id = "test-recover-" + uuid4().hex
+    from egis_agentkit.client.nacos._settings import (
+        WorkspaceLockConfig,
+        WorkspaceProbeConfig,
+    )
     from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
+    from egis_agentkit.core.message_bus import EgisMessageBus
 
+    engine = create_async_engine(
+        os.environ["AGENTKIT_DATABASE_URL"], hide_parameters=True
+    )
+    bus = EgisMessageBus(deployment_mode="cluster", engine=engine)
     manager = EgisSandboxManager(
         root,
         settings,
         read_guard_factory=ReadToolGuardMiddleware,
+        bus=bus,
+        probe=WorkspaceProbeConfig(),
+        lock=WorkspaceLockConfig(),
         client_factory=partial(
             OpenSandboxClient, settings, api_key=os.environ[settings.api_key_env]
         ),
@@ -261,41 +287,46 @@ async def test_real_docker_recovers_missing_sandbox_without_losing_project_files
     manager.files.write(
         "sandbox-test", project_id, "report.txt", b"persistent result", area="artifacts"
     )
-    async with manager:
-        try:
-            workspace = await manager.get_workspace(
-                "sandbox-test", "agent", "session", project_id=project_id
-            )
-            original_id = workspace.sandbox_id
-            async with manager.renew_workspace(workspace):
-                before = await workspace.client._sandbox.get_info()
-                await asyncio.sleep(settings.renew_interval_seconds * 2)
-                after = await workspace.client._sandbox.get_info()
-                assert after.expires_at > before.expires_at
-                manager._cache[workspace.runtime_binding_id] = (
-                    workspace,
-                    time.monotonic() - manager._ttl - 1,
+    try:
+        async with manager:
+            try:
+                workspace = await manager.get_workspace(
+                    "sandbox-test", "agent", "session", project_id=project_id
                 )
-                await manager._recycle_idle_workspaces()
-                result = await workspace.get_backend().exec_shell(["true"])
-                assert result.ok()
-            # 只销毁本测试独占的实例，模拟到期或外部删除。
-            await workspace.client._sandbox.kill()
-            recovered = await manager.get_workspace(
-                "sandbox-test", "agent", "session", project_id=project_id
-            )
-            assert recovered.sandbox_id != original_id
-            project_root = manager.files.project_root("sandbox-test", project_id)
-            assert (
-                await recovered.get_backend().read_file(str(project_root / "input.txt"))
-                == b"persistent input"
-            )
-            assert (
-                await recovered.get_backend().read_file(
-                    str(project_root / "artifacts/report.txt")
+                original_id = workspace.sandbox_id
+                async with manager.renew_workspace(workspace):
+                    before = await workspace.client._sandbox.get_info()
+                    await asyncio.sleep(settings.renew_interval_seconds * 2)
+                    after = await workspace.client._sandbox.get_info()
+                    assert after.expires_at > before.expires_at
+                    manager._cache[workspace.runtime_binding_id] = (
+                        workspace,
+                        time.monotonic() - manager._ttl - 1,
+                    )
+                    await manager._recycle_idle_workspaces()
+                    result = await workspace.get_backend().exec_shell(["true"])
+                    assert result.ok()
+                # 只销毁本测试独占的实例，模拟到期或外部删除。
+                await workspace.client._sandbox.kill()
+                recovered = await manager.get_workspace(
+                    "sandbox-test", "agent", "session", project_id=project_id
                 )
-                == b"persistent result"
-            )
-        finally:
-            await manager.destroy_workspaces("sandbox-test", project_id)
-            manager.files.remove_project("sandbox-test", project_id)
+                assert recovered.sandbox_id != original_id
+                project_root = manager.files.project_root("sandbox-test", project_id)
+                assert (
+                    await recovered.get_backend().read_file(
+                        str(project_root / "input.txt")
+                    )
+                    == b"persistent input"
+                )
+                assert (
+                    await recovered.get_backend().read_file(
+                        str(project_root / "artifacts/report.txt")
+                    )
+                    == b"persistent result"
+                )
+            finally:
+                await manager.destroy_workspaces("sandbox-test", project_id)
+                manager.files.remove_project("sandbox-test", project_id)
+    finally:
+        await engine.dispose()

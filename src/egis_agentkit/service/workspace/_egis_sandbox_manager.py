@@ -13,10 +13,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Callable
 
+from agentscope.app.message_bus import MessageBus, MessageBusKeys
 from agentscope.app.workspace_manager import IsolationPolicy, WorkspaceManagerBase
 
 from egis_agentkit.client.mcp._gateway_mcp_client_override import (
@@ -24,9 +25,12 @@ from egis_agentkit.client.mcp._gateway_mcp_client_override import (
 )
 from egis_agentkit.client.nacos._settings import (
     SandboxWorkspaceConfig,
+    WorkspaceLockConfig,
+    WorkspaceProbeConfig,
 )
 from egis_agentkit.client.sandbox import SandboxClient, SandboxInstanceNotFound
 from egis_agentkit.core.workspace._egis_sandbox_workspace import EgisSandboxWorkspace
+from egis_agentkit.core.workspace._errors import WorkspaceProbeError
 from egis_agentkit.core.workspace._identity import sandbox_binding_for, workspace_id_for
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
 from egis_agentkit.storage.project._files import ProjectFileStorage
@@ -44,10 +48,17 @@ class EgisSandboxManager(WorkspaceManagerBase):
         *,
         client_factory: Callable[[], SandboxClient],
         read_guard_factory: Callable,
+        bus: MessageBus,
+        probe: WorkspaceProbeConfig,
+        lock: WorkspaceLockConfig,
     ):
         super().__init__(isolation=IsolationPolicy.PER_USER)
         self.files = ProjectFileStorage(Path(workspace_root))
         self.settings = settings
+        self.bus = bus
+        self.probe_settings = probe
+        self.lock_settings = lock
+        self._failed_workspaces = {}
         self._read_guard_factory = read_guard_factory
         self._client_factory = client_factory
         self._cache: dict[str, tuple[EgisSandboxWorkspace, float]] = {}
@@ -86,6 +97,39 @@ class EgisSandboxManager(WorkspaceManagerBase):
                 else:
                     self._workspace_locks[identifier] = (lock, count - 1)
 
+    @staticmethod
+    def _instance_key(identifier):
+        return "ak:workspace:" + identifier
+
+    @asynccontextmanager
+    async def _distributed_lock(self, identifier):
+        """复用集群 PG 租约；预算只约束等待，加锁后续期与失锁取消由总线保证。"""
+        async with AsyncExitStack() as stack:
+            try:
+                async with asyncio.timeout(self.lock_settings.wait_timeout_seconds):
+                    await stack.enter_async_context(
+                        self.bus.acquire_lock(
+                            self._instance_key(identifier),
+                            ttl_secs=self.lock_settings.lease_seconds,
+                        )
+                    )
+            except TimeoutError:
+                raise WorkspaceProbeError("lease", "busy", retryable=True) from None
+            yield
+
+    @asynccontextmanager
+    async def _instance_lock(self, identifier):
+        """进程内锁只保护缓存；同绑定的远程生命周期操作另外取得分布式锁。"""
+        async with self._workspace_lock(identifier):
+            async with self._distributed_lock(identifier):
+                yield
+
+    async def _session_in_use(self, workspace):
+        """覆盖 get_workspace 到回复结束之间的整个原生执行阶段，包括工具装配。"""
+        return bool(workspace.egis_session_id) and await self.bus.is_locked(
+            MessageBusKeys.session_lock(workspace.egis_session_id)
+        )
+
     def _require_open(self, user_id, project_id):
         if (
             self._closing_all
@@ -98,40 +142,44 @@ class EgisSandboxManager(WorkspaceManagerBase):
     async def renew_workspace(self, workspace):
         """从回复开始到结束持有使用计数，续期失败时终止执行而不重放命令。"""
         identifier = workspace.runtime_binding_id
-        # 1. 先在回收锁内登记使用者，不能租用已经被其他请求替换的句柄。
-        async with self._lock:
-            entry = self._cache.get(identifier)
-            if entry is None or entry[0] is not workspace:
-                raise Conflict("工作区实例已关闭，请重试当前消息")
-            self._active_workspaces[identifier] = (
-                self._active_workspaces.get(identifier, 0) + 1
-            )
-        try:
-            await workspace.renew_workspace()
-            # 2. 子任务失败会取消当前执行；正常结束或用户取消时停止续期任务。
-            try:
-                async with asyncio.TaskGroup() as group:
-                    renewal = group.create_task(self._renew_active_workspace(workspace))
-                    try:
-                        yield
-                    finally:
-                        renewal.cancel()
-            except ExceptionGroup as exc:
-                # 单一错误保持原类型，授权拒绝等业务异常不能被并发容器改写。
-                if len(exc.exceptions) == 1:
-                    raise exc.exceptions[0] from None
-                raise
-        finally:
-            # 3. 从本次执行结束起重新计算空闲时间，给原生上下文保存留出时间。
+        async with self._distributed_lock(identifier):
+            # 1. 先在回收锁内登记使用者，不能租用已经被其他请求替换的句柄。
             async with self._lock:
-                remaining = self._active_workspaces[identifier] - 1
-                if remaining:
-                    self._active_workspaces[identifier] = remaining
-                else:
-                    self._active_workspaces.pop(identifier)
                 entry = self._cache.get(identifier)
-                if entry is not None and entry[0] is workspace:
-                    self._cache[identifier] = (workspace, time.monotonic())
+                if entry is None or entry[0] is not workspace:
+                    raise Conflict("工作区实例已关闭，请重试当前消息")
+                self._active_workspaces[identifier] = (
+                    self._active_workspaces.get(identifier, 0) + 1
+                )
+            try:
+                await workspace.check_ready()
+                await workspace.renew_workspace()
+                # 2. 子任务失败会取消当前执行；正常结束或用户取消时停止续期任务。
+                try:
+                    async with asyncio.TaskGroup() as group:
+                        renewal = group.create_task(
+                            self._renew_active_workspace(workspace)
+                        )
+                        try:
+                            yield
+                        finally:
+                            renewal.cancel()
+                except ExceptionGroup as exc:
+                    # 单一错误保持原类型，授权拒绝等业务异常不能被并发容器改写。
+                    if len(exc.exceptions) == 1:
+                        raise exc.exceptions[0] from None
+                    raise
+            finally:
+                # 3. 从本次执行结束起重新计算空闲时间，给原生上下文保存留出时间。
+                async with self._lock:
+                    remaining = self._active_workspaces[identifier] - 1
+                    if remaining:
+                        self._active_workspaces[identifier] = remaining
+                    else:
+                        self._active_workspaces.pop(identifier)
+                    entry = self._cache.get(identifier)
+                    if entry is not None and entry[0] is workspace:
+                        self._cache[identifier] = (workspace, time.monotonic())
 
     async def get_workspace(
         self,
@@ -169,7 +217,7 @@ class EgisSandboxManager(WorkspaceManagerBase):
             raise NotFound("会话未绑定项目")
         # 项目目录由 ProjectFileManager 管理，此处只选择用户工作区的执行环境。
         runtime_id = sandbox_binding_for(user_id, project_id, agent_id, session_id)
-        async with self._workspace_lock(runtime_id):
+        async with self._instance_lock(runtime_id):
             async with self._lock:
                 self._require_open(user_id, project_id)
             await self._refresh_cached_workspace(runtime_id)
@@ -179,6 +227,12 @@ class EgisSandboxManager(WorkspaceManagerBase):
             else:
                 async with self._lock:
                     self._require_open(user_id, project_id)
+                    failure = self._failed_workspaces.get(runtime_id)
+                    if failure is not None and time.monotonic() < failure[2]:
+                        raise WorkspaceProbeError(
+                            failure[0], failure[1], retryable=False
+                        )
+                    self._failed_workspaces.pop(runtime_id, None)
                     self._building[runtime_id] = (user_id, project_id)
                 try:
                     workspace = await self._build_workspace(
@@ -195,6 +249,15 @@ class EgisSandboxManager(WorkspaceManagerBase):
                     if rejected:
                         await self._close_workspace_safely(workspace)
                         raise Conflict("构建期间工作区已开始关闭，请重试")
+                except WorkspaceProbeError as exc:
+                    if not exc.retryable:
+                        self._failed_workspaces[runtime_id] = (
+                            exc.stage,
+                            exc.reason,
+                            time.monotonic()
+                            + self.probe_settings.failure_cooldown_seconds,
+                        )
+                    raise
                 finally:
                     async with self._lock:
                         self._building.pop(runtime_id, None)
@@ -208,12 +271,23 @@ class EgisSandboxManager(WorkspaceManagerBase):
                 raise Forbidden("工作区实例与用户或项目不一致")
             return workspace
 
-    async def _close_cached_workspace(self, identifier):
+    async def _close_cached_workspace(self, identifier, *, check_session=True):
         async with self._workspace_lock(identifier):
-            async with self._lock:
-                entry = self._cache.pop(identifier, None)
-            if entry is not None:
-                await entry[0].close_workspace()
+            entry = self._cache.get(identifier)
+            if entry is None:
+                return
+            workspace = entry[0]
+            # 其他节点持有 Session 时，只断开本地连接；不能注销其 MCP 或暂停实例。
+            if check_session and await self._session_in_use(workspace):
+                self._cache.pop(identifier, None)
+                await workspace.disconnect_workspace()
+                return
+            async with self._distributed_lock(identifier):
+                self._cache.pop(identifier, None)
+                if check_session and await self._session_in_use(workspace):
+                    await workspace.disconnect_workspace()
+                else:
+                    await workspace.close_workspace()
 
     async def close_workspaces(self, workspace_id):
         """关闭用户逻辑工作区下的缓存和构建中实例，保留持久文件。"""
@@ -260,9 +334,12 @@ class EgisSandboxManager(WorkspaceManagerBase):
                 )
             try:
                 for identifier in identifiers:
-                    await self._close_cached_workspace(identifier)
+                    await self._close_cached_workspace(identifier, check_session=False)
                 await EgisSandboxWorkspace.destroy_sandbox_instances(
-                    user_id, project_id, client=self._client_factory()
+                    user_id,
+                    project_id,
+                    client=self._client_factory(),
+                    guard_instance=self._distributed_lock,
                 )
             finally:
                 async with self._lock:
@@ -275,13 +352,19 @@ class EgisSandboxManager(WorkspaceManagerBase):
             return
         workspace, _ = entry
         try:
+            await workspace.check_ready()
             await workspace.renew_workspace()
-        except SandboxInstanceNotFound:
+        except (SandboxInstanceNotFound, WorkspaceProbeError) as exc:
+            if isinstance(exc, WorkspaceProbeError) and (exc.stage, exc.reason) != (
+                "instance",
+                "not_running",
+            ):
+                raise
             async with self._lock:
                 if self._active_workspaces.get(runtime_id):
                     raise Conflict("沙箱实例已失效，请等待当前执行结束后重试") from None
                 self._cache.pop(runtime_id, None)
-            await self._close_workspace_safely(workspace)
+            await workspace.disconnect_workspace()
         else:
             async with self._lock:
                 self._cache[runtime_id] = (workspace, time.monotonic())
@@ -299,17 +382,25 @@ class EgisSandboxManager(WorkspaceManagerBase):
             logger.warning("工作区连接关闭失败：%s", type(exc).__name__)
 
     async def _recycle_idle_workspaces(self):
-        """只回收超过空闲期限且没有执行者的实例，逐绑定复核状态。"""
+        """先确认本地空闲，再在分布式实例锁内检查远端 Session，避免跨节点误暂停。"""
+        now = time.monotonic()
+        self._failed_workspaces = {
+            key: value
+            for key, value in self._failed_workspaces.items()
+            if now < value[2]
+        }
         async with self._lock:
             identifiers = [
                 key
                 for key, (_, accessed) in self._cache.items()
-                if not self._active_workspaces.get(key)
-                and time.monotonic() - accessed > self._ttl
+                if not self._active_workspaces.get(key) and now - accessed > self._ttl
             ]
         for identifier in identifiers:
-            async with self._workspace_lock(identifier):
-                async with self._lock:
+            try:
+                # 先做非阻塞判断；真正暂停前仍必须在分布式锁内复核。
+                if await self.bus.is_locked(self._instance_key(identifier)):
+                    continue
+                async with self._instance_lock(identifier):
                     entry = self._cache.get(identifier)
                     if (
                         entry is None
@@ -317,8 +408,12 @@ class EgisSandboxManager(WorkspaceManagerBase):
                         or time.monotonic() - entry[1] <= self._ttl
                     ):
                         continue
+                    if await self._session_in_use(entry[0]):
+                        continue
                     self._cache.pop(identifier)
-                await self._close_workspace_safely(entry[0])
+                    await self._close_workspace_safely(entry[0])
+            except Exception as exc:
+                logger.warning("工作区回收未完成：%s", type(exc).__name__)
 
     async def _recycle_loop(self):
         while True:
@@ -340,17 +435,28 @@ class EgisSandboxManager(WorkspaceManagerBase):
                 files=self.files,
                 client=client,
                 settings=self.settings,
+                probe=self.probe_settings,
                 read_guard_factory=self._read_guard_factory,
                 mcp_client_factory=AuthorizedGatewayMCPClient,
                 workspace_id=workspace_id_for(user_id),
                 runtime_binding_id=runtime_id,
             )
-            await workspace.initialize()
+            try:
+                await workspace.initialize()
+            except RuntimeError:
+                raise WorkspaceProbeError(
+                    "runtime", "initialization_failed", retryable=False
+                ) from None
             await workspace.renew_workspace()
+            await workspace.check_ready(full=True)
             return workspace
         except BaseException:
             if workspace is not None:
-                await self._close_workspace_safely(workspace)
+                # 取消可能来自租约丢失；此时只释放句柄，禁止暂停新持有者的实例。
+                try:
+                    await workspace.disconnect_workspace()
+                except Exception:
+                    logger.warning("工作区本地连接释放失败")
             else:
                 await client.close()
             raise

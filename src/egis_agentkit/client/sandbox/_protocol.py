@@ -10,7 +10,7 @@ from typing import Protocol
 
 from agentscope.tool import ExecResult
 
-from egis_agentkit.errors import NotFound
+from egis_agentkit.errors import AgentKitError, NotFound
 
 from ._models import SandboxInstance, SandboxMount
 
@@ -20,6 +20,13 @@ class SandboxInstanceNotFound(NotFound):
 
     def __init__(self):
         super().__init__("沙箱实例不存在或已失效")
+
+
+class SandboxConnectionError(AgentKitError):
+    """实例可能仍然存在，但执行通信暂时不可用；不能据此创建替代实例。"""
+
+    def __init__(self):
+        super().__init__("沙箱执行通道暂时不可用", 503)
 
 
 class SandboxClient(Protocol):
@@ -45,6 +52,9 @@ class SandboxClient(Protocol):
 
     async def renew_instance(self, timeout_seconds: float) -> None:
         """延长有效期；只有明确确认实例消失才抛 SandboxInstanceNotFound。"""
+
+    async def check_connection(self, *, reconnect: bool = False) -> SandboxInstance:
+        """读取当前实例与租约状态，并检查命令通道；重连只连接同一个实例。"""
 
     async def close_instance(self) -> None:
         """暂停当前实例并释放连接，保留文件；实例已不存在时视为已关闭。"""

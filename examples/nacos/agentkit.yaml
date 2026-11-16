@@ -189,6 +189,28 @@ agentkit:
       secretEnv: AGENTKIT_DOWNLOAD_SECRET
       minSecretLength: 32
   workspace:
+    probe:
+      intervalSeconds: 30.0
+      fullIntervalSeconds: 300.0
+      timeoutSeconds: 15.0
+      retryAttempts: 2
+      retryDelaySeconds: 0.25
+      failureCooldownSeconds: 60.0
+      command:
+      - sh
+      - -c
+      - ':'
+      storagePython: '{gateway_python}'
+      runtimeCommands:
+      - - '{gateway_python}'
+        - -c
+        - import agentscope, mcp; import sys; print(sys.version)
+      - - sh
+        - -c
+        - command -v curl >/dev/null && command -v rg >/dev/null
+    lock:
+      leaseSeconds: 90.0
+      waitTimeoutSeconds: 30.0
     readGuard:
       sampleBytes: 4096
       controlByteRatioThreshold: 0.3

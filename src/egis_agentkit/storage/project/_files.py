@@ -21,6 +21,7 @@ class ProjectFileStorage(FileStorage):
     """在通用文件存储上实现项目目录、输入保护和交付规则。"""
 
     RESERVED = frozenset((".work", "artifacts"))
+    PROBE_DIRECTORY = ".agentkit-probes"  # 内部命名空间，禁止用于项目业务文件。
 
     @property
     def max_bytes(self):
@@ -50,6 +51,11 @@ class ProjectFileStorage(FileStorage):
         )
 
     def _area_parts(self, area, path):
+        if any(
+            part.casefold() == self.PROBE_DIRECTORY
+            for part in PurePosixPath(path).parts
+        ):
+            raise Forbidden("该目录由工作区就绪检查保留")
         parts = self._parts(path)
         if area == "uploads" and parts and parts[0].casefold() in self.RESERVED:
             raise Forbidden("上传资料不能访问工作或交付目录")
@@ -102,7 +108,7 @@ class ProjectFileStorage(FileStorage):
     def list(self, user_id, project_id, area, path="", *, recursive=False):
         root = self.area_root(user_id, project_id, area)
         self._area_parts(area, path)
-        ignored = self.RESERVED if area == "uploads" else ()
+        ignored = self.RESERVED if area == "uploads" else (self.PROBE_DIRECTORY,)
         if recursive:
             return list(self._walk_files(root, path, ignored_root=ignored))
         return self._list_root(root, path, ignored_root=ignored)
@@ -289,6 +295,34 @@ class ProjectFileStorage(FileStorage):
                 self._remove_entry(parent, parts[-1])
             except FileNotFoundError:
                 pass  # A retry after a completed delete is idempotent.
+        finally:
+            os.close(parent)
+
+    def write_probe_file(self, user_id, project_id, area, token, content):
+        """原子写入独立探针文件；覆盖已有内容仅限当前探针的随机身份。"""
+        root = self.area_root(user_id, project_id, area)
+        path = self.PROBE_DIRECTORY + "/" + self._identifier(token)
+        self._write_root(root, path, content, overwrite=False, max_bytes=len(content))
+        return str(root / path)
+
+    def read_probe_file(self, user_id, project_id, area, token, size):
+        """验证沙箱写回的数据，继续复用受管存储的防符号链接检查。"""
+        root = self.area_root(user_id, project_id, area)
+        return self._read_root(
+            root, self.PROBE_DIRECTORY + "/" + self._identifier(token), max_bytes=size
+        )[0]
+
+    def remove_probe_file(self, user_id, project_id, area, token):
+        """只清理当前探针文件，不删除保留目录或其他运行实例的探针。"""
+        root = self.area_root(user_id, project_id, area)
+        try:
+            parent = self._directory_fd(root, [self.PROBE_DIRECTORY])
+        except (NotFound, FileNotFoundError):
+            return
+        try:
+            self._remove_entry(parent, self._identifier(token))
+        except FileNotFoundError:
+            pass
         finally:
             os.close(parent)
 

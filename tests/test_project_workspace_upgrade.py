@@ -28,6 +28,8 @@ def test_project_file_tables_and_config_belong_to_project():
     assert set(yaml.safe_load(source)["agentkit"]["workspace"]) == {
         "runtime",
         "readGuard",
+        "probe",
+        "lock",
     }
 
 

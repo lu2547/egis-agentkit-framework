@@ -29,7 +29,9 @@ def native_gateway(monkeypatch):
     from unittest.mock import AsyncMock
 
     async def gateway(workspace):
-        workspace._gateway = SimpleNamespace(aclose=AsyncMock())
+        workspace._gateway = SimpleNamespace(
+            aclose=AsyncMock(), health=AsyncMock(return_value=True)
+        )
 
     monkeypatch.setattr(SandboxedWorkspaceBase, "_setup_mcp_gateway", gateway)
 
@@ -43,7 +45,15 @@ def build_manager(tmp_path, *, client_factory):
         workdir=str(tmp_path / "runtime"),
         gateway_home=str(tmp_path / "gateway"),
     )
-    return EgisSandboxManager(tmp_path, settings, client_factory=client_factory, read_guard_factory=ReadToolGuardMiddleware)
+    from runtime_helpers import workspace_dependencies
+
+    return EgisSandboxManager(
+        tmp_path,
+        settings,
+        client_factory=client_factory,
+        read_guard_factory=ReadToolGuardMiddleware,
+        **workspace_dependencies(),
+    )
 
 
 @pytest.mark.asyncio
@@ -58,6 +68,7 @@ async def test_independent_client_executes_native_tools_and_reuses_one_binding(
     manager = build_manager(
         tmp_path, client_factory=partial(TestSandboxClient, events=events)
     )
+    manager.files.initialize_project("alice", "project")
     async with manager:
         one, two = await asyncio.gather(
             *(
@@ -136,14 +147,21 @@ async def test_different_bindings_do_not_hold_a_global_lock_across_provision(
 async def test_custom_mode_needs_no_opensandbox_credentials(
     storage, tmp_path, native_gateway
 ):
+    import sys
+
     from test_app_http import Config, app_snapshot
 
     from egis_agentkit.bootstrap import init_agentkit
+    from egis_agentkit.client.nacos._settings import WorkspaceProbeConfig
 
     config = Config(
         app_snapshot(
             tmp_path,
             workspace={
+                "probe": WorkspaceProbeConfig(
+                    storage_python=sys.executable,
+                    runtime_commands=[[sys.executable, "-c", "import sys"]],
+                ).model_dump(),
                 "runtime": {
                     "root": str(tmp_path),
                     "mode": "custom",
@@ -152,7 +170,7 @@ async def test_custom_mode_needs_no_opensandbox_credentials(
                         "workdir": str(tmp_path / "runtime"),
                         "gatewayHome": str(tmp_path / "gateway"),
                     },
-                }
+                },
             },
         )
     )

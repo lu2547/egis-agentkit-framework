@@ -554,10 +554,54 @@ class WorkspaceReadGuardConfig(ConfigModel):
     ] = 0.3
 
 
+class WorkspaceProbeConfig(ConfigModel):
+    """工作区分层探测的频率、单阶段预算和只读运行环境命令。"""
+
+    interval_seconds: Seconds = 30
+    full_interval_seconds: Seconds = 300
+    timeout_seconds: Seconds = 15
+    retry_attempts: PositiveInt = 2
+    retry_delay_seconds: NonNegativeSeconds = 0.25
+    failure_cooldown_seconds: Seconds = 60
+    command: list[NonEmptyString] = Field(default_factory=lambda: ["sh", "-c", ":"])
+    storage_python: NonEmptyString = "{gateway_python}"
+    runtime_commands: list[list[NonEmptyString]] = Field(
+        default_factory=lambda: [
+            [
+                "{gateway_python}",
+                "-c",
+                "import agentscope, mcp; import sys; print(sys.version)",
+            ],
+            ["sh", "-c", "command -v curl >/dev/null && command -v rg >/dev/null"],
+        ]
+    )
+
+    @model_validator(mode="after")
+    def validate_probe_policy(self):
+        if self.full_interval_seconds < self.interval_seconds:
+            raise ValueError("完整探测间隔不能小于轻量探测间隔")
+        if (
+            not self.command
+            or not self.runtime_commands
+            or any(not command for command in self.runtime_commands)
+        ):
+            raise ValueError("工作区探测命令不能为空")
+        return self
+
+
+class WorkspaceLockConfig(ConfigModel):
+    """复用消息总线租约的工作区互斥预算，不保存业务连接。"""
+
+    lease_seconds: Seconds = 90
+    wait_timeout_seconds: Seconds = 30
+
+
 class WorkspaceConfig(ConfigModel):
     """工作区仅配置执行环境，不承载项目文件管理。"""
 
     runtime: WorkspaceRuntimeConfig
+    probe: WorkspaceProbeConfig = Field(default_factory=WorkspaceProbeConfig)
+    lock: WorkspaceLockConfig = Field(default_factory=WorkspaceLockConfig)
     read_guard: WorkspaceReadGuardConfig = Field(
         default_factory=WorkspaceReadGuardConfig
     )
