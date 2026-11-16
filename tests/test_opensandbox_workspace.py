@@ -2,15 +2,18 @@
 
 import asyncio
 import importlib
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from agentscope.app.workspace_manager import OpenSandboxWorkspaceManager
-from agentscope.workspace import OpenSandboxWorkspace
+from agentscope.app.workspace_manager import WorkspaceManagerBase
+from agentscope.workspace._sandboxed_base import SandboxedWorkspaceBase
 from pydantic import ValidationError
 
+from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
+from egis_agentkit.core.workspace._egis_sandbox_workspace import EgisSandboxWorkspace
 from egis_agentkit.errors import Forbidden
 
 
@@ -26,15 +29,24 @@ def configuration(tmp_path):
 
 
 def manager_type():
-    module = importlib.import_module("egis_agentkit.service.workspace._egis_sandbox_manager")
-    return module.EgisSandboxManager
+    module = importlib.import_module(
+        "egis_agentkit.service.workspace._egis_sandbox_manager"
+    )
+
+    def factory(root, settings, **kwargs):
+        kwargs.setdefault(
+            "client_factory", partial(OpenSandboxClient, settings, api_key="test-only")
+        )
+        return module.EgisSandboxManager(root, settings, **kwargs)
+
+    return factory
 
 
 async def initialized_provider(workspace):
     """替代远程创建，保留 Manager 所需的真实 SDK 生命周期接口。"""
     workspace.is_alive = True
-    workspace._sandbox = SimpleNamespace(
-        renew=AsyncMock(), pause=AsyncMock(), close=AsyncMock()
+    workspace.client._sandbox = SimpleNamespace(
+        id="test-instance", renew=AsyncMock(), pause=AsyncMock(), close=AsyncMock()
     )
 
 
@@ -51,9 +63,9 @@ async def test_native_manager_reuses_workspace_and_rejects_cross_user_binding(
 ):
     monkeypatch.setenv("TEST_SANDBOX_KEY", "test-only")
 
-    monkeypatch.setattr(OpenSandboxWorkspace, "initialize", initialized_provider)
+    monkeypatch.setattr(EgisSandboxWorkspace, "initialize", initialized_provider)
     manager = manager_type()(tmp_path / "app", configuration(tmp_path))
-    assert isinstance(manager, OpenSandboxWorkspaceManager)
+    assert isinstance(manager, WorkspaceManagerBase)
     async with manager:
         first, same = await asyncio.gather(
             *[
@@ -79,7 +91,7 @@ async def test_project_mounts_expose_only_current_project_and_protect_inputs(
 ):
     monkeypatch.setenv("TEST_SANDBOX_KEY", "test-only")
 
-    monkeypatch.setattr(OpenSandboxWorkspace, "initialize", initialized_provider)
+    monkeypatch.setattr(EgisSandboxWorkspace, "initialize", initialized_provider)
     manager = manager_type()(tmp_path / "app", configuration(tmp_path))
     async with manager:
         workspace = await manager.get_workspace(
@@ -87,7 +99,7 @@ async def test_project_mounts_expose_only_current_project_and_protect_inputs(
         )
         mounts = workspace.build_project_mounts()
         sources = {
-            mount.name: (mount.host.path, mount.mount_path, mount.read_only)
+            mount.name: (mount.source, mount.target, mount.read_only)
             for mount in mounts
         }
         host = tmp_path / "docker-host/user/alice/projects/project"
@@ -101,7 +113,7 @@ async def test_project_mounts_expose_only_current_project_and_protect_inputs(
                 False,
             ),
         }
-        assert all("common" not in str(Path(mount.host.path).parts) for mount in mounts)
+        assert all("common" not in str(Path(mount.source).parts) for mount in mounts)
 
 
 @pytest.mark.asyncio
@@ -116,7 +128,7 @@ async def test_failed_provision_is_not_cached_and_can_retry(tmp_path, monkeypatc
             raise RuntimeError("provider unavailable")
         await initialized_provider(workspace)
 
-    monkeypatch.setattr(OpenSandboxWorkspace, "initialize", initialize)
+    monkeypatch.setattr(EgisSandboxWorkspace, "initialize", initialize)
     manager = manager_type()(tmp_path / "app", configuration(tmp_path))
     async with manager:
         with pytest.raises(RuntimeError, match="provider unavailable"):
@@ -155,6 +167,7 @@ async def test_activated_skill_is_published_inside_backend_without_exposing_othe
         project_id="project",
         files=ProjectFileStorage(tmp_path / "app"),
         settings=configuration(tmp_path),
+        client=OpenSandboxClient(configuration(tmp_path), api_key="test-only"),
     )
     # Exercise the real file Backend without provisioning a remote provider here.
     workspace.workdir = str(tmp_path / "runtime")
@@ -177,7 +190,7 @@ async def test_gateway_tools_keep_managed_connection_source():
     from agentscope.mcp import HttpMCPConfig
 
     module = importlib.import_module(
-        "egis_agentkit.extension.workspace._opensandbox_mcp_client_override"
+        "egis_agentkit.extension.workspace._gateway_mcp_client_override"
     )
 
     class ToolEndpoint:
@@ -228,6 +241,7 @@ async def test_skill_loader_publishes_runtime_path_but_persists_host_cache(tmp_p
         project_id="project-one",
         files=ProjectFileStorage(root),
         settings=configuration(tmp_path),
+        client=OpenSandboxClient(configuration(tmp_path), api_key="test-only"),
     )
     workspace.workdir = str(tmp_path / "runtime")
     workspace._backend = LocalBackend()
@@ -286,7 +300,7 @@ async def test_bootstrap_selects_native_sandbox_manager(storage, tmp_path, monke
         engine=storage.engine,
         owns_client=False,
     )
-    assert isinstance(kit.workspace, OpenSandboxWorkspaceManager)
+    assert isinstance(kit.workspace, WorkspaceManagerBase)
     assert not hasattr(kit.workspace, "resources")
 
 
@@ -304,6 +318,7 @@ def test_binding_metadata_obeys_opensandbox_label_contract(tmp_path):
         project_id="project",
         files=ProjectFileStorage(tmp_path / "app"),
         settings=configuration(tmp_path),
+        client=OpenSandboxClient(configuration(tmp_path), api_key="test-only"),
     )
     for value in workspace._binding_metadata.values():
         assert re.fullmatch(r"[a-zA-Z0-9]([a-zA-Z0-9._-]{0,61}[a-zA-Z0-9])?", value)
@@ -315,7 +330,7 @@ async def test_external_user_subject_remains_valid_provider_metadata(
 ):
     monkeypatch.setenv("TEST_SANDBOX_KEY", "test-only")
 
-    monkeypatch.setattr(OpenSandboxWorkspace, "initialize", initialized_provider)
+    monkeypatch.setattr(EgisSandboxWorkspace, "initialize", initialized_provider)
     async with manager_type()(tmp_path / "app", configuration(tmp_path)) as manager:
         workspace = await manager.get_workspace(
             "张三@example.com", "agent", "session", project_id="project"
@@ -342,6 +357,7 @@ async def test_skill_partition_rejects_parent_segments(tmp_path, agent_id):
         project_id="project",
         files=ProjectFileStorage(tmp_path / "app"),
         settings=configuration(tmp_path),
+        client=OpenSandboxClient(configuration(tmp_path), api_key="test-only"),
     )
     with pytest.raises(Forbidden, match="分区"):
         await workspace.publish_skill(
@@ -362,7 +378,7 @@ async def test_gateway_tool_uses_same_resource_authorization_and_revocation(
     from egis_agentkit.extension.runtime._session_lock_override import (
         ExecutionCoordinator,
     )
-    from egis_agentkit.extension.workspace._opensandbox_mcp_client_override import (
+    from egis_agentkit.extension.workspace._gateway_mcp_client_override import (
         AuthorizedGatewayMCPClient,
     )
     from egis_agentkit.service._session import SessionService
@@ -429,7 +445,7 @@ async def test_agents_and_sessions_do_not_share_running_resources(
 ):
     monkeypatch.setenv("TEST_SANDBOX_KEY", "test-only")
 
-    monkeypatch.setattr(OpenSandboxWorkspace, "initialize", initialized_provider)
+    monkeypatch.setattr(EgisSandboxWorkspace, "initialize", initialized_provider)
     async with manager_type()(tmp_path / "app", configuration(tmp_path)) as manager:
         a = await manager.get_workspace("alice", "writer", "one", project_id="project")
         b = await manager.get_workspace(
@@ -443,7 +459,11 @@ async def test_agents_and_sessions_do_not_share_running_resources(
         assert (
             len({a.runtime_binding_id, b.runtime_binding_id, c.runtime_binding_id}) == 3
         )
-        assert a.build_project_mounts() == b.build_project_mounts() == c.build_project_mounts()
+        assert (
+            a.build_project_mounts()
+            == b.build_project_mounts()
+            == c.build_project_mounts()
+        )
 
 
 @pytest.mark.asyncio
@@ -467,6 +487,7 @@ async def test_skill_publication_reuses_complete_files_and_failure_preserves_the
         project_id="project",
         files=ProjectFileStorage(tmp_path / "app"),
         settings=configuration(tmp_path),
+        client=OpenSandboxClient(configuration(tmp_path), api_key="test-only"),
     )
     workspace.workdir = str(tmp_path / "runtime")
     backend = LocalBackend()
@@ -520,13 +541,14 @@ async def test_gateway_credentials_use_memory_and_cleanup_on_failed_request(
     async def native_setup(workspace):
         workspace._gateway = GatewayClient(backend, workspace.gateway_port)
 
-    monkeypatch.setattr(OpenSandboxWorkspace, "_setup_mcp_gateway", native_setup)
+    monkeypatch.setattr(SandboxedWorkspaceBase, "_setup_mcp_gateway", native_setup)
     workspace = EgisSandboxWorkspace(
         user_id="alice",
         agent_id="agent",
         project_id="project",
         files=ProjectFileStorage(tmp_path / "app"),
         settings=configuration(tmp_path),
+        client=OpenSandboxClient(configuration(tmp_path), api_key="test-only"),
     )
     workspace._backend = backend
     await workspace._setup_mcp_gateway()
@@ -565,7 +587,13 @@ async def test_project_release_destroys_only_owned_provider_bindings(
                 "agentkit.project.id": "project",
             }
             return SimpleNamespace(
-                sandbox_infos=[SimpleNamespace(id="owned", metadata=query.metadata)],
+                sandbox_infos=[
+                    SimpleNamespace(
+                        id="owned",
+                        metadata=query.metadata,
+                        status=SimpleNamespace(state="running"),
+                    )
+                ],
                 pagination=SimpleNamespace(has_next_page=False),
             )
 
@@ -580,5 +608,5 @@ async def test_project_release_destroys_only_owned_provider_bindings(
 
     monkeypatch.setattr(ProviderManager, "create", connect)
     await manager.destroy_workspaces("alice", "project")
-    assert killed == ["owned"] and closed == ["provider"]
+    assert killed == ["owned"] and closed == ["provider", "provider"]
     assert len(pages) == 1

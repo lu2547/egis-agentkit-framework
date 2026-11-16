@@ -222,8 +222,17 @@ async def test_nacos_guard_limits_control_actual_workspace_read(
     )
     monkeypatch.setenv("TEST_SANDBOX_KEY", "test-only")
     stub_sandbox_provider(monkeypatch)
+    from functools import partial
+
+    from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
+
     manager = EgisSandboxManager(
-        tmp_path, config.runtime.opensandbox, read_guard=config.read_guard
+        tmp_path,
+        config.runtime.opensandbox,
+        read_guard=config.read_guard,
+        client_factory=partial(
+            OpenSandboxClient, config.runtime.opensandbox, api_key="test-only"
+        ),
     )
     try:
         workspace = await manager.get_workspace(

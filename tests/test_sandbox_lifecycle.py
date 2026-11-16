@@ -6,15 +6,18 @@ from datetime import timedelta
 
 import pytest
 from agentscope.tool import LocalBackend
-from agentscope.workspace import OpenSandboxWorkspace
-from opensandbox.exceptions import SandboxApiException
 from test_opensandbox_workspace import configuration, manager_type
+
+from egis_agentkit.client.sandbox import SandboxInstanceNotFound
+from egis_agentkit.core.workspace._egis_sandbox_workspace import EgisSandboxWorkspace
+from egis_agentkit.errors import AgentKitError
 
 
 class ProviderHandle:
     """仅替代远程 SDK；缓存、续期、回收和项目文件均走真实实现。"""
 
     def __init__(self):
+        self.id = "test-instance"
         self.failure = None
         self.expires_at = 0
         self.closed = False
@@ -22,7 +25,9 @@ class ProviderHandle:
 
     async def renew(self, timeout):
         if self.failure:
-            raise SandboxApiException("provider failure", status_code=self.failure)
+            if self.failure == 404:
+                raise SandboxInstanceNotFound()
+            raise AgentKitError("provider failure", self.failure)
         self.expires_at = time.monotonic() + timeout.total_seconds()
         self.renewed.set()
 
@@ -38,10 +43,10 @@ def sandbox_manager(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_SANDBOX_KEY", "test-only")
 
     async def initialize(workspace):
-        workspace._sandbox = ProviderHandle()
+        workspace.client._sandbox = ProviderHandle()
         workspace._backend = LocalBackend()
 
-    monkeypatch.setattr(OpenSandboxWorkspace, "initialize", initialize)
+    monkeypatch.setattr(EgisSandboxWorkspace, "initialize", initialize)
     return manager_type()(tmp_path / "app", configuration(tmp_path))
 
 
@@ -57,7 +62,7 @@ async def test_missing_cached_sandbox_is_rebuilt_with_original_project_files(
         old = await manager.get_workspace(
             "alice", "agent", "session", project_id="project"
         )
-        handle = old._sandbox
+        handle = old.client._sandbox
         handle.failure = 404
         recovered = await manager.get_workspace(
             "alice", "agent", "session", project_id="project"
@@ -82,12 +87,12 @@ async def test_provider_failure_does_not_create_duplicate_sandbox(
         workspace = await manager.get_workspace(
             "alice", "agent", "session", project_id="project"
         )
-        workspace._sandbox.failure = status
-        with pytest.raises(SandboxApiException):
+        workspace.client._sandbox.failure = status
+        with pytest.raises(AgentKitError):
             await manager.get_workspace(
                 "alice", "agent", "session", project_id="project"
             )
-        workspace._sandbox.failure = None
+        workspace.client._sandbox.failure = None
         assert (
             await manager.get_workspace(
                 "alice", "agent", "session", project_id="project"
@@ -102,13 +107,13 @@ async def test_active_reply_is_not_evicted_but_idle_workspace_can_be(sandbox_man
         workspace = await manager.get_workspace(
             "alice", "agent", "session", project_id="project"
         )
-        handle = workspace._sandbox
+        handle = workspace.client._sandbox
         async with manager.renew_workspace(workspace):
             manager._cache[workspace.runtime_binding_id] = (
                 workspace,
                 time.monotonic() - manager._ttl - 1,
             )
-            await manager._sweep_once()
+            await manager._recycle_idle_workspaces()
             assert workspace.get_backend() is not None
             assert not handle.closed
         assert (
@@ -119,7 +124,7 @@ async def test_active_reply_is_not_evicted_but_idle_workspace_can_be(sandbox_man
             workspace,
             time.monotonic() - manager._ttl - 1,
         )
-        await manager._sweep_once()
+        await manager._recycle_idle_workspaces()
         assert handle.closed
         assert workspace.runtime_binding_id not in manager._cache
 
@@ -136,7 +141,7 @@ async def test_active_reply_renews_provider_deadline_and_stops_after_completion(
         workspace = await manager.get_workspace(
             "alice", "agent", "session", project_id="project"
         )
-        handle = workspace._sandbox
+        handle = workspace.client._sandbox
         async with manager.renew_workspace(workspace):
             handle.expires_at = 0
             handle.renewed.clear()
@@ -164,9 +169,9 @@ async def test_missing_sandbox_during_reply_stops_execution_instead_of_replaying
             "alice", "agent", "session", project_id="project"
         )
         completed = False
-        with pytest.raises(SandboxApiException):
+        with pytest.raises(AgentKitError):
             async with manager.renew_workspace(workspace):
-                workspace._sandbox.failure = 404
+                workspace.client._sandbox.failure = 404
                 await asyncio.wait_for(asyncio.Event().wait(), timeout=1)
                 completed = True
         assert not completed
@@ -192,7 +197,7 @@ async def test_session_reply_wiring_protects_workspace_until_stream_finishes(
         workspace = await manager.get_workspace(
             "alice", "agent-one", "session-two", project_id="project-one"
         )
-        handle = workspace._sandbox
+        handle = workspace.client._sandbox
         token = execution_scope.set(scope_at(tmp_path))
         try:
             factory = session_middlewares(
@@ -205,7 +210,7 @@ async def test_session_reply_wiring_protects_workspace_until_stream_finishes(
                     workspace,
                     time.monotonic() - manager._ttl - 1,
                 )
-                await manager._sweep_once()
+                await manager._recycle_idle_workspaces()
                 assert not handle.closed
                 yield "still executing"
 
@@ -244,7 +249,7 @@ async def test_reply_exception_is_preserved_and_workspace_becomes_idle(sandbox_m
             workspace,
             time.monotonic() - manager._ttl - 1,
         )
-        await manager._sweep_once()
+        await manager._recycle_idle_workspaces()
         assert workspace.runtime_binding_id not in manager._cache
 
 
@@ -270,5 +275,5 @@ async def test_cancelled_reply_releases_workspace_for_idle_collection(sandbox_ma
             workspace,
             time.monotonic() - manager._ttl - 1,
         )
-        await manager._sweep_once()
+        await manager._recycle_idle_workspaces()
         assert workspace.runtime_binding_id not in manager._cache

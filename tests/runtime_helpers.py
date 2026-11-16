@@ -53,18 +53,21 @@ def stub_sandbox_provider(monkeypatch):
     from unittest.mock import AsyncMock
 
     from agentscope.tool import LocalBackend
-    from agentscope.workspace import OpenSandboxWorkspace
+
+    from egis_agentkit.core.workspace._egis_sandbox_workspace import (
+        EgisSandboxWorkspace,
+    )
 
     async def initialize(workspace):
         workspace.workdir = str(workspace.egis_files.user_root(workspace.egis_user_id))
         Path(workspace.workdir).mkdir(parents=True, exist_ok=True)
         workspace._backend = LocalBackend()
         workspace.is_alive = True
-        workspace._sandbox = SimpleNamespace(
-            renew=AsyncMock(), pause=AsyncMock(), close=AsyncMock()
+        workspace.client._sandbox = SimpleNamespace(
+            id="test-instance", renew=AsyncMock(), pause=AsyncMock(), close=AsyncMock()
         )
 
-    monkeypatch.setattr(OpenSandboxWorkspace, "initialize", initialize)
+    monkeypatch.setattr(EgisSandboxWorkspace, "initialize", initialize)
 
 
 def sandbox_manager(root, monkeypatch):
@@ -74,9 +77,13 @@ def sandbox_manager(root, monkeypatch):
 
     monkeypatch.setenv("TEST_SANDBOX_KEY", "test-only")
     stub_sandbox_provider(monkeypatch)
+    from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
+
+    settings = OpenSandboxConfig(
+        domain="127.0.0.1:8090", api_key_env="TEST_SANDBOX_KEY", host_root=str(root)
+    )
     return EgisSandboxManager(
         root,
-        OpenSandboxConfig(
-            domain="127.0.0.1:8090", api_key_env="TEST_SANDBOX_KEY", host_root=str(root)
-        ),
+        settings,
+        client_factory=partial(OpenSandboxClient, settings, api_key="test-only"),
     )

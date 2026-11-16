@@ -27,6 +27,7 @@ def test_workspace_has_one_sandbox_implementation_and_no_local_branch(tmp_path):
         if path.name != "__init__.py"
     } == {
         "_identity.py",
+        "_sandbox_backend.py",
         "_egis_sandbox_workspace.py",
     }
     with pytest.raises(ValidationError):

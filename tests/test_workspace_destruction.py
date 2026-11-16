@@ -4,11 +4,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from agentscope.workspace import OpenSandboxWorkspace
 from opensandbox import SandboxManager as ProviderManager
 from opensandbox.models.sandboxes import SandboxState
 from test_opensandbox_workspace import configuration, initialized_provider, manager_type
 
+from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
 from egis_agentkit.core.workspace._egis_sandbox_workspace import EgisSandboxWorkspace
 from egis_agentkit.errors import Forbidden
 
@@ -33,9 +33,10 @@ async def test_service_releases_cached_handles_then_delegates_destruction_to_cor
     )
     manager._cache = {"owned": (owned, 0), "other": (other, 0)}
 
-    async def destroy(user_id, project_id, *, settings, api_key):
+    async def destroy(user_id, project_id, *, client):
         assert (user_id, project_id) == ("alice", "project")
-        assert settings is manager.settings and api_key == "test-only"
+        assert isinstance(client, OpenSandboxClient)
+        assert client.settings is manager.settings
         events.append("destroy")
 
     destroy_core = AsyncMock(side_effect=destroy)
@@ -77,7 +78,13 @@ async def test_core_validates_all_pages_before_destroying_owned_running_and_paus
             else metadata
         )
         return SimpleNamespace(
-            sandbox_infos=[SimpleNamespace(id=f"instance-{page}", metadata=actual)],
+            sandbox_infos=[
+                SimpleNamespace(
+                    id=f"instance-{page}",
+                    metadata=actual,
+                    status=SimpleNamespace(state="running"),
+                )
+            ],
             pagination=SimpleNamespace(page=page, has_next_page=page == 1),
         )
 
@@ -95,13 +102,19 @@ async def test_core_validates_all_pages_before_destroying_owned_running_and_paus
     assert method is not None, "Core 缺少实例销毁能力"
     if foreign:
         with pytest.raises(Forbidden, match="归属"):
-            await method("alice", "project", settings=settings, api_key="test-only")
+            await method(
+                "alice",
+                "project",
+                client=OpenSandboxClient(settings, api_key="test-only"),
+            )
         provider.kill_sandbox.assert_not_awaited()
     else:
-        await method("alice", "project", settings=settings, api_key="test-only")
+        await method(
+            "alice", "project", client=OpenSandboxClient(settings, api_key="test-only")
+        )
         assert events[:2] == ["page-1", "page-2"]
         assert set(events[2:]) == {"instance-1", "instance-2"}
-    provider.close.assert_awaited_once()
+    assert provider.close.await_count == (1 if foreign else 3)
     connection = create.call_args.kwargs["connection_config"]
     assert connection.domain == settings.domain
     assert connection.use_server_proxy == settings.use_server_proxy
@@ -119,7 +132,13 @@ async def test_core_propagates_provider_failure_and_closes_client(
     provider = SimpleNamespace(
         list_sandbox_infos=AsyncMock(
             return_value=SimpleNamespace(
-                sandbox_infos=[SimpleNamespace(id="owned", metadata=metadata)],
+                sandbox_infos=[
+                    SimpleNamespace(
+                        id="owned",
+                        metadata=metadata,
+                        status=SimpleNamespace(state="running"),
+                    )
+                ],
                 pagination=SimpleNamespace(has_next_page=False),
             )
         ),
@@ -132,9 +151,13 @@ async def test_core_propagates_provider_failure_and_closes_client(
     assert method is not None, "Core 缺少实例销毁能力"
     with pytest.raises(RuntimeError, match="provider failed"):
         await method(
-            "alice", "project", settings=configuration(tmp_path), api_key="test-only"
+            "alice",
+            "project",
+            client=OpenSandboxClient(configuration(tmp_path), api_key="test-only"),
         )
-    provider.close.assert_awaited_once()
+    assert provider.close.await_count == (
+        1 if failure_stage == "list_sandbox_infos" else 2
+    )
 
 
 @pytest.mark.asyncio
@@ -142,14 +165,14 @@ async def test_core_propagates_provider_failure_and_closes_client(
 async def test_normal_close_pauses_without_destroying_sandbox(
     tmp_path, monkeypatch, entrypoint
 ):
-    monkeypatch.setattr(OpenSandboxWorkspace, "initialize", initialized_provider)
+    monkeypatch.setattr(EgisSandboxWorkspace, "initialize", initialized_provider)
     provider_create = AsyncMock(side_effect=AssertionError("普通关闭不得销毁实例"))
     monkeypatch.setattr(ProviderManager, "create", provider_create)
     async with manager_type()(tmp_path, configuration(tmp_path)) as manager:
         workspace = await manager.get_workspace(
             "alice", "agent", "session", project_id="project"
         )
-        handle = workspace._sandbox
+        handle = workspace.client._sandbox
         await getattr(manager, entrypoint)(workspace.workspace_id)
         handle.pause.assert_awaited_once()
         handle.close.assert_awaited_once()
@@ -161,14 +184,14 @@ async def test_normal_close_pauses_without_destroying_sandbox(
 async def test_core_close_entrypoints_pause_and_clear_connections_once(
     tmp_path, monkeypatch, entrypoint
 ):
-    monkeypatch.setattr(OpenSandboxWorkspace, "initialize", initialized_provider)
+    monkeypatch.setattr(EgisSandboxWorkspace, "initialize", initialized_provider)
     async with manager_type()(tmp_path, configuration(tmp_path)) as manager:
         workspace = await manager.get_workspace(
             "alice", "agent", "session", project_id="project"
         )
-        handle = workspace._sandbox
+        handle = workspace.client._sandbox
         await getattr(workspace, entrypoint)()
         handle.pause.assert_awaited_once()
         handle.close.assert_awaited_once()
-        assert workspace._sandbox is None
+        assert workspace.client._sandbox is None
         assert not workspace.is_alive

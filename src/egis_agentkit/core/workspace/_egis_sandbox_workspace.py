@@ -1,4 +1,4 @@
-"""继承原生 OpenSandbox Workspace，实现固定执行绑定下的沙箱能力。
+"""继承原生 SandboxedWorkspaceBase，实现固定执行绑定下的沙箱核心能力。
 
 公开能力
 - build_project_mounts：构造当前项目挂载，资料只读，工作和交付目录可写。
@@ -18,30 +18,28 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import json
 import re
-from datetime import timedelta
+import shlex
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from agentscope.skill import Skill
 from agentscope.tool import Bash, Read
-from agentscope.workspace import OpenSandboxWorkspace
 from agentscope.workspace._gateway_client import GatewayMCPClient
+from agentscope.workspace._sandboxed_base import SandboxedWorkspaceBase
+from agentscope.workspace._utils import _GATEWAY_BASE_REQUIREMENTS, UV_VERSION
 
-from egis_agentkit.client.nacos._settings import OpenSandboxConfig
+from egis_agentkit.client.nacos._settings import SandboxWorkspaceConfig
+from egis_agentkit.client.sandbox import SandboxClient, SandboxMount
 from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
 from ._identity import sandbox_binding_for, workspace_id_for
-
-if TYPE_CHECKING:
-    from opensandbox.models.sandboxes import Volume
+from ._sandbox_backend import SandboxBackend
 
 
-class EgisSandboxWorkspace(OpenSandboxWorkspace):
-    """保留原生环境与 Backend，挂载企业项目的持久数据。"""
+class EgisSandboxWorkspace(SandboxedWorkspaceBase):
+    """实现通用沙箱生命周期，组合企业 Backend 和当前项目持久挂载。"""
 
     # 初始化固定执行绑定与沙箱配置。
 
@@ -52,12 +50,13 @@ class EgisSandboxWorkspace(OpenSandboxWorkspace):
         agent_id: str,
         project_id: str,
         files: ProjectFileStorage,
-        settings: OpenSandboxConfig,
+        settings: SandboxWorkspaceConfig,
+        client: SandboxClient,
         session_id: str = "",
         runtime_binding_id: str | None = None,
         read_guard_factory=None,
         mcp_client_factory=GatewayMCPClient,
-        **kwargs,
+        workspace_id: str | None = None,
     ):
         self.egis_user_id = user_id
         self.egis_agent_id = agent_id
@@ -74,128 +73,82 @@ class EgisSandboxWorkspace(OpenSandboxWorkspace):
             user_id, project_id, agent_id, session_id
         )
         logical_id = workspace_id_for(user_id)
-        if (
-            kwargs.get("workspace_id") is not None
-            and kwargs["workspace_id"] != logical_id
-        ):
+        if workspace_id is not None and workspace_id != logical_id:
             raise Forbidden("工作区标识与用户不一致")
-        kwargs["workspace_id"] = logical_id
         self._mcp_client_factory = mcp_client_factory
         self.settings = settings
         self._skill_publication_lock = asyncio.Lock()
         self._bootstrap_cmd_timeout = settings.bootstrap_timeout_seconds
-        super().__init__(**kwargs)
-        mounts = [
-            mount.model_dump(mode="json", by_alias=True)
-            for mount in self.build_project_mounts()
-        ]
+        self.client = client
+        self.workdir = settings.workdir
+        self._gateway_home = settings.gateway_home
+        self.gateway_port = settings.gateway_port
+        super().__init__(workspace_id=logical_id)
+        mounts = self.build_project_mounts()
         self._binding_metadata = {
             # 外部身份可以包含 Unicode 或邮箱，不能直接作为 provider label。
             "agentkit.user.hash": self._hash_metadata(user_id.encode()),
             "agentkit.project.id": project_id,
             # 服务端 metadata 遵循 label 长度约束；Base32 保留完整摘要且仅含字母数字。
-            "agentkit.mount.hash": self._hash_metadata(
-                json.dumps(mounts, sort_keys=True).encode()
-            ),
+            "agentkit.mount.hash": client.mount_fingerprint(mounts),
         }
-        self.sandbox_metadata.update(self._binding_metadata)
+        self.sandbox_metadata = dict(self._binding_metadata)
         self.sandbox_metadata["agentkit.workspace.id"] = self.workspace_id
+        self.sandbox_metadata["agentscope.workspace.id"] = self.runtime_binding_id
 
     # 公开执行能力：挂载、续期、资源装载、技能发布及实例关闭和销毁。
 
-    def build_project_mounts(self) -> list[Volume]:
-        """构造限定项目的三个挂载，宿主机和应用可使用不同根目录。"""
-        from opensandbox.models.sandboxes import Host, Volume
-
+    def build_project_mounts(self) -> list[SandboxMount]:
+        """只描述当前项目的挂载意图，Client 负责转换提供方协议。"""
         target = self.egis_files.project_root(self.egis_user_id, self.egis_project_id)
         relative = target.relative_to(self.egis_files.root)
         source = PurePosixPath(self.settings.host_root).joinpath(*relative.parts)
         return [
-            Volume(
-                name="project-inputs",
-                host=Host(path=str(source)),
-                mount_path=str(target),
-                read_only=self.settings.inputs_read_only,
+            SandboxMount(
+                "project-inputs",
+                str(source),
+                str(target),
+                self.settings.inputs_read_only,
             ),
-            Volume(
-                name="project-work",
-                host=Host(path=str(source / ".work")),
-                mount_path=str(target / ".work"),
-            ),
-            Volume(
-                name="project-artifacts",
-                host=Host(path=str(source / "artifacts")),
-                mount_path=str(target / "artifacts"),
+            SandboxMount("project-work", str(source / ".work"), str(target / ".work")),
+            SandboxMount(
+                "project-artifacts",
+                str(source / "artifacts"),
+                str(target / "artifacts"),
             ),
         ]
 
+    @property
+    def sandbox_id(self) -> str | None:
+        """仅暴露中立实例 ID，不向调用方交出提供方 SDK 对象。"""
+        return self.client.instance_id
+
     async def renew_workspace(self):
-        """延长现有沙箱的到期时间；实例不存在时保留 SDK 错误供 Manager 处理。"""
-        if self._sandbox is None:
+        """延长当前实例有效期，明确失效时由 Manager 决定是否重建。"""
+        if self.client.instance_id is None:
             raise RuntimeError("工作区尚未初始化，不能续期沙箱")
-        await self._sandbox.renew(timedelta(seconds=self.timeout_seconds))
+        await self.client.renew_instance(self.settings.timeout_seconds)
 
     @classmethod
     async def destroy_sandbox_instances(
-        cls,
-        user_id: str,
-        project_id: str,
-        *,
-        settings: OpenSandboxConfig,
-        api_key: str,
+        cls, user_id: str, project_id: str, *, client: SandboxClient
     ) -> None:
-        """销毁指定用户、项目的全部沙箱实例，包括暂停及其他进程创建的实例。
-
-        本能力只释放底层沙箱，不查询项目数据库或删除持久文件。
-        调用方先关闭缓存句柄；查询、归属校验或销毁失败时保留错误供其终止删除流程。
-        """
-        from opensandbox import SandboxManager as ProviderManager
-        from opensandbox.config.connection import ConnectionConfig
-        from opensandbox.models.sandboxes import SandboxFilter, SandboxState
-
-        # 1. 创建短期 SDK 管理客户端，连接参数与工作区运行配置保持一致。
-        manager = await ProviderManager.create(
-            connection_config=ConnectionConfig(
-                domain=settings.domain,
-                api_key=api_key,
-                protocol=settings.protocol,
-                request_timeout=timedelta(seconds=settings.request_timeout_seconds),
-                use_server_proxy=settings.use_server_proxy,
-            )
-        )
+        """检查全部实例归属后销毁；不查询项目数据库或删除持久文件。"""
         metadata = {
             "agentkit.user.hash": cls._hash_metadata(user_id.encode()),
             "agentkit.project.id": project_id,
         }
         try:
-            # 2. 完整收集运行和暂停实例，检查全部分页的归属后才允许销毁。
-            page = None
-            bindings = []
-            while True:
-                result = await manager.list_sandbox_infos(
-                    SandboxFilter(
-                        states=[SandboxState.RUNNING, SandboxState.PAUSED],
-                        metadata=metadata,
-                        page=page,
-                    )
-                )
-                bindings.extend(result.sandbox_infos)
-                if not result.pagination.has_next_page:
-                    break
-                page = result.pagination.page + 1
+            instances = await client.list_instances(metadata)
             if any(
-                any(
-                    (info.metadata or {}).get(key) != value
-                    for key, value in metadata.items()
-                )
-                for info in bindings
+                any(info.metadata.get(key) != value for key, value in metadata.items())
+                for info in instances
             ):
                 raise Forbidden("沙箱归属与待删除项目不一致")
-            # 3. 去重后销毁实际沙箱；任何 SDK 失败向上抛出，阻止项目删除。
-            for identifier in {info.id for info in bindings}:
-                await manager.kill_sandbox(identifier)
+            for identifier in sorted({info.id for info in instances}):
+                await client.destroy_instance(identifier)
         finally:
-            await manager.close()
+            await client.close()
 
     async def get_builtin_tools(self):
         """原生工具使用本次执行的 Backend 和目录，Read 增强由管理层注入。"""
@@ -269,13 +222,16 @@ class EgisSandboxWorkspace(OpenSandboxWorkspace):
             await self._close_all_mcp_instances()
         finally:
             self.egis_mcp_clients.clear()
-            await super().close()
+            try:
+                await super().close()
+            finally:
+                await self.client.close()
 
     # 内部辅助方法：元数据编码、技能文件发布与 MCP 分区校验。
 
     @staticmethod
     def _hash_metadata(content: bytes) -> str:
-        """完整 SHA256 以无填充 Base32 编码，符合 OpenSandbox label 约束。"""
+        """完整 SHA256 以无填充 Base32 编码，满足提供方 label 字符及长度约束。"""
         return base64.b32encode(hashlib.sha256(content).digest()).decode().rstrip("=")
 
     def _get_skill_destination(self, agent_id: str, checksum: str) -> str:
@@ -324,57 +280,50 @@ class EgisSandboxWorkspace(OpenSandboxWorkspace):
 
     # AgentScope 原生接口与覆盖钩子：名称由父类协议规定。
 
-    def _connection_config(self):
-        """沿用原生连接配置，增加服务代理选项。"""
-        connection = super()._connection_config()
-        connection.use_server_proxy = self.settings.use_server_proxy
-        return connection
-
-    async def _create_sandbox(self):
-        """原生创建接口未暴露 volumes，在此补充项目挂载。"""
-        from opensandbox import Sandbox
-
-        return await Sandbox.create(
-            image=self.image,
-            connection_config=self._connection_config(),
-            metadata={
-                **self.sandbox_metadata,
-                "agentscope.workspace.id": self.runtime_binding_id,
-            },
-            timeout=timedelta(seconds=self.timeout_seconds),
-            ready_timeout=timedelta(seconds=self.settings.ready_timeout_seconds),
-            env=self.env,
-            resource=self.resource,
-            entrypoint=self.entrypoint,
-            volumes=self.build_project_mounts(),
-        )
-
-    async def _find_existing_sandbox(self):
-        """重连前核对持久身份，拒绝把其他用户或不同挂载接入当前环境。"""
-        from opensandbox import SandboxManager
-        from opensandbox.models.sandboxes import SandboxFilter, SandboxState
-
-        manager = await SandboxManager.create(
-            connection_config=self._connection_config()
-        )
-        try:
-            result = await manager.list_sandbox_infos(
-                SandboxFilter(
-                    states=[SandboxState.RUNNING, SandboxState.PAUSED],
-                    metadata={"agentscope.workspace.id": self.runtime_binding_id},
-                )
+    async def _provision_backend(self):
+        """原生 initialize 的接入点：检查持久身份、连接实例并绑定 Core Backend。"""
+        # 1. 查找实例不代表可以接入，必须逐项检查执行绑定和挂载身份。
+        existing = await self.client.find_instance(self.runtime_binding_id)
+        if existing is not None:
+            if any(
+                existing.metadata.get(key) != value
+                for key, value in self.sandbox_metadata.items()
+            ):
+                raise Forbidden("已有沙箱的用户、项目或挂载与当前绑定不一致")
+            await self.client.connect_instance(existing)
+        else:
+            await self.client.create_instance(
+                dict(self.sandbox_metadata), self.build_project_mounts()
             )
-        finally:
-            await manager.close()
-        existing = max(
-            result.sandbox_infos, key=lambda info: info.created_at, default=None
+        # 2. 命令和文件能力由 Core Backend 统一提供，不导入厂商 Backend。
+        self._backend = SandboxBackend(self.client, self.workdir)
+
+    async def _teardown_backend(self):
+        """原生 close 的接入点；关闭实例与销毁项目是不同操作。"""
+        await self.client.close_instance()
+
+    async def get_instructions(self):
+        return self.settings.instructions.format(
+            backend="Sandbox", workdir=self.workdir
         )
-        if existing is not None and any(
-            (existing.metadata or {}).get(key) != value
-            for key, value in self._binding_metadata.items()
-        ):
-            raise Forbidden("已有沙箱的用户、项目或挂载与当前绑定不一致")
-        return existing
+
+    def _bootstrap_commands(self):
+        """执行命令来自 Nacos；只替换明确的网关占位符，不解释其他花括号。"""
+        replacements = {
+            "{uv_version}": UV_VERSION,
+            "{gateway_venv}": shlex.quote(self._gateway_venv),
+            "{gateway_python}": shlex.quote(self._gateway_python),
+            "{pip_requirements}": " ".join(
+                shlex.quote(value)
+                for value in [*_GATEWAY_BASE_REQUIREMENTS, *self.settings.extra_pip]
+            ),
+        }
+        commands = []
+        for template in self.settings.bootstrap_commands:
+            for key, value in replacements.items():
+                template = template.replace(key, value)
+            commands.append(template)
+        return commands
 
     async def _restore_mcp_specs(self):
         """每轮根据当前授权构建声明，不恢复可能包含旧凭据的配置文件。"""

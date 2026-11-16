@@ -316,17 +316,11 @@ class ProjectContextConfig(ConfigModel):
     max_directories: PositiveInt = 200
 
 
-class OpenSandboxConfig(ConfigModel):
-    """OpenSandbox Docker 接入参数，凭据仅引用部署环境变量。"""
+class SandboxWorkspaceConfig(ConfigModel):
+    """通用工作区的挂载、生命周期和网关配置，不声明提供方连接协议。"""
 
-    domain: NonEmptyString
     host_root: NonEmptyString
-    api_key_env: SecretRef = "OPEN_SANDBOX_API_KEY"
-    protocol: Literal["http", "https"] = "http"
-    image: NonEmptyString = "python:3.11-slim"
-    use_server_proxy: StrictBool = True
     inputs_read_only: StrictBool = True
-    request_timeout_seconds: Seconds = 600
     ready_timeout_seconds: Seconds = 60
     timeout_seconds: Annotated[int, Field(strict=True, ge=60)] = 3600
     bootstrap_timeout_seconds: Seconds = 600
@@ -335,12 +329,19 @@ class OpenSandboxConfig(ConfigModel):
     renew_interval_seconds: Seconds = 60
     gateway_port: Annotated[int, Field(strict=True, ge=1, le=65535)] = 5600
     gateway_tmp_dir: NonEmptyString = "/dev/shm"
-    max_skill_bytes: PositiveInt = DEFAULT_SKILL_ARCHIVE_MAX_BYTES
-    env: dict[str, str] = Field(default_factory=dict)
-    resource: dict[str, str] = Field(
-        default_factory=lambda: {"cpu": "1", "memory": "1Gi"}
+    gateway_home: NonEmptyString = "/root/.agentscope"
+    workdir: NonEmptyString = "/workspace"
+    instructions: str = "当前执行环境为企业沙箱，工作根目录：{workdir}。"
+    bootstrap_commands: list[str] = Field(
+        default_factory=lambda: [
+            "apt-get update -qq && apt-get install -y --no-install-recommends curl ca-certificates ripgrep && update-ca-certificates && rm -rf /var/lib/apt/lists/*",
+            "curl -LsSf https://astral.sh/uv/{uv_version}/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh",
+            "uv venv {gateway_venv}",
+            "uv pip install --python {gateway_python} {pip_requirements}",
+            "uv pip install --python {gateway_python} --no-deps 'agentscope'",
+        ]
     )
-    entrypoint: list[str] = Field(default_factory=lambda: ["tail", "-f", "/dev/null"])
+    max_skill_bytes: PositiveInt = DEFAULT_SKILL_ARCHIVE_MAX_BYTES
     # 原生轻量网关未安装 Tool 模块的传递依赖，调用 MCP 工具时才会触发这些导入。
     extra_pip: list[str] = Field(
         default_factory=lambda: [
@@ -360,6 +361,30 @@ class OpenSandboxConfig(ConfigModel):
             raise ValueError("沙箱续期间隔必须小于实例有效期")
         return self
 
+    @field_validator("host_root", "workdir", "gateway_home", "gateway_tmp_dir")
+    @classmethod
+    def validate_absolute_directory(cls, value):
+        path = PurePosixPath(value)
+        if not path.is_absolute() or ".." in path.parts or path == PurePosixPath("/"):
+            raise ValueError("沙箱目录必须是限定的绝对路径")
+        return str(path)
+
+
+class OpenSandboxConfig(SandboxWorkspaceConfig):
+    """当前开发提供方连接配置；仅 Bootstrap 和 OpenSandboxClient 使用。"""
+
+    domain: NonEmptyString
+    api_key_env: SecretRef = "OPEN_SANDBOX_API_KEY"
+    protocol: Literal["http", "https"] = "http"
+    image: NonEmptyString = "python:3.11-slim"
+    use_server_proxy: StrictBool = True
+    request_timeout_seconds: Seconds = 600
+    env: dict[str, str] = Field(default_factory=dict)
+    resource: dict[str, str] = Field(
+        default_factory=lambda: {"cpu": "1", "memory": "1Gi"}
+    )
+    entrypoint: list[str] = Field(default_factory=lambda: ["tail", "-f", "/dev/null"])
+
     @field_validator("domain")
     @classmethod
     def validate_domain(cls, value):
@@ -377,24 +402,25 @@ class OpenSandboxConfig(ConfigModel):
             )
         return value
 
-    @field_validator("host_root")
-    @classmethod
-    def validate_host_root(cls, value):
-        path = PurePosixPath(value)
-        if not path.is_absolute() or ".." in path.parts or path == PurePosixPath("/"):
-            raise ValueError("OpenSandbox hostRoot 必须是限定的绝对目录")
-        return str(path)
-
 
 class WorkspaceRuntimeConfig(ConfigModel):
     root: NonEmptyString
-    mode: Literal["opensandbox"] = "opensandbox"
-    opensandbox: OpenSandboxConfig
+    mode: Literal["opensandbox", "custom"] = "opensandbox"
+    opensandbox: OpenSandboxConfig | None = None
+    sandbox: SandboxWorkspaceConfig | None = None
 
     @model_validator(mode="after")
     def validate_provider(self):
         if not PurePosixPath(self.root).is_absolute():
-            raise ValueError("opensandbox 模式的 workspace root 必须是绝对路径")
+            raise ValueError("workspace root 必须是绝对路径")
+        if self.mode == "opensandbox" and (
+            self.opensandbox is None or self.sandbox is not None
+        ):
+            raise ValueError("opensandbox 模式只接受对应提供方配置")
+        if self.mode == "custom" and (
+            self.sandbox is None or self.opensandbox is not None
+        ):
+            raise ValueError("custom 模式只接受通用 sandbox 配置")
         return self
 
 

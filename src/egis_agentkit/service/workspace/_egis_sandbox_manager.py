@@ -1,36 +1,34 @@
-"""继承原生 OpenSandbox Manager，管理用户工作区的缓存和运行实例。
+"""实现 WorkspaceManagerBase，管理中立沙箱的缓存、并发、续期与回收。
 
-公开能力
-- get_workspace：原生公开入口，按用户、项目、Agent、会话取得执行环境。
-- renew_workspace：执行期间持续续期，并阻止空闲回收。
-- close_workspaces：关闭用户逻辑工作区下的全部缓存实例，暂停沙箱并保留文件。
-- destroy_workspaces：清理指定用户、项目的缓存连接，调用 Core 销毁底层实例。
-内部实现
-- _refresh_cached_workspace 检查缓存实例；_renew_active_workspace 负责周期续期。
-原生接入
-- close、_sweep_once、_build_and_start 保留父类规定名称，分别接入关闭、空闲回收和构建。
+核心能力
+- get_workspace：核对执行身份，逐绑定串行构建；不同实例可并行初始化。
+- renew_workspace：维护执行使用计数和周期续期，失败终止本次执行而不重放工具。
+- close_workspaces / destroy_workspaces：协调缓存连接与 Core 生命周期。
+- close_all：包括正在构建的实例，关闭所有当前跟踪的环境，可再次使用 Manager。
+- 原生上下文接口启动/停止空闲回收任务，不依赖任何厂商 Manager 私有状态。
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
+import logging
 import time
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 from functools import partial
 from pathlib import Path
+from typing import Callable
 
-from agentscope.app.workspace_manager import OpenSandboxWorkspaceManager
+from agentscope.app.workspace_manager import IsolationPolicy, WorkspaceManagerBase
 
 from egis_agentkit.client.nacos._settings import (
-    OpenSandboxConfig,
+    SandboxWorkspaceConfig,
     WorkspaceReadGuardConfig,
 )
+from egis_agentkit.client.sandbox import SandboxClient, SandboxInstanceNotFound
 from egis_agentkit.core.workspace._egis_sandbox_workspace import EgisSandboxWorkspace
 from egis_agentkit.core.workspace._identity import sandbox_binding_for, workspace_id_for
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
-from egis_agentkit.extension.workspace._opensandbox_mcp_client_override import (
+from egis_agentkit.extension.workspace._gateway_mcp_client_override import (
     AuthorizedGatewayMCPClient,
 )
 from egis_agentkit.extension.workspace._workspace_read_guard_middleware_impl import (
@@ -38,49 +36,70 @@ from egis_agentkit.extension.workspace._workspace_read_guard_middleware_impl imp
 )
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
+logger = logging.getLogger(__name__)
 
-class EgisSandboxManager(OpenSandboxWorkspaceManager):
-    """在原生 Manager 之上绑定项目，保留其缓存、重连和回收语义。"""
 
-    # 初始化依赖与原生生命周期配置。
+class EgisSandboxManager(WorkspaceManagerBase):
+    """管理工作区实例，不创建厂商连接配置或持有 SDK 对象。"""
 
     def __init__(
         self,
         workspace_root: str | Path,
-        settings: OpenSandboxConfig,
+        settings: SandboxWorkspaceConfig,
         *,
+        client_factory: Callable[[], SandboxClient],
         read_guard: WorkspaceReadGuardConfig | None = None,
     ):
-        """注入沙箱连接与挂载配置，凭据缺失时明确失败。"""
+        super().__init__(isolation=IsolationPolicy.PER_USER)
         self.files = ProjectFileStorage(Path(workspace_root))
         self.settings = settings
         self.read_guard_settings = (
             read_guard if read_guard is not None else WorkspaceReadGuardConfig()
         )
+        self._client_factory = client_factory
+        self._cache: dict[str, tuple[EgisSandboxWorkspace, float]] = {}
         self._active_workspaces: dict[str, int] = {}
-        self._project_binding: ContextVar[tuple[str, str] | None] = ContextVar(
-            "sandbox_project_binding", default=None
-        )
-        api_key = os.environ.get(settings.api_key_env)
-        if not api_key:
-            raise ValueError(f"缺少 OpenSandbox 凭据环境变量 {settings.api_key_env}")
-        super().__init__(
-            image=settings.image,
-            api_key=api_key,
-            domain=settings.domain,
-            protocol=settings.protocol,
-            request_timeout_seconds=settings.request_timeout_seconds,
-            timeout_seconds=settings.timeout_seconds,
-            gateway_port=settings.gateway_port,
-            env=settings.env,
-            resource=settings.resource,
-            entrypoint=settings.entrypoint,
-            extra_pip=settings.extra_pip,
-            ttl=settings.ttl_seconds,
-            sweep_interval=settings.sweep_interval_seconds,
-        )
+        self._lock = asyncio.Lock()
+        self._workspace_locks: dict[
+            str | tuple[str, ...], tuple[asyncio.Lock, int]
+        ] = {}
+        self._building: dict[str, tuple[str, str]] = {}
+        self._closing_workspaces: set[str] = set()
+        self._destroying_projects: set[tuple[str, str]] = set()
+        self._closing_all = False
+        self._ttl = settings.ttl_seconds
+        self._sweep_task = None
 
-    # 公开管理能力：操作对象与作用范围写入方法名。
+    async def assign_workspace_id(
+        self, *, user_id: str, agent_id: str, session_id: str
+    ) -> str:
+        """原生创建流程和企业会话始终采用同一用户逻辑身份。"""
+        return workspace_id_for(user_id)
+
+    @asynccontextmanager
+    async def _workspace_lock(self, identifier):
+        """按执行绑定或关闭作用域互斥，计数等待者，最后一位离开时删除锁记录。"""
+        async with self._lock:
+            lock, count = self._workspace_locks.get(identifier, (asyncio.Lock(), 0))
+            self._workspace_locks[identifier] = (lock, count + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            async with self._lock:
+                _, count = self._workspace_locks[identifier]
+                if count == 1:
+                    self._workspace_locks.pop(identifier)
+                else:
+                    self._workspace_locks[identifier] = (lock, count - 1)
+
+    def _require_open(self, user_id, project_id):
+        if (
+            self._closing_all
+            or workspace_id_for(user_id) in self._closing_workspaces
+            or (user_id, project_id) in self._destroying_projects
+        ):
+            raise Conflict("工作区正在关闭，请在当前操作结束后重试")
 
     @asynccontextmanager
     async def renew_workspace(self, workspace):
@@ -121,70 +140,6 @@ class EgisSandboxManager(OpenSandboxWorkspaceManager):
                 if entry is not None and entry[0] is workspace:
                     self._cache[identifier] = (workspace, time.monotonic())
 
-    async def close_workspaces(self, workspace_id):
-        """移除用户工作区下全部缓存实例，关闭连接并暂停沙箱，保留项目文件。"""
-        async with self._lock:
-            identifiers = [
-                key
-                for key, (workspace, _) in self._cache.items()
-                if workspace.workspace_id == workspace_id
-            ]
-        for identifier in identifiers:
-            await super().close(identifier)
-
-    async def destroy_workspaces(self, user_id, project_id):
-        """按用户和项目筛选工作区，统一移除缓存、关闭连接并销毁底层实例。"""
-        # 1. 项目管理已持有删除锁；选出本进程缓存并关闭对应工作区句柄。
-        async with self._lock:
-            identifiers = [
-                key
-                for key, (workspace, _) in self._cache.items()
-                if (workspace.egis_user_id, workspace.egis_project_id)
-                == (user_id, project_id)
-            ]
-            entries = [self._cache.pop(key)[0] for key in identifiers]
-        await asyncio.gather(*(workspace.close_workspace() for workspace in entries))
-        # 2. Core 负责底层实例的完整查询、归属校验和销毁；失败阻止后续文件删除。
-        await EgisSandboxWorkspace.destroy_sandbox_instances(
-            user_id,
-            project_id,
-            settings=self.settings,
-            api_key=self._api_key,
-        )
-
-    # 内部辅助方法：仅供本类维护缓存有效性和执行期续期。
-
-    async def _refresh_cached_workspace(self, runtime_id):
-        """续期缓存实例；只移除已确认不存在且没有执行者的句柄。"""
-        from opensandbox.exceptions import SandboxApiException
-
-        expired = None
-        async with self._lock:
-            cached = self._cache.get(runtime_id)
-            if cached is None:
-                return
-            workspace, _ = cached
-            try:
-                await workspace.renew_workspace()
-            except SandboxApiException as exc:
-                if exc.status_code != 404:
-                    raise
-                if self._active_workspaces.get(runtime_id):
-                    raise Conflict("沙箱实例已失效，请等待当前执行结束后重试") from exc
-                expired, _ = self._cache.pop(runtime_id)
-            else:
-                self._cache[runtime_id] = (workspace, time.monotonic())
-        if expired is not None:
-            await self._safe_close(expired)
-
-    async def _renew_active_workspace(self, workspace):
-        """按 Nacos 配置的间隔续期；不忽略服务端失败或无限重试。"""
-        while True:
-            await asyncio.sleep(self.settings.renew_interval_seconds)
-            await workspace.renew_workspace()
-
-    # AgentScope 原生接口与覆盖钩子：名称由父类协议规定。
-
     async def get_workspace(
         self,
         user_id: str,
@@ -221,74 +176,224 @@ class EgisSandboxManager(OpenSandboxWorkspaceManager):
             raise NotFound("会话未绑定项目")
         # 项目目录由 ProjectFileManager 管理，此处只选择用户工作区的执行环境。
         runtime_id = sandbox_binding_for(user_id, project_id, agent_id, session_id)
-        token = self._project_binding.set((project_id, session_id))
-        try:
-            # 2. 缓存对象仍在不代表服务端容器仍在；仅实例 404 才允许重新构建。
+        async with self._workspace_lock(runtime_id):
+            async with self._lock:
+                self._require_open(user_id, project_id)
             await self._refresh_cached_workspace(runtime_id)
-            workspace = await super().get_workspace(
-                user_id, agent_id, session_id, workspace_id=runtime_id
-            )
-        finally:
-            self._project_binding.reset(token)
-        # 3. 缓存命中后仍核对归属，禁止跨用户接入。
-        if workspace.egis_user_id != user_id or workspace.egis_project_id != project_id:
-            raise Forbidden("工作区实例与用户或项目不一致")
-        return workspace
+            entry = self._cache.get(runtime_id)
+            if entry is not None:
+                workspace = entry[0]
+            else:
+                async with self._lock:
+                    self._require_open(user_id, project_id)
+                    self._building[runtime_id] = (user_id, project_id)
+                try:
+                    workspace = await self._build_workspace(
+                        runtime_id, user_id, project_id, agent_id, session_id
+                    )
+                    async with self._lock:
+                        try:
+                            self._require_open(user_id, project_id)
+                        except Conflict:
+                            rejected = True
+                        else:
+                            self._cache[runtime_id] = (workspace, time.monotonic())
+                            rejected = False
+                    if rejected:
+                        await self._close_workspace_safely(workspace)
+                        raise Conflict("构建期间工作区已开始关闭，请重试")
+                finally:
+                    async with self._lock:
+                        self._building.pop(runtime_id, None)
+            # 网络续期期间可能启动关闭；返回前再次确认生命周期。
+            async with self._lock:
+                self._require_open(user_id, project_id)
+            if (
+                workspace.egis_user_id != user_id
+                or workspace.egis_project_id != project_id
+            ):
+                raise Forbidden("工作区实例与用户或项目不一致")
+            return workspace
 
-    async def close(self, workspace_id):
-        """接入 AgentScope 固定关闭接口，转入本类的用户工作区关闭能力。"""
-        await self.close_workspaces(workspace_id)
+    async def _close_cached_workspace(self, identifier):
+        async with self._workspace_lock(identifier):
+            async with self._lock:
+                entry = self._cache.pop(identifier, None)
+            if entry is not None:
+                await entry[0].close_workspace()
 
-    async def _sweep_once(self):
-        """覆盖原生定时回收钩子，仅暂停超过空闲 TTL 且没有执行者的实例。"""
-        now = time.monotonic()
+    async def close_workspaces(self, workspace_id):
+        """关闭用户逻辑工作区下的缓存和构建中实例，保留持久文件。"""
+        async with self._workspace_lock(("close_user", workspace_id)):
+            async with self._lock:
+                self._closing_workspaces.add(workspace_id)
+                identifiers = {
+                    key
+                    for key, (workspace, _) in self._cache.items()
+                    if workspace.workspace_id == workspace_id
+                }
+                identifiers.update(
+                    key
+                    for key, (uid, _) in self._building.items()
+                    if workspace_id_for(uid) == workspace_id
+                )
+            try:
+                results = await asyncio.gather(
+                    *(self._close_cached_workspace(key) for key in identifiers),
+                    return_exceptions=True,
+                )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+            finally:
+                async with self._lock:
+                    self._closing_workspaces.discard(workspace_id)
+
+    async def destroy_workspaces(self, user_id, project_id):
+        """先关闭该项目的缓存/构建中连接，再由 Core 校验并销毁提供方实例。"""
+        async with self._workspace_lock(("destroy_project", user_id, project_id)):
+            async with self._lock:
+                self._destroying_projects.add((user_id, project_id))
+                identifiers = {
+                    key
+                    for key, (workspace, _) in self._cache.items()
+                    if (workspace.egis_user_id, workspace.egis_project_id)
+                    == (user_id, project_id)
+                }
+                identifiers.update(
+                    key
+                    for key, owner in self._building.items()
+                    if owner == (user_id, project_id)
+                )
+            try:
+                for identifier in identifiers:
+                    await self._close_cached_workspace(identifier)
+                await EgisSandboxWorkspace.destroy_sandbox_instances(
+                    user_id, project_id, client=self._client_factory()
+                )
+            finally:
+                async with self._lock:
+                    self._destroying_projects.discard((user_id, project_id))
+
+    async def _refresh_cached_workspace(self, runtime_id):
+        """调用者持有绑定锁；网络请求不持有全局缓存锁，只有明确失效才移除实例。"""
+        entry = self._cache.get(runtime_id)
+        if entry is None:
+            return
+        workspace, _ = entry
+        try:
+            await workspace.renew_workspace()
+        except SandboxInstanceNotFound:
+            async with self._lock:
+                if self._active_workspaces.get(runtime_id):
+                    raise Conflict("沙箱实例已失效，请等待当前执行结束后重试") from None
+                self._cache.pop(runtime_id, None)
+            await self._close_workspace_safely(workspace)
+        else:
+            async with self._lock:
+                self._cache[runtime_id] = (workspace, time.monotonic())
+
+    async def _renew_active_workspace(self, workspace):
+        while True:
+            await asyncio.sleep(self.settings.renew_interval_seconds)
+            await workspace.renew_workspace()
+
+    @staticmethod
+    async def _close_workspace_safely(workspace):
+        try:
+            await workspace.close_workspace()
+        except Exception as exc:
+            logger.warning("工作区连接关闭失败：%s", type(exc).__name__)
+
+    async def _recycle_idle_workspaces(self):
+        """只回收超过空闲期限且没有执行者的实例，逐绑定复核状态。"""
         async with self._lock:
             identifiers = [
                 key
                 for key, (_, accessed) in self._cache.items()
-                if not self._active_workspaces.get(key) and now - accessed > self._ttl
+                if not self._active_workspaces.get(key)
+                and time.monotonic() - accessed > self._ttl
             ]
-            expired = [self._cache.pop(key)[0] for key in identifiers]
-        await asyncio.gather(*(self._safe_close(workspace) for workspace in expired))
+        for identifier in identifiers:
+            async with self._workspace_lock(identifier):
+                async with self._lock:
+                    entry = self._cache.get(identifier)
+                    if (
+                        entry is None
+                        or self._active_workspaces.get(identifier)
+                        or time.monotonic() - entry[1] <= self._ttl
+                    ):
+                        continue
+                    self._cache.pop(identifier)
+                await self._close_workspace_safely(entry[0])
 
-    async def _build_and_start(
-        self, *, workspace_id: str, user_id: str, agent_id: str
-    ) -> EgisSandboxWorkspace:
-        """只定制实例构造，创建/恢复仍交给原生 Workspace.initialize。"""
-        binding = self._project_binding.get()
-        if binding is None:
-            raise RuntimeError("创建沙箱缺少项目绑定上下文")
-        project_id, session_id = binding
-        workspace = EgisSandboxWorkspace(
-            user_id=user_id,
-            agent_id=agent_id,
-            project_id=project_id,
-            session_id=session_id,
-            files=self.files,
-            read_guard_factory=partial(
-                ReadToolGuardMiddleware, settings=self.read_guard_settings
-            ),
-            mcp_client_factory=AuthorizedGatewayMCPClient,
-            settings=self.settings,
-            workspace_id=workspace_id_for(user_id),
-            runtime_binding_id=workspace_id,
-            image=self._image,
-            api_key=self._api_key,
-            domain=self._domain,
-            protocol=self._protocol,
-            request_timeout_seconds=self._request_timeout_seconds,
-            timeout_seconds=self._timeout_seconds,
-            gateway_port=self._gateway_port,
-            env=self._env,
-            resource=self._resource,
-            entrypoint=self._entrypoint,
-            extra_pip=self._extra_pip,
-        )
+    async def _recycle_loop(self):
+        while True:
+            await asyncio.sleep(self.settings.sweep_interval_seconds)
+            await self._recycle_idle_workspaces()
+
+    async def _build_workspace(
+        self, runtime_id, user_id, project_id, agent_id, session_id
+    ):
+        """构建 Core Workspace，具体 Client 由 Bootstrap 注入。"""
+        client = self._client_factory()
+        workspace = None
         try:
+            workspace = EgisSandboxWorkspace(
+                user_id=user_id,
+                agent_id=agent_id,
+                project_id=project_id,
+                session_id=session_id,
+                files=self.files,
+                client=client,
+                settings=self.settings,
+                read_guard_factory=partial(
+                    ReadToolGuardMiddleware, settings=self.read_guard_settings
+                ),
+                mcp_client_factory=AuthorizedGatewayMCPClient,
+                workspace_id=workspace_id_for(user_id),
+                runtime_binding_id=runtime_id,
+            )
             await workspace.initialize()
-            # 恢复旧实例不会自动延长其有效期，初始化完成后显式续期。
             await workspace.renew_workspace()
+            return workspace
         except BaseException:
-            await workspace.close_workspace()
+            if workspace is not None:
+                await self._close_workspace_safely(workspace)
+            else:
+                await client.close()
             raise
-        return workspace
+
+    async def close(self, workspace_id):
+        """原生关闭接口使用用户逻辑工作区身份。"""
+        await self.close_workspaces(workspace_id)
+
+    async def close_all(self):
+        """包括构建中的实例；完整等待关闭结果，不把某个失败变成后台遗留任务。"""
+        async with self._workspace_lock(("close_all",)):
+            async with self._lock:
+                self._closing_all = True
+                identifiers = set(self._cache) | set(self._building)
+            try:
+                results = await asyncio.gather(
+                    *(self._close_cached_workspace(key) for key in identifiers),
+                    return_exceptions=True,
+                )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+            finally:
+                async with self._lock:
+                    self._closing_all = False
+
+    async def __aenter__(self):
+        if self._sweep_task is None:
+            self._sweep_task = asyncio.create_task(self._recycle_loop())
+        return self
+
+    async def __aexit__(self, *exc):
+        if self._sweep_task is not None:
+            self._sweep_task.cancel()
+            await asyncio.gather(self._sweep_task, return_exceptions=True)
+            self._sweep_task = None
+        await self.close_all()

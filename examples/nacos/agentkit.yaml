@@ -212,6 +212,15 @@ agentkit:
         renewIntervalSeconds: 60
         gatewayPort: 5600
         gatewayTmpDir: /dev/shm
+        gatewayHome: /root/.agentscope
+        workdir: /workspace
+        instructions: 当前执行环境为企业沙箱，工作根目录：{workdir}。
+        bootstrapCommands:
+        - apt-get update -qq && apt-get install -y --no-install-recommends curl ca-certificates ripgrep && update-ca-certificates && rm -rf /var/lib/apt/lists/*
+        - curl -LsSf https://astral.sh/uv/{uv_version}/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
+        - uv venv {gateway_venv}
+        - uv pip install --python {gateway_python} {pip_requirements}
+        - uv pip install --python {gateway_python} --no-deps agentscope
         maxSkillBytes: 52428800
         env: {}
         resource: {cpu: '1', memory: 1Gi}

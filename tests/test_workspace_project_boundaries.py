@@ -72,16 +72,16 @@ async def test_same_user_two_projects_keep_one_workspace_identity(storage, tmp_p
 
 
 def test_sandbox_management_and_execution_have_distinct_owners():
-    from agentscope.app.workspace_manager import OpenSandboxWorkspaceManager
-    from agentscope.workspace import OpenSandboxWorkspace
+    from agentscope.app.workspace_manager import WorkspaceManagerBase
+    from agentscope.workspace._sandboxed_base import SandboxedWorkspaceBase
 
     from egis_agentkit.core.workspace._egis_sandbox_workspace import (
         EgisSandboxWorkspace,
     )
     from egis_agentkit.service.workspace._egis_sandbox_manager import EgisSandboxManager
 
-    assert issubclass(EgisSandboxManager, OpenSandboxWorkspaceManager)
-    assert issubclass(EgisSandboxWorkspace, OpenSandboxWorkspace)
+    assert issubclass(EgisSandboxManager, WorkspaceManagerBase)
+    assert issubclass(EgisSandboxWorkspace, SandboxedWorkspaceBase)
 
 
 def test_generic_runtime_callback_has_no_project_or_storage_dependencies():

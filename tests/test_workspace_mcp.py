@@ -8,7 +8,7 @@ from agentscope.workspace._gateway_client import GatewayClient
 from runtime_helpers import sandbox_manager
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.extension.workspace._opensandbox_mcp_client_override import (
+from egis_agentkit.extension.workspace._gateway_mcp_client_override import (
     AuthorizedGatewayMCPClient,
 )
 

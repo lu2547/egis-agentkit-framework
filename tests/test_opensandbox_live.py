@@ -6,6 +6,7 @@ import os
 import shutil
 import socket
 import time
+from functools import partial
 from pathlib import Path
 from uuid import uuid4
 
@@ -26,7 +27,7 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
     from opensandbox.models.sandboxes import SandboxFilter
 
     from egis_agentkit.client.nacos._settings import OpenSandboxConfig
-    from egis_agentkit.extension.workspace._opensandbox_mcp_client_override import (
+    from egis_agentkit.extension.workspace._gateway_mcp_client_override import (
         AuthorizedGatewayMCPClient,
     )
     from egis_agentkit.service.workspace._egis_sandbox_manager import (
@@ -56,7 +57,15 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
         )
     project_id = "test-sandbox-" + uuid4().hex
     other_id = "test-sandbox-" + uuid4().hex
-    manager = EgisSandboxManager(root, settings)
+    from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
+
+    manager = EgisSandboxManager(
+        root,
+        settings,
+        client_factory=partial(
+            OpenSandboxClient, settings, api_key=os.environ[settings.api_key_env]
+        ),
+    )
     manager.files.initialize_project("sandbox-test", project_id)
     manager.files.initialize_project("sandbox-test", other_id)
     source = root / "common" / project_id
@@ -167,7 +176,7 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
             other_pwd = [chunk async for chunk in await other_bash(command="pwd")]
             assert str(other_root / ".work") in str(other_pwd)
 
-            assert another._sandbox.id != workspace._sandbox.id
+            assert another.sandbox_id != workspace.sandbox_id
             assert not await another.get_backend().file_exists(
                 published.dir + "/SKILL.md"
             )
@@ -181,12 +190,12 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
                 )
                 == b"sandbox output"
             )
-            sandbox_id = workspace._sandbox.id
+            sandbox_id = workspace.sandbox_id
             await manager.close_workspaces(workspace.workspace_id)
             again = await manager.get_workspace(
                 "sandbox-test", "agent", "session", project_id=project_id
             )
-            assert again._sandbox.id == sandbox_id
+            assert again.sandbox_id == sandbox_id
             assert (
                 await again.get_backend().read_file(str(probe / "artifacts/result.txt"))
                 == b"sandbox output"
@@ -230,7 +239,15 @@ async def test_real_docker_recovers_missing_sandbox_without_losing_project_files
         renew_interval_seconds=0.05,
     )
     project_id = "test-recover-" + uuid4().hex
-    manager = EgisSandboxManager(root, settings)
+    from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
+
+    manager = EgisSandboxManager(
+        root,
+        settings,
+        client_factory=partial(
+            OpenSandboxClient, settings, api_key=os.environ[settings.api_key_env]
+        ),
+    )
     manager.files.initialize_project("sandbox-test", project_id)
     manager.files.write(
         "sandbox-test", project_id, "input.txt", b"persistent input", area="uploads"
@@ -245,19 +262,19 @@ async def test_real_docker_recovers_missing_sandbox_without_losing_project_files
             )
             original_id = workspace.sandbox_id
             async with manager.renew_workspace(workspace):
-                before = await workspace._sandbox.get_info()
+                before = await workspace.client._sandbox.get_info()
                 await asyncio.sleep(settings.renew_interval_seconds * 2)
-                after = await workspace._sandbox.get_info()
+                after = await workspace.client._sandbox.get_info()
                 assert after.expires_at > before.expires_at
                 manager._cache[workspace.runtime_binding_id] = (
                     workspace,
                     time.monotonic() - manager._ttl - 1,
                 )
-                await manager._sweep_once()
+                await manager._recycle_idle_workspaces()
                 result = await workspace.get_backend().exec_shell(["true"])
                 assert result.ok()
             # 只销毁本测试独占的实例，模拟到期或外部删除。
-            await workspace._sandbox.kill()
+            await workspace.client._sandbox.kill()
             recovered = await manager.get_workspace(
                 "sandbox-test", "agent", "session", project_id=project_id
             )

@@ -1,5 +1,6 @@
 """组装 AgentKit 的业务服务和运行时扩展，管理组件启动和关闭顺序。"""
 
+import os
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from egis_agentkit.client._postgres import check_postgres, create_postgres_engine
 from egis_agentkit.client.nacos import NacosClient, NacosConfigProvider
 from egis_agentkit.client.nacos._config import LivePolicies
+from egis_agentkit.client.sandbox import SandboxClient
 from egis_agentkit.core.agent._expert_definition import ExpertDefinition
 from egis_agentkit.core.agent._remote_definition import RemoteDefinition
 from egis_agentkit.extension.demo._demo_report_tool_impl import deploy_demo_report_tools
@@ -104,10 +106,27 @@ def init_agentkit(
     *,
     engine: AsyncEngine | None = None,
     owns_client: bool = True,
+    sandbox_client_factory: Callable[[], SandboxClient] | None = None,
 ) -> AgentKit:
     snapshot = config.snapshot
     postgres = snapshot.client.postgres
     workspace = snapshot.workspace
+    # 具体沙箱通信只在装配点选择；公司实现可直接注入中立 Client 工厂。
+    runtime = workspace.runtime
+    sandbox_settings = (
+        runtime.opensandbox if runtime.mode == "opensandbox" else runtime.sandbox
+    )
+    if sandbox_client_factory is None:
+        if runtime.mode != "opensandbox":
+            raise ValueError("custom 沙箱模式必须注入 sandbox_client_factory")
+        from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
+
+        api_key = os.environ.get(runtime.opensandbox.api_key_env)
+        if not api_key:
+            raise ValueError(f"缺少沙箱凭据环境变量 {runtime.opensandbox.api_key_env}")
+        sandbox_client_factory = partial(
+            OpenSandboxClient, runtime.opensandbox, api_key=api_key
+        )
     owns_engine = engine is None
     if engine is None:
         engine = create_postgres_engine(
@@ -140,7 +159,10 @@ def init_agentkit(
     files = ProjectFileStorage(root, config_provider=config)
     resources = ResourceService(storage, root, policies=policies, config=config)
     workspace_manager = EgisSandboxManager(
-        root, workspace.runtime.opensandbox, read_guard=workspace.read_guard
+        root,
+        sandbox_settings,
+        client_factory=sandbox_client_factory,
+        read_guard=workspace.read_guard,
     )
     projects = ProjectManager(
         storage,

@@ -52,7 +52,7 @@ python -m egis_agentkit_app upgrade-db --database agentscope --apply
 
 OpenSandbox Docker 工作区已通过 `EgisSandboxManager` 接入，继承原生 `OpenSandboxWorkspaceManager`。缓存、并发复用、TTL、暂停和重连使用原生实现；Manager 只负责执行绑定和实例生命周期；Core 负责项目挂载及工具执行。授权资源由 SessionService 调用 ResourceService.prepare_workspace 装载。运行容器按用户、项目、Agent、会话隔离，同一绑定复用环境；项目上传资料只读，`.work/`、`artifacts/` 可写，项目数据仍由文件存储共享和持久化，不新增工作区表。
 
-部署时安装 `uv sync --extra opensandbox`，在 Nacos `agentkit.workspace.runtime` 设置 `mode: opensandbox`，并填写示例中的 `opensandbox` 配置。`root` 是应用访问的持久根目录，`hostRoot` 是 Docker daemon 看到的同一份存储；两者可以不同，但相对目录必须一致。OpenSandbox 服务的 `storage.allowed_host_paths` 必须包含该宿主根目录；本地 compose 通过 `AGENTKIT_WORKSPACE_HOST_ROOT` 设置白名单和服务端只读挂载。API 进程使用 `apiKeyEnv` 引用的环境变量，不把密钥写进 Nacos。修改镜像和挂载后需要重启 API；仅支持 OpenSandbox Docker 运行时。
+部署时安装 `uv sync --extra opensandbox`，在 Nacos `agentkit.workspace.runtime` 设置 `mode: opensandbox`，并填写示例中的 `opensandbox` 配置。`root` 是应用访问的持久根目录，`hostRoot` 是 Docker daemon 看到的同一份存储；两者可以不同，但相对目录必须一致。OpenSandbox 服务的 `storage.allowed_host_paths` 必须包含该宿主根目录；本地 compose 通过 `AGENTKIT_WORKSPACE_HOST_ROOT` 设置白名单和服务端只读挂载。API 进程使用 `apiKeyEnv` 引用的环境变量，不把密钥写进 Nacos。修改镜像和挂载后需要重启 API。当前开发环境使用 OpenSandbox Docker；公司沙箱使用 `mode: custom` 和通用 `sandbox` 配置，并在 `init_agentkit` 注入 `sandbox_client_factory`。Manager、Workspace 直接实现原生通用基类，Backend 在 Core，只有 `client/sandbox/_opensandbox.py` 导入该提供方 SDK。能力与接入契约见下文。
 
 工具通过 OpenSandbox Backend 执行；MCP 通过容器内原生网关连接，连接配置不写入 `.mcp`，网关临时内容只允许经过启动时验证为 tmpfs 的 `gatewayTmpDir`；技能在激活后暂存完整再安装，完成的同一内容直接复用，授权失效会移除运行副本。持久激活记录继续校验原资源内容。MCP 中的 `localhost` 指沙箱自身；访问宿主开发服务应使用沙箱可达地址。
 
@@ -65,6 +65,23 @@ PYTHONPATH=src python scripts/build_workspace_image.py \
 ```
 
 构建复用原生镜像模板，网关和 AgentScope wheel 来自同一份源码，额外依赖读取 YAML；配置正文、密钥和项目文件不进入镜像。将最后输出的 `agentkit-workspace:<内容摘要>` 写入 Nacos `agentkit.workspace.runtime.opensandbox.image`，重启 API。包源通过 uv 的部署环境配置；本机私有包源不可用时应在构建环境配置可达包源。已有沙箱不会自动换镜像，升级时需回收旧运行环境，持久项目目录保留。
+
+沙箱代码按职责收敛为：
+
+```text
+service/workspace/_egis_sandbox_manager.py   缓存、并发构建、续期调度、空闲回收
+core/workspace/_identity.py                 用户身份和固定执行绑定
+core/workspace/_egis_sandbox_workspace.py   挂载、技能、MCP 和单实例生命周期
+core/workspace/_sandbox_backend.py          原生工具的命令、字节文件执行能力
+client/sandbox/_protocol.py                 SandboxClient 通信契约
+client/sandbox/_models.py                   中立挂载与实例数据
+client/sandbox/_opensandbox.py              当前开发提供方 SDK 通信
+extension/workspace/                        Read 拦截、网关工具来源标记
+```
+
+`EgisSandboxManager → WorkspaceManagerBase`，`EgisSandboxWorkspace → SandboxedWorkspaceBase`，`SandboxBackend → BackendBase`，均直接实现通用原生基类。调用链为 `Manager → Core Workspace/Backend → 注入的 Client → 提供方`；不按 init/start/runtime/end 再建目录，也不新增表。用户逻辑工作区、会话执行绑定及 NAS 路径保持稳定。
+
+公司沙箱通过 `init_agentkit(..., sandbox_client_factory=...)` 注入，每次工厂调用返回独立的 `SandboxClient`。`find_instance/list_instances` 负责完整查询；`create_instance/connect_instance/renew_instance/close_instance/destroy_instance` 管实例；`exec_command/read_file/write_file` 管通信；`close` 只释放连接。Core 先检查实例绑定和挂载身份再恢复；只有 `SandboxInstanceNotFound` 可以触发缓存重建。公司模式使用 `agentkit.workspace.runtime.mode: custom`，在 `sandbox` 下填写通用配置，不填写 OpenSandbox 连接字段。缺少 Client 工厂时初始化立即失败，不会自动使用开发提供方。
 
 日常回归运行 `pytest -q`。真实 Docker 验收需要显式提供 `AGENTKIT_TEST_OPENSANDBOX_ROOT`、`AGENTKIT_TEST_OPENSANDBOX_DOMAIN` 和 `OPEN_SANDBOX_API_KEY`，再运行 `pytest tests/test_opensandbox_live.py -q -s`；该测试仅清理自己生成的唯一沙箱和文件目录。额外设置 `AGENTKIT_TEST_OPENSANDBOX_IMAGE` 可验证预构建镜像；此时任何会话内安装依赖都会令测试失败。验收还需通过真实 `/chat/` 和 SSE 收到正常结束的模型回复，健康检查不能替代聊天验收。
 
