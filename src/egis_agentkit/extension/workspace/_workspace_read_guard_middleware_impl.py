@@ -1,4 +1,9 @@
-"""实现 ToolMiddlewareBase，在原生 Read 处理前拦截不支持的二进制文件。"""
+"""实现 ToolMiddlewareBase，在原生 Read 处理前拦截不支持的二进制文件。
+
+核心能力
+- on_tool_call：按配置进行有界采样，拒绝不支持的输入和含空字符的输出。
+- _is_binary：按已验证的控制字节占比阈值判定，不更改模型调用流程。
+"""
 
 from contextlib import aclosing
 from pathlib import PurePosixPath
@@ -6,11 +11,12 @@ from pathlib import PurePosixPath
 from agentscope.message import TextBlock, ToolResultState
 from agentscope.tool import BackendBase, ToolChunk, ToolMiddlewareBase
 
+from egis_agentkit.client.nacos._settings import WorkspaceReadGuardConfig
+
 
 class ReadToolGuardMiddleware(ToolMiddlewareBase):
     MESSAGE = "Read 不支持解析此类二进制文件。"
     OUTPUT_MESSAGE = "Read 无法将包含空字符的内容作为文本返回。"
-    SAMPLE_BYTES = 4096
     # Native Read routes these formats to its own media handling, including
     # model capability checks. Do not mistake their binary bytes for text.
     NATIVE_MEDIA = frozenset(
@@ -74,8 +80,11 @@ class ReadToolGuardMiddleware(ToolMiddlewareBase):
         }
     )
 
-    def __init__(self, backend: BackendBase):
+    def __init__(
+        self, backend: BackendBase, *, settings: WorkspaceReadGuardConfig | None = None
+    ):
         self.backend = backend
+        self.settings = settings if settings is not None else WorkspaceReadGuardConfig()
 
     @classmethod
     def _error(cls, message=None):
@@ -84,12 +93,14 @@ class ReadToolGuardMiddleware(ToolMiddlewareBase):
             state=ToolResultState.ERROR,
         )
 
-    @staticmethod
-    def _is_binary(sample: bytes) -> bool:
+    def _is_binary(self, sample: bytes) -> bool:
         if b"\0" in sample:
             return True
         controls = sum(byte < 9 or 13 < byte < 32 for byte in sample)
-        return bool(sample) and controls / len(sample) > 0.3
+        return (
+            bool(sample)
+            and controls / len(sample) > self.settings.control_byte_ratio_threshold
+        )
 
     async def on_tool_call(self, tool, input_kwargs, next_handler):
         path = input_kwargs["file_path"]
@@ -105,7 +116,9 @@ class ReadToolGuardMiddleware(ToolMiddlewareBase):
                         yield self._error()
                         return
                     async with aclosing(
-                        self.backend.read_stream(path, chunk_size=self.SAMPLE_BYTES)
+                        self.backend.read_stream(
+                            path, chunk_size=self.settings.sample_bytes
+                        )
                     ) as stream:
                         sample = await anext(stream, b"")
                     if self._is_binary(sample):

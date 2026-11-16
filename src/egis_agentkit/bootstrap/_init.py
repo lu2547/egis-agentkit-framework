@@ -139,7 +139,9 @@ def init_agentkit(
     )
     files = ProjectFileStorage(root, config_provider=config)
     resources = ResourceService(storage, root, policies=policies, config=config)
-    workspace_manager = EgisSandboxManager(root, workspace.runtime.opensandbox)
+    workspace_manager = EgisSandboxManager(
+        root, workspace.runtime.opensandbox, read_guard=workspace.read_guard
+    )
     projects = ProjectManager(
         storage,
         root,

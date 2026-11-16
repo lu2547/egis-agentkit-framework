@@ -130,7 +130,7 @@ async def test_active_reply_renews_provider_deadline_and_stops_after_completion(
 ):
     manager = sandbox_manager
     manager.settings = manager.settings.model_copy(
-        update={"keepalive_interval_seconds": 0.01}
+        update={"renew_interval_seconds": 0.01}
     )
     async with manager:
         workspace = await manager.get_workspace(
@@ -157,7 +157,7 @@ async def test_missing_sandbox_during_reply_stops_execution_instead_of_replaying
 ):
     manager = sandbox_manager
     manager.settings = manager.settings.model_copy(
-        update={"keepalive_interval_seconds": 0.01}
+        update={"renew_interval_seconds": 0.01}
     )
     async with manager:
         workspace = await manager.get_workspace(
@@ -218,7 +218,7 @@ async def test_session_reply_wiring_protects_workspace_until_stream_finishes(
             execution_scope.reset(token)
 
 
-def test_keepalive_interval_must_be_shorter_than_sandbox_lifetime(tmp_path):
+def test_renew_interval_must_be_shorter_than_sandbox_lifetime(tmp_path):
     from pydantic import ValidationError
 
     config = configuration(tmp_path)
@@ -226,7 +226,7 @@ def test_keepalive_interval_must_be_shorter_than_sandbox_lifetime(tmp_path):
         type(config)(
             **{
                 **config.model_dump(),
-                "keepalive_interval_seconds": config.timeout_seconds,
+                "renew_interval_seconds": config.timeout_seconds,
             }
         )
 

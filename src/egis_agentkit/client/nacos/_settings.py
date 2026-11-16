@@ -332,7 +332,7 @@ class OpenSandboxConfig(ConfigModel):
     bootstrap_timeout_seconds: Seconds = 600
     ttl_seconds: Seconds = 900
     sweep_interval_seconds: Seconds = 60
-    keepalive_interval_seconds: Seconds = 60
+    renew_interval_seconds: Seconds = 60
     gateway_port: Annotated[int, Field(strict=True, ge=1, le=65535)] = 5600
     gateway_tmp_dir: NonEmptyString = "/dev/shm"
     max_skill_bytes: PositiveInt = DEFAULT_SKILL_ARCHIVE_MAX_BYTES
@@ -355,8 +355,8 @@ class OpenSandboxConfig(ConfigModel):
     )
 
     @model_validator(mode="after")
-    def validate_keepalive_interval(self):
-        if self.keepalive_interval_seconds >= self.timeout_seconds:
+    def validate_renew_interval(self):
+        if self.renew_interval_seconds >= self.timeout_seconds:
             raise ValueError("沙箱续期间隔必须小于实例有效期")
         return self
 
@@ -519,10 +519,22 @@ class ProjectConfig(ConfigModel):
     download: ProjectDownloadConfig = Field(default_factory=ProjectDownloadConfig)
 
 
+class WorkspaceReadGuardConfig(ConfigModel):
+    """Read 二进制拦截的采样预算和控制字节占比阈值，由 Nacos 提供。"""
+
+    sample_bytes: PositiveInt = 4096
+    control_byte_ratio_threshold: Annotated[
+        float, Field(ge=0, le=1, allow_inf_nan=False)
+    ] = 0.3
+
+
 class WorkspaceConfig(ConfigModel):
     """工作区仅配置执行环境，不承载项目文件管理。"""
 
     runtime: WorkspaceRuntimeConfig
+    read_guard: WorkspaceReadGuardConfig = Field(
+        default_factory=WorkspaceReadGuardConfig
+    )
 
 
 class ModelSpec(ConfigModel):

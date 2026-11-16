@@ -25,7 +25,10 @@ def test_project_file_tables_and_config_belong_to_project():
     assert settings.project.upload.max_bytes > 0
     assert settings.project.context.max_files > 0
     assert settings.project.preview.max_concurrent > 0
-    assert set(yaml.safe_load(source)["agentkit"]["workspace"]) == {"runtime"}
+    assert set(yaml.safe_load(source)["agentkit"]["workspace"]) == {
+        "runtime",
+        "readGuard",
+    }
 
 
 @pytest.mark.asyncio

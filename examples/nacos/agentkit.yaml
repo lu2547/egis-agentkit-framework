@@ -189,6 +189,9 @@ agentkit:
       secretEnv: AGENTKIT_DOWNLOAD_SECRET
       minSecretLength: 32
   workspace:
+    readGuard:
+      sampleBytes: 4096
+      controlByteRatioThreshold: 0.3
     runtime:
       root: /srv/agentkit/workspace
       mode: opensandbox
@@ -206,7 +209,7 @@ agentkit:
         bootstrapTimeoutSeconds: 600
         ttlSeconds: 900
         sweepIntervalSeconds: 60
-        keepaliveIntervalSeconds: 60
+        renewIntervalSeconds: 60
         gatewayPort: 5600
         gatewayTmpDir: /dev/shm
         maxSkillBytes: 52428800

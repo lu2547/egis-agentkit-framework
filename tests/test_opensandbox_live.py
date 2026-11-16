@@ -227,7 +227,7 @@ async def test_real_docker_recovers_missing_sandbox_without_losing_project_files
         domain=os.environ["AGENTKIT_TEST_OPENSANDBOX_DOMAIN"],
         host_root=str(root),
         image=os.environ.get("AGENTKIT_TEST_OPENSANDBOX_IMAGE", "python:3.11-slim"),
-        keepalive_interval_seconds=0.05,
+        renew_interval_seconds=0.05,
     )
     project_id = "test-recover-" + uuid4().hex
     manager = EgisSandboxManager(root, settings)
@@ -246,7 +246,7 @@ async def test_real_docker_recovers_missing_sandbox_without_losing_project_files
             original_id = workspace.sandbox_id
             async with manager.renew_workspace(workspace):
                 before = await workspace._sandbox.get_info()
-                await asyncio.sleep(settings.keepalive_interval_seconds * 2)
+                await asyncio.sleep(settings.renew_interval_seconds * 2)
                 after = await workspace._sandbox.get_info()
                 assert after.expires_at > before.expires_at
                 manager._cache[workspace.runtime_binding_id] = (

@@ -17,7 +17,9 @@ MESSAGE = "Read 不支持解析此类二进制文件。"
 
 async def tools(root, monkeypatch):
     manager = sandbox_manager(root, monkeypatch)
-    workspace = await manager.get_workspace("alice", "agent", "session", project_id="project")
+    workspace = await manager.get_workspace(
+        "alice", "agent", "session", project_id="project"
+    )
     read = next(tool for tool in await workspace.list_tools() if tool.name == "Read")
     assert type(read) is Read
     toolkit = Toolkit()
@@ -41,7 +43,9 @@ async def execute(toolkit, path, **kwargs):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name", ["preview.docx", "preview.pptx", "preview.xlsx"])
-async def test_office_is_rejected_as_a_tool_error_before_raw_bytes(name, tmp_path, monkeypatch):
+async def test_office_is_rejected_as_a_tool_error_before_raw_bytes(
+    name, tmp_path, monkeypatch
+):
     manager, toolkit = await tools(tmp_path, monkeypatch)
     try:
         chunks = await execute(toolkit, FIXTURES / name)
@@ -59,7 +63,9 @@ async def test_office_is_rejected_as_a_tool_error_before_raw_bytes(name, tmp_pat
 @pytest.mark.parametrize(
     "payload", [b"unknown\0binary", bytes([1, 2, 3, 4]) * 50, b"PK\x03\x04\0zip"]
 )
-async def test_unknown_binary_content_is_detected_without_extension(tmp_path, payload, monkeypatch):
+async def test_unknown_binary_content_is_detected_without_extension(
+    tmp_path, payload, monkeypatch
+):
     path = tmp_path / "unknown"
     path.write_bytes(payload)
     manager, toolkit = await tools(tmp_path / "workspace", monkeypatch)
@@ -70,7 +76,9 @@ async def test_unknown_binary_content_is_detected_without_extension(tmp_path, pa
 
 
 @pytest.mark.asyncio
-async def test_nul_after_sniff_window_never_reaches_pg_replay(storage, tmp_path, monkeypatch):
+async def test_nul_after_sniff_window_never_reaches_pg_replay(
+    storage, tmp_path, monkeypatch
+):
     path = tmp_path / "late.txt"
     path.write_bytes(b"normal line\n" * 500 + b"bad\0byte")
     manager, toolkit = await tools(tmp_path / "workspace", monkeypatch)
@@ -87,7 +95,9 @@ async def test_nul_after_sniff_window_never_reaches_pg_replay(storage, tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_native_pdf_text_with_nul_does_not_poison_pg_replay(storage, tmp_path, monkeypatch):
+async def test_native_pdf_text_with_nul_does_not_poison_pg_replay(
+    storage, tmp_path, monkeypatch
+):
     from pypdf import PdfWriter
     from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
@@ -123,7 +133,9 @@ async def test_native_pdf_text_with_nul_does_not_poison_pg_replay(storage, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_plain_text_pagination_and_pdf_and_image_remain_native(tmp_path, monkeypatch):
+async def test_plain_text_pagination_and_pdf_and_image_remain_native(
+    tmp_path, monkeypatch
+):
     manager, toolkit = await tools(tmp_path / "workspace", monkeypatch)
     try:
         path = tmp_path / "code.py"
@@ -185,7 +197,54 @@ async def test_guard_sniffs_only_one_chunk_and_never_executes_binary_read(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_native_path_errors_and_empty_unicode_files_are_preserved(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("sample_bytes", "threshold", "expected_state"),
+    [(4, 0.3, "error"), (8, 0.3, "success"), (8, 0.2, "error")],
+)
+async def test_nacos_guard_limits_control_actual_workspace_read(
+    tmp_path, monkeypatch, sample_bytes, threshold, expected_state
+):
+    """采样长度和阈值都必须实际影响 Read，不能只被配置模型接收。"""
+    from config_helpers import sandbox_runtime
+    from runtime_helpers import stub_sandbox_provider
+
+    from egis_agentkit.client.nacos._settings import WorkspaceConfig
+    from egis_agentkit.service.workspace._egis_sandbox_manager import EgisSandboxManager
+
+    config = WorkspaceConfig.model_validate(
+        {
+            "runtime": sandbox_runtime(tmp_path),
+            "readGuard": {
+                "sampleBytes": sample_bytes,
+                "controlByteRatioThreshold": threshold,
+            },
+        }
+    )
+    monkeypatch.setenv("TEST_SANDBOX_KEY", "test-only")
+    stub_sandbox_provider(monkeypatch)
+    manager = EgisSandboxManager(
+        tmp_path, config.runtime.opensandbox, read_guard=config.read_guard
+    )
+    try:
+        workspace = await manager.get_workspace(
+            "alice", "agent", "session", project_id="project"
+        )
+        toolkit = Toolkit()
+        await toolkit.add_tool(
+            next(tool for tool in await workspace.list_tools() if tool.name == "Read")
+        )
+        path = tmp_path / "unknown"
+        path.write_bytes(b"\x01\x02abcdef")
+        result = (await execute(toolkit, path))[-1]
+        assert result.state == expected_state
+    finally:
+        await manager.close_all()
+
+
+@pytest.mark.asyncio
+async def test_native_path_errors_and_empty_unicode_files_are_preserved(
+    tmp_path, monkeypatch
+):
     manager, toolkit = await tools(tmp_path / "workspace", monkeypatch)
     try:
         for path, expected in [

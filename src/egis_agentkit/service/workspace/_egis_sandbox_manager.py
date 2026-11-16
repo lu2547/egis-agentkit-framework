@@ -18,11 +18,15 @@ import os
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from functools import partial
 from pathlib import Path
 
 from agentscope.app.workspace_manager import OpenSandboxWorkspaceManager
 
-from egis_agentkit.client.nacos._settings import OpenSandboxConfig
+from egis_agentkit.client.nacos._settings import (
+    OpenSandboxConfig,
+    WorkspaceReadGuardConfig,
+)
 from egis_agentkit.core.workspace._egis_sandbox_workspace import EgisSandboxWorkspace
 from egis_agentkit.core.workspace._identity import sandbox_binding_for, workspace_id_for
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
@@ -44,10 +48,15 @@ class EgisSandboxManager(OpenSandboxWorkspaceManager):
         self,
         workspace_root: str | Path,
         settings: OpenSandboxConfig,
+        *,
+        read_guard: WorkspaceReadGuardConfig | None = None,
     ):
         """注入沙箱连接与挂载配置，凭据缺失时明确失败。"""
         self.files = ProjectFileStorage(Path(workspace_root))
         self.settings = settings
+        self.read_guard_settings = (
+            read_guard if read_guard is not None else WorkspaceReadGuardConfig()
+        )
         self._active_workspaces: dict[str, int] = {}
         self._project_binding: ContextVar[tuple[str, str] | None] = ContextVar(
             "sandbox_project_binding", default=None
@@ -171,7 +180,7 @@ class EgisSandboxManager(OpenSandboxWorkspaceManager):
     async def _renew_active_workspace(self, workspace):
         """按 Nacos 配置的间隔续期；不忽略服务端失败或无限重试。"""
         while True:
-            await asyncio.sleep(self.settings.keepalive_interval_seconds)
+            await asyncio.sleep(self.settings.renew_interval_seconds)
             await workspace.renew_workspace()
 
     # AgentScope 原生接口与覆盖钩子：名称由父类协议规定。
@@ -256,7 +265,9 @@ class EgisSandboxManager(OpenSandboxWorkspaceManager):
             project_id=project_id,
             session_id=session_id,
             files=self.files,
-            read_guard_factory=ReadToolGuardMiddleware,
+            read_guard_factory=partial(
+                ReadToolGuardMiddleware, settings=self.read_guard_settings
+            ),
             mcp_client_factory=AuthorizedGatewayMCPClient,
             settings=self.settings,
             workspace_id=workspace_id_for(user_id),
