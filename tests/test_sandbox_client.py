@@ -12,7 +12,7 @@ async def test_provider_maps_neutral_mounts_and_argv_without_losing_bytes(
 ):
     from opensandbox import Sandbox
 
-    from egis_agentkit.client.nacos._settings import OpenSandboxConfig
+    from egis_agentkit.client.nacos._settings import SandboxConfig
     from egis_agentkit.client.sandbox import SandboxMount
     from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
 
@@ -37,7 +37,7 @@ async def test_provider_maps_neutral_mounts_and_argv_without_losing_bytes(
     create = AsyncMock(return_value=raw)
     monkeypatch.setattr(Sandbox, "create", create)
     client = OpenSandboxClient(
-        OpenSandboxConfig(domain="localhost:8090"),
+        SandboxConfig(domain="localhost:8090"),
         api_key="test-only",
     )
     await client.create_instance(
@@ -66,13 +66,13 @@ async def test_provider_maps_neutral_mounts_and_argv_without_losing_bytes(
 async def test_provider_errors_become_safe_neutral_errors(tmp_path, status):
     from opensandbox.exceptions import SandboxApiException
 
-    from egis_agentkit.client.nacos._settings import OpenSandboxConfig
+    from egis_agentkit.client.nacos._settings import SandboxConfig
     from egis_agentkit.client.sandbox import SandboxInstanceNotFound
     from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
     from egis_agentkit.errors import AgentKitError
 
     client = OpenSandboxClient(
-        OpenSandboxConfig(domain="localhost:8090"),
+        SandboxConfig(domain="localhost:8090"),
         api_key="test-only",
     )
     client._sandbox = SimpleNamespace(
@@ -95,7 +95,7 @@ async def test_pause_already_missing_instance_is_idempotent_but_failures_propaga
 ):
     from opensandbox.exceptions import SandboxApiException
 
-    from egis_agentkit.client.nacos._settings import OpenSandboxConfig
+    from egis_agentkit.client.nacos._settings import SandboxConfig
     from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
     from egis_agentkit.errors import AgentKitError
 
@@ -107,7 +107,7 @@ async def test_pause_already_missing_instance_is_idempotent_but_failures_propaga
         close=AsyncMock(),
     )
     client = OpenSandboxClient(
-        OpenSandboxConfig(domain="localhost:8090"),
+        SandboxConfig(domain="localhost:8090"),
         api_key="test-only",
     )
     client._sandbox = raw
@@ -124,13 +124,13 @@ async def test_pause_already_missing_instance_is_idempotent_but_failures_propaga
 async def test_non_http_sdk_failure_is_sanitized_and_never_marked_as_missing(tmp_path):
     from opensandbox.exceptions import SandboxInternalException
 
-    from egis_agentkit.client.nacos._settings import OpenSandboxConfig
+    from egis_agentkit.client.nacos._settings import SandboxConfig
     from egis_agentkit.client.sandbox import SandboxInstanceNotFound
     from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
     from egis_agentkit.errors import AgentKitError
 
     client = OpenSandboxClient(
-        OpenSandboxConfig(domain="localhost:8090"),
+        SandboxConfig(domain="localhost:8090"),
         api_key="test-only",
     )
     client._sandbox = SimpleNamespace(
@@ -144,12 +144,12 @@ async def test_non_http_sdk_failure_is_sanitized_and_never_marked_as_missing(tmp
 
 @pytest.mark.asyncio
 async def test_connection_probe_checks_runtime_instead_of_only_renewing(tmp_path):
-    from egis_agentkit.client.nacos._settings import OpenSandboxConfig
+    from egis_agentkit.client.nacos._settings import SandboxConfig
     from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
     from egis_agentkit.errors import AgentKitError
 
     client = OpenSandboxClient(
-        OpenSandboxConfig(domain="localhost:8090"),
+        SandboxConfig(domain="localhost:8090"),
         api_key="test-only",
     )
     client._sandbox = SimpleNamespace(

@@ -231,11 +231,11 @@ async def test_nacos_guard_limits_control_actual_workspace_read(
 
     manager = EgisSandboxManager(
         tmp_path,
-        config.runtime.opensandbox,
+        config.runtime.sandbox,
         read_guard_factory=partial(ReadToolGuardMiddleware, settings=config.read_guard),
         **workspace_dependencies(),
         client_factory=partial(
-            OpenSandboxClient, config.runtime.opensandbox, api_key="test-only"
+            OpenSandboxClient, config.runtime.sandbox, api_key="test-only"
         ),
     )
     try:

@@ -143,7 +143,7 @@ async def test_different_bindings_do_not_hold_a_global_lock_across_provision(
 
 
 @pytest.mark.asyncio
-async def test_custom_mode_needs_no_opensandbox_credentials(
+async def test_pks_injected_client_needs_no_opensandbox_credentials(
     storage, tmp_path, native_gateway
 ):
     import sys
@@ -163,7 +163,7 @@ async def test_custom_mode_needs_no_opensandbox_credentials(
                 ).model_dump(),
                 "runtime": {
                     "root": str(tmp_path),
-                    "mode": "custom",
+                    "mode": "pks",
                     "sandbox": {
                         "workdir": str(tmp_path / "runtime"),
                         "gatewayHome": str(tmp_path / "gateway"),

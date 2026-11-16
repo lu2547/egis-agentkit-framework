@@ -48,7 +48,7 @@ bash scripts/init/nas.sh
 - 已存在的 `user/` 不能是符号链接；持久根、用户根和技能根均执行读写探针。
 - 不递归修改已有权限，不预建具体用户或项目；文件探针执行后会清理。
 
-所有 API/技能导入节点与 OpenSandbox Docker 宿主机必须将同一份 NAS 挂载到相同绝对路径。Nacos 的 `workspace.runtime.root` 是唯一持久根目录，值与 `NAS_ROOT` 一致；沙箱直接挂载当前项目目录，无需复制项目文件。OpenSandbox 服务的 `storage.allowed_host_paths` 必须包含该根目录。原生 `data/skills/sessions` 运行目录由 Workspace 初始化流程创建，不在这里预置。
+所有 API/技能导入节点与沙箱执行宿主机必须将同一份 NAS 挂载到相同绝对路径。Nacos 的 `workspace.runtime.root` 是唯一持久根目录，值与 `NAS_ROOT` 一致；沙箱直接挂载当前项目目录，无需复制项目文件。使用 OpenSandbox 开发适配器时，服务端的 `storage.allowed_host_paths` 必须包含该根目录。原生 `data/skills/sessions` 运行目录由 Workspace 初始化流程创建，不在这里预置。
 
 ## 3 PostgreSQL
 
@@ -109,9 +109,10 @@ python scripts/init/nacos.py --file "$HOME/.config/agentkit/agentkit.yaml"
 | YAML 字段 | 初始化参数或平台提供内容 |
 | --- | --- |
 | `revision` | 首次配置版本，模板为 1 |
-| `workspace.runtime.root` | 唯一的 NAS 根目录，与 `NAS_ROOT` 一致；API 与 Docker 宿主机使用相同路径 |
+| `workspace.runtime.root` | 唯一的 NAS 根目录，与 `NAS_ROOT` 一致；API 与沙箱执行宿主机使用相同路径 |
 | `skill.storage.root` | `SKILL_STORAGE_ROOT` |
-| `workspace.runtime.opensandbox` | 平台提供的服务地址、镜像与 API 密钥环境变量引用 |
+| `workspace.runtime.mode` | 固定为 `pks` |
+| `workspace.runtime.sandbox` | 沙箱服务地址、镜像、凭据引用及执行参数；公司 Client 由接入方注入 |
 | `client.postgres.connection.urlEnv` | 应用运行时数据库连接串的环境变量名称，默认 `AGENTKIT_DATABASE_URL` |
 | `client.kafka.connection.deploymentMode` | 企业跨进程运行设为 `cluster` |
 | `client.kafka.connection.bootstrapServers/topicPrefix` | Kafka 地址、`KAFKA_TOPIC_PREFIX` |

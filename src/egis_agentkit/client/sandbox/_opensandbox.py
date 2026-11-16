@@ -22,7 +22,7 @@ from opensandbox.models.execd import RunCommandOpts
 from opensandbox.models.filesystem import WriteEntry
 from opensandbox.models.sandboxes import Host, SandboxFilter, SandboxState, Volume
 
-from egis_agentkit.client.nacos._settings import OpenSandboxConfig
+from egis_agentkit.client.nacos._settings import SandboxConfig
 from egis_agentkit.errors import AgentKitError, Conflict, Forbidden
 
 from ._models import SandboxInstance, SandboxMount
@@ -34,7 +34,7 @@ UNKNOWN_EXIT_CODE = -1
 class OpenSandboxClient:
     """一个 Client 持有一个执行连接；项目清理使用独立 Client 对象。"""
 
-    def __init__(self, settings: OpenSandboxConfig, *, api_key: str):
+    def __init__(self, settings: SandboxConfig, *, api_key: str):
         if not api_key:
             raise ValueError(f"缺少沙箱凭据环境变量 {settings.api_key_env}")
         self.settings, self._api_key = settings, api_key

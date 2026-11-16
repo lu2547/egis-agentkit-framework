@@ -216,8 +216,8 @@ agentkit:
       controlByteRatioThreshold: 0.3
     runtime:
       root: /mnt/company-nas/agentkit
-      mode: opensandbox
-      opensandbox:
+      mode: pks
+      sandbox:
         domain: 127.0.0.1:8090
         apiKeyEnv: OPEN_SANDBOX_API_KEY
         protocol: http

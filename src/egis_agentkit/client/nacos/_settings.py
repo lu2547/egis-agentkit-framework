@@ -369,10 +369,10 @@ class SandboxWorkspaceConfig(ConfigModel):
         return str(path)
 
 
-class OpenSandboxConfig(SandboxWorkspaceConfig):
-    """当前开发提供方连接配置；仅 Bootstrap 和 OpenSandboxClient 使用。"""
+class SandboxConfig(SandboxWorkspaceConfig):
+    """sandbox 节点统一声明执行与连接参数；注入的公司 Client 可自行管理连接。"""
 
-    domain: NonEmptyString
+    domain: NonEmptyString | None = None
     api_key_env: SecretRef = "OPEN_SANDBOX_API_KEY"
     protocol: Literal["http", "https"] = "http"
     image: NonEmptyString = "python:3.11-slim"
@@ -387,6 +387,8 @@ class OpenSandboxConfig(SandboxWorkspaceConfig):
     @field_validator("domain")
     @classmethod
     def validate_domain(cls, value):
+        if value is None:
+            return value
         url = urlsplit("http://" + value)
         if (
             not url.hostname
@@ -397,7 +399,7 @@ class OpenSandboxConfig(SandboxWorkspaceConfig):
             or url.fragment
         ):
             raise ValueError(
-                "OpenSandbox domain 必须是 host[:port]，不包含协议、凭据或路径"
+                "sandbox domain 必须是 host[:port]，不包含协议、凭据或路径"
             )
         return value
 
@@ -406,9 +408,8 @@ class WorkspaceRuntimeConfig(ConfigModel):
     """声明 API 与沙箱宿主机共同使用的 NAS 根目录及执行提供方。"""
 
     root: NonEmptyString
-    mode: Literal["opensandbox", "custom"] = "opensandbox"
-    opensandbox: OpenSandboxConfig | None = None
-    sandbox: SandboxWorkspaceConfig | None = None
+    mode: Literal["pks"] = "pks"
+    sandbox: SandboxConfig
 
     @field_validator("root")
     @classmethod
@@ -417,18 +418,6 @@ class WorkspaceRuntimeConfig(ConfigModel):
         if not path.is_absolute() or ".." in path.parts or path == PurePosixPath("/"):
             raise ValueError("workspace root 必须是限定的绝对路径")
         return str(path)
-
-    @model_validator(mode="after")
-    def validate_provider(self):
-        if self.mode == "opensandbox" and (
-            self.opensandbox is None or self.sandbox is not None
-        ):
-            raise ValueError("opensandbox 模式只接受对应提供方配置")
-        if self.mode == "custom" and (
-            self.sandbox is None or self.opensandbox is not None
-        ):
-            raise ValueError("custom 模式只接受通用 sandbox 配置")
-        return self
 
 
 class ProjectUploadConfig(ConfigModel):

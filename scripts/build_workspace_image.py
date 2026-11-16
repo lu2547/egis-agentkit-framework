@@ -17,15 +17,15 @@ from agentscope.workspace._docker._make_dockerfile import (
     prepare_build_context,
 )
 
-from egis_agentkit.client.nacos._settings import OpenSandboxConfig
+from egis_agentkit.client.nacos._settings import SandboxConfig
 
 
 def build_image(config_file: Path, agentscope_source: Path, base_image: str) -> str:
     """构建镜像并返回不可变的内容标签；任何安装失败都会中止发布。"""
     # 1. 校验配置，复用原生构建上下文，不把配置正文放进镜像。
     raw = yaml.safe_load(config_file.read_text())
-    settings = OpenSandboxConfig.model_validate(
-        raw["agentkit"]["workspace"]["runtime"]["opensandbox"]
+    settings = SandboxConfig.model_validate(
+        raw["agentkit"]["workspace"]["runtime"]["sandbox"]
     )
     context, _, files = prepare_build_context(
         base_image=base_image, extra_pip=settings.extra_pip

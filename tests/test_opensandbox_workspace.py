@@ -22,7 +22,7 @@ from egis_agentkit.middleware.workspace._workspace_read_guard_middleware_impl im
 
 def configuration(tmp_path):
     settings = importlib.import_module("egis_agentkit.client.nacos._settings")
-    config_type = getattr(settings, "OpenSandboxConfig", None)
+    config_type = getattr(settings, "SandboxConfig", None)
     assert config_type is not None, "缺少类型化 OpenSandbox 配置"
     return config_type(
         domain="127.0.0.1:8090",
@@ -298,8 +298,8 @@ async def test_bootstrap_selects_native_sandbox_manager(storage, tmp_path, monke
             workspace={
                 "runtime": {
                     "root": str(tmp_path),
-                    "mode": "opensandbox",
-                    "opensandbox": settings.model_dump(),
+                    "mode": "pks",
+                    "sandbox": settings.model_dump(),
                 },
             },
         )

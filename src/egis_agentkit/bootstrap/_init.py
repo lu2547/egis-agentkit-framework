@@ -114,19 +114,17 @@ def init_agentkit(
     workspace = snapshot.workspace
     # 具体沙箱通信只在装配点选择；公司实现可直接注入中立 Client 工厂。
     runtime = workspace.runtime
-    sandbox_settings = (
-        runtime.opensandbox if runtime.mode == "opensandbox" else runtime.sandbox
-    )
+    sandbox_settings = runtime.sandbox
     if sandbox_client_factory is None:
-        if runtime.mode != "opensandbox":
-            raise ValueError("custom 沙箱模式必须注入 sandbox_client_factory")
+        if not sandbox_settings.domain:
+            raise ValueError("未配置沙箱 domain，必须注入 sandbox_client_factory")
         from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
 
-        api_key = os.environ.get(runtime.opensandbox.api_key_env)
+        api_key = os.environ.get(sandbox_settings.api_key_env)
         if not api_key:
-            raise ValueError(f"缺少沙箱凭据环境变量 {runtime.opensandbox.api_key_env}")
+            raise ValueError(f"缺少沙箱凭据环境变量 {sandbox_settings.api_key_env}")
         sandbox_client_factory = partial(
-            OpenSandboxClient, runtime.opensandbox, api_key=api_key
+            OpenSandboxClient, sandbox_settings, api_key=api_key
         )
     owns_engine = engine is None
     if engine is None:

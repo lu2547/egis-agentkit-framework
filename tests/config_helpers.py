@@ -4,8 +4,8 @@
 def sandbox_runtime(root):
     return {
         "root": str(root),
-        "mode": "opensandbox",
-        "opensandbox": {
+        "mode": "pks",
+        "sandbox": {
             "domain": "127.0.0.1:8090",
             "apiKeyEnv": "TEST_SANDBOX_KEY",
         },

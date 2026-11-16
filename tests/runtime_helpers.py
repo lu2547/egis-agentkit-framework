@@ -85,14 +85,14 @@ def stub_sandbox_provider(monkeypatch):
 
 def sandbox_manager(root, monkeypatch):
     """用真实 Manager/Core 验证工具、绑定和关闭链，不创建远程沙箱。"""
-    from egis_agentkit.client.nacos._settings import OpenSandboxConfig
+    from egis_agentkit.client.nacos._settings import SandboxConfig
     from egis_agentkit.service.workspace._egis_sandbox_manager import EgisSandboxManager
 
     monkeypatch.setenv("TEST_SANDBOX_KEY", "test-only")
     stub_sandbox_provider(monkeypatch)
     from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
 
-    settings = OpenSandboxConfig(
+    settings = SandboxConfig(
         domain="127.0.0.1:8090", api_key_env="TEST_SANDBOX_KEY"
     )
     return EgisSandboxManager(

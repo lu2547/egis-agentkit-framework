@@ -34,13 +34,13 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
     from egis_agentkit.client.mcp._gateway_mcp_client_override import (
         AuthorizedGatewayMCPClient,
     )
-    from egis_agentkit.client.nacos._settings import OpenSandboxConfig
+    from egis_agentkit.client.nacos._settings import SandboxConfig
     from egis_agentkit.service.workspace._egis_sandbox_manager import (
         EgisSandboxManager,
     )
 
     root = Path(os.environ["AGENTKIT_TEST_OPENSANDBOX_ROOT"]).resolve()
-    settings = OpenSandboxConfig(
+    settings = SandboxConfig(
         domain=os.environ["AGENTKIT_TEST_OPENSANDBOX_DOMAIN"],
         **(
             {"image": os.environ["AGENTKIT_TEST_OPENSANDBOX_IMAGE"]}
@@ -246,11 +246,11 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_real_docker_recovers_missing_sandbox_without_losing_project_files():
-    from egis_agentkit.client.nacos._settings import OpenSandboxConfig
+    from egis_agentkit.client.nacos._settings import SandboxConfig
     from egis_agentkit.service.workspace._egis_sandbox_manager import EgisSandboxManager
 
     root = Path(os.environ["AGENTKIT_TEST_OPENSANDBOX_ROOT"]).resolve()
-    settings = OpenSandboxConfig(
+    settings = SandboxConfig(
         domain=os.environ["AGENTKIT_TEST_OPENSANDBOX_DOMAIN"],
         image=os.environ.get("AGENTKIT_TEST_OPENSANDBOX_IMAGE", "python:3.11-slim"),
         renew_interval_seconds=0.05,
