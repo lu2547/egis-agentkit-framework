@@ -1,4 +1,4 @@
-"""核验工作区执行就绪：实例身份、通道、运行环境、网关及 NAS 双向可见性。
+"""实现 EgisSandboxWorkspace 内部检查：实例、通道、环境、网关和 NAS。
 
 核心能力
 - check_ready：每次核对实例和通道，按配置间隔执行轻量/完整检查。
@@ -16,18 +16,21 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from egis_agentkit.client.sandbox import SandboxConnectionError, SandboxInstanceNotFound
-from egis_agentkit.errors import Forbidden, NotFound, UploadNameConflict
-
-from ._errors import WorkspaceProbeError
+from egis_agentkit.errors import (
+    Forbidden,
+    NotFound,
+    UploadNameConflict,
+    WorkspaceProbeError,
+)
 
 if TYPE_CHECKING:
-    from ._egis_sandbox_workspace import EgisSandboxWorkspace
+    from .._egis_sandbox_workspace import EgisSandboxWorkspace
 
 logger = logging.getLogger(__name__)
 
 
-class WorkspaceReadiness:
-    """组合已有 Workspace 能力，不持有数据库连接或厂商 SDK。"""
+class _EgisSandboxChecks:
+    """只由 EgisSandboxWorkspace 持有，保存检查状态并执行内部校验。"""
 
     def __init__(self, workspace: "EgisSandboxWorkspace"):
         self.workspace = workspace

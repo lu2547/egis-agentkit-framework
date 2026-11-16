@@ -54,7 +54,7 @@ OpenSandbox Docker 工作区已通过 `EgisSandboxManager` 接入，继承原生
 
 部署时安装 `uv sync --extra opensandbox`，在 Nacos `agentkit.workspace.runtime` 设置 `mode: opensandbox`，并填写示例中的 `opensandbox` 配置。`root` 是应用访问的持久根目录，`hostRoot` 是 Docker daemon 看到的同一份存储；两者可以不同，但相对目录必须一致。OpenSandbox 服务的 `storage.allowed_host_paths` 必须包含该宿主根目录；本地 compose 通过 `AGENTKIT_WORKSPACE_HOST_ROOT` 设置白名单和服务端只读挂载。API 进程使用 `apiKeyEnv` 引用的环境变量，不把密钥写进 Nacos。修改镜像和挂载后需要重启 API。当前开发环境使用 OpenSandbox Docker；公司沙箱使用 `mode: custom` 和通用 `sandbox` 配置，并在 `init_agentkit` 注入 `sandbox_client_factory`。Manager、Workspace 直接实现原生通用基类，Backend 在 Core，只有 `client/sandbox/_opensandbox.py` 导入该提供方 SDK。能力与接入契约见下文。
 
-工具通过 OpenSandbox Backend 执行；MCP 通过容器内原生网关连接，连接配置不写入 `.mcp`，网关临时内容只允许经过启动时验证为 tmpfs 的 `gatewayTmpDir`；技能在激活后暂存完整再安装，完成的同一内容直接复用，授权失效会移除运行副本。持久激活记录继续校验原资源内容。MCP 中的 `localhost` 指沙箱自身；访问宿主开发服务应使用沙箱可达地址。
+工具通过 EgisSandboxBackend 调用注入的沙箱 Client 执行；MCP 通过容器内原生网关连接，连接配置不写入 `.mcp`，网关临时内容只允许经过启动时验证为 tmpfs 的 `gatewayTmpDir`；技能在激活后暂存完整再安装，完成的同一内容直接复用，授权失效会移除运行副本。持久激活记录继续校验原资源内容。MCP 中的 `localhost` 指沙箱自身；访问宿主开发服务应使用沙箱可达地址。
 
 上线和日常开发使用预构建镜像。裸 `python:3.11-slim` 会使每个新会话现场安装依赖，网络慢时聊天长时间没有回复。先将当前 Nacos YAML 导出到受保护文件，然后在框架目录运行：
 
@@ -72,7 +72,8 @@ PYTHONPATH=src python scripts/build_workspace_image.py \
 service/workspace/_egis_sandbox_manager.py   缓存、并发构建、续期调度、空闲回收
 core/workspace/_identity.py                 用户身份和固定执行绑定
 core/workspace/_egis_sandbox_workspace.py   挂载、技能、MCP 和单实例生命周期
-core/workspace/_sandbox_backend.py          原生工具的命令、字节文件执行能力
+core/workspace/_egis_sandbox_backend.py      原生工具的命令、字节文件执行能力
+core/workspace/_checks/                     Workspace 内部检查，不注册独立组件
 client/sandbox/_protocol.py                 SandboxClient 通信契约
 client/sandbox/_models.py                   中立挂载与实例数据
 client/sandbox/_opensandbox.py              当前开发提供方 SDK 通信
@@ -80,7 +81,7 @@ middleware/workspace/                       Read 二进制拦截
 client/mcp/_gateway_mcp_client_override.py   网关 MCP 工具来源标记
 ```
 
-`EgisSandboxManager → WorkspaceManagerBase`，`EgisSandboxWorkspace → SandboxedWorkspaceBase`，`SandboxBackend → BackendBase`，均直接实现通用原生基类。调用链为 `Manager → Core Workspace/Backend → 注入的 Client → 提供方`；不按 init/start/runtime/end 再建目录，也不新增表。用户逻辑工作区、会话执行绑定及 NAS 路径保持稳定。
+`EgisSandboxManager → WorkspaceManagerBase`，`EgisSandboxWorkspace → SandboxedWorkspaceBase`，`EgisSandboxBackend → BackendBase`，均直接实现通用原生基类。调用链为 `Manager → Core Workspace/Backend → 注入的 Client → 提供方`；不按 init/start/runtime/end 再建目录，也不新增表。用户逻辑工作区、会话执行绑定及 NAS 路径保持稳定。
 
 公司沙箱通过 `init_agentkit(..., sandbox_client_factory=...)` 注入，每次工厂调用返回独立的 `SandboxClient`。`find_instance/list_instances` 负责完整查询；`create_instance/connect_instance/renew_instance/close_instance/destroy_instance` 管实例；`exec_command/read_file/write_file` 管通信；`close` 只释放连接。Core 先检查实例绑定和挂载身份再恢复；只有 `SandboxInstanceNotFound` 可以触发缓存重建。公司模式使用 `agentkit.workspace.runtime.mode: custom`，在 `sandbox` 下填写通用配置，不填写 OpenSandbox 连接字段。缺少 Client 工厂时初始化立即失败，不会自动使用开发提供方。
 
@@ -99,7 +100,7 @@ Nacos `agentkit.workspace.probe` 配置轻量/完整检查间隔、单阶段超�
 - 创建、恢复后完整验证实例归属、执行通道、网关、Python/依赖和 NAS；缓存命中仍确认当前实例，命令/网关和完整检查分别按配置间隔复核。
 - NAS 使用 `.work/.agentkit-probes` 和 `artifacts/.agentkit-probes` 下的独立随机文件，执行宿主写/沙箱读、沙箱写/宿主读。保留目录不进入项目列表、变更扫描或自动交付，失败和取消只清理自己的文件。
 - Client 的 `check_connection(reconnect=False)` 返回当前 `SandboxInstance` 并验证命令通道。网络重试只连接原实例，不重放业务命令。只有明确不存在才创建；确认暂停则恢复；其他实例状态、认证、环境和存储故障拒绝使用。
-- `WorkspaceReadiness` 在 Core 组合检查，`WorkspaceProbeError` 保留 `stage/reason/retryable`。非临时的初始化检查错误按配置短路，避免反复初始化同一个错误环境。
+- `EgisSandboxWorkspace.check_ready` 是工作区自身的校验能力，内部实现收在 `core/workspace/_checks/`，不注册独立 Core 组件；`WorkspaceProbeError` 统一在公共错误模块定义，保留 `stage/reason/retryable`。非临时的初始化检查错误按配置短路，避免反复初始化同一个错误环境。
 - 集群中，同一运行绑定的构建、复核、暂停和回复使用保护复用现有 PG 总线租约。进程内锁仅保护本节点缓存，不承担跨节点互斥。失锁取消受保护执行，不重放命令。
 - 空闲回收还检查原生 Session 分布式锁，覆盖工具装配到回复结束；本节点关闭时若另一节点仍在使用，只断开本地句柄，不暂停共享实例或注销远端 MCP。项目删除继续使用 PG 项目生命周期锁和 Session 锁后再销毁实例。
 - `standalone` 明确是单节点模式；多实例部署使用 `cluster`。API `/health/ready` 仍表示 API/PG/消息总线就绪，不将单个 Workspace 的故障升级为整个 API 的存活失败。

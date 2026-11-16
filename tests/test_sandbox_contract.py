@@ -62,7 +62,7 @@ async def test_independent_client_executes_native_tools_and_reuses_one_binding(
 ):
     from agentscope.tool import BackendBase
 
-    from egis_agentkit.core.workspace._sandbox_backend import SandboxBackend
+    from egis_agentkit.core.workspace._egis_sandbox_backend import EgisSandboxBackend
 
     events = []
     manager = build_manager(
@@ -77,7 +77,7 @@ async def test_independent_client_executes_native_tools_and_reuses_one_binding(
             )
         )
         assert one is two
-        assert isinstance(one.get_backend(), SandboxBackend)
+        assert isinstance(one.get_backend(), EgisSandboxBackend)
         assert isinstance(one.get_backend(), BackendBase)
         assert sum(event[0] == "create" for event in events) == 1
         path = str(tmp_path / "runtime/report.txt")

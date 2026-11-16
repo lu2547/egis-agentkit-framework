@@ -30,9 +30,8 @@ from egis_agentkit.client.nacos._settings import (
 )
 from egis_agentkit.client.sandbox import SandboxClient, SandboxInstanceNotFound
 from egis_agentkit.core.workspace._egis_sandbox_workspace import EgisSandboxWorkspace
-from egis_agentkit.core.workspace._errors import WorkspaceProbeError
 from egis_agentkit.core.workspace._identity import sandbox_binding_for, workspace_id_for
-from egis_agentkit.errors import Conflict, Forbidden, NotFound
+from egis_agentkit.errors import Conflict, Forbidden, NotFound, WorkspaceProbeError
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
 logger = logging.getLogger(__name__)

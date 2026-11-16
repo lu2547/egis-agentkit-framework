@@ -1,4 +1,4 @@
-"""实现原生 BackendBase，让工具在注入的沙箱 Client 上执行。
+"""实现企业沙箱 Backend，让原生工具在注入的 Client 上执行。
 
 核心能力
 - exec_shell：绑定默认工作目录，保留 argv 参数边界和明确的执行结果。
@@ -11,7 +11,7 @@ from agentscope.tool import BackendBase, ExecResult
 from egis_agentkit.client.sandbox import SandboxClient
 
 
-class SandboxBackend(BackendBase):
+class EgisSandboxBackend(BackendBase):
     """Workspace 的核心执行后端，持有实例 Client 和沙箱内部工作目录。"""
 
     def __init__(self, client: SandboxClient, workdir: str):

@@ -77,7 +77,6 @@ async def test_ready_checks_read_actual_nas_both_ways_and_leave_no_probe_files(
     )
     try:
         await workspace.check_ready(full=True)
-        assert workspace.readiness.status["is_ready"] is True
         assert not [p for p in tmp_path.rglob("*") if p.is_file()]
     finally:
         await workspace.close_workspace()
@@ -230,7 +229,7 @@ async def test_reserved_probe_files_are_invisible_to_lists_and_change_scan(
 async def test_probe_name_collision_never_overwrites_or_deletes_another_file(
     tmp_path, monkeypatch
 ):
-    import egis_agentkit.core.workspace._readiness as module
+    import egis_agentkit.core.workspace._checks._egis_sandbox_checks as module
 
     workspace = await workspace_at(tmp_path, monkeypatch)
     files = workspace.egis_files

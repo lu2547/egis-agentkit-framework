@@ -1,6 +1,7 @@
 """继承原生 SandboxedWorkspaceBase，实现固定执行绑定下的沙箱核心能力。
 
 公开能力
+- check_ready：工作区内部校验入口，检查实现封装于 _checks，不作为独立组件。
 - build_project_mounts：构造当前项目挂载，资料只读，工作和交付目录可写。
 - renew_workspace / close_workspace：续期或暂停当前实例，关闭 SDK 和 MCP 连接。
 - destroy_sandbox_instances：校验归属并销毁指定用户、项目的全部底层实例。
@@ -37,9 +38,9 @@ from egis_agentkit.client.sandbox import SandboxClient, SandboxMount
 from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
+from ._checks._egis_sandbox_checks import _EgisSandboxChecks
+from ._egis_sandbox_backend import EgisSandboxBackend
 from ._identity import sandbox_binding_for, workspace_id_for
-from ._readiness import WorkspaceReadiness
-from ._sandbox_backend import SandboxBackend
 
 
 class EgisSandboxWorkspace(SandboxedWorkspaceBase):
@@ -83,7 +84,7 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
         self._mcp_client_factory = mcp_client_factory
         self.settings = settings
         self.probe_settings = probe if probe is not None else WorkspaceProbeConfig()
-        self.readiness = WorkspaceReadiness(self)
+        self._checks = _EgisSandboxChecks(self)
         self._skill_publication_lock = asyncio.Lock()
         self._bootstrap_cmd_timeout = settings.bootstrap_timeout_seconds
         self.client = client
@@ -131,8 +132,8 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
         return self.client.instance_id
 
     async def check_ready(self, *, full=False):
-        """核验实例、执行链和持久存储；具体检查由就绪能力组合，失败不交付环境。"""
-        await self.readiness.check_ready(full=full)
+        """校验当前工作区是否可执行；内部辅助实现位于 _checks，失败不交付环境。"""
+        await self._checks.check_ready(full=full)
 
     async def disconnect_workspace(self):
         """只释放本节点句柄，不暂停实例或注销其他节点正在使用的 MCP。"""
@@ -333,7 +334,7 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
                 dict(self.sandbox_metadata), self.build_project_mounts()
             )
         # 2. 命令和文件能力由 Core Backend 统一提供，不导入厂商 Backend。
-        self._backend = SandboxBackend(self.client, self.workdir)
+        self._backend = EgisSandboxBackend(self.client, self.workdir)
 
     async def _teardown_backend(self):
         """原生 close 的接入点；关闭实例与销毁项目是不同操作。"""
