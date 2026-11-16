@@ -317,9 +317,8 @@ class ProjectContextConfig(ConfigModel):
 
 
 class SandboxWorkspaceConfig(ConfigModel):
-    """通用工作区的挂载、生命周期和网关配置，不声明提供方连接协议。"""
+    """通用工作区的执行、生命周期和网关配置，持久目录统一由 runtime.root 指定。"""
 
-    host_root: NonEmptyString
     inputs_read_only: StrictBool = True
     ready_timeout_seconds: Seconds = 60
     timeout_seconds: Annotated[int, Field(strict=True, ge=60)] = 3600
@@ -361,7 +360,7 @@ class SandboxWorkspaceConfig(ConfigModel):
             raise ValueError("沙箱续期间隔必须小于实例有效期")
         return self
 
-    @field_validator("host_root", "workdir", "gateway_home", "gateway_tmp_dir")
+    @field_validator("workdir", "gateway_home", "gateway_tmp_dir")
     @classmethod
     def validate_absolute_directory(cls, value):
         path = PurePosixPath(value)
@@ -404,15 +403,23 @@ class OpenSandboxConfig(SandboxWorkspaceConfig):
 
 
 class WorkspaceRuntimeConfig(ConfigModel):
+    """声明 API 与沙箱宿主机共同使用的 NAS 根目录及执行提供方。"""
+
     root: NonEmptyString
     mode: Literal["opensandbox", "custom"] = "opensandbox"
     opensandbox: OpenSandboxConfig | None = None
     sandbox: SandboxWorkspaceConfig | None = None
 
+    @field_validator("root")
+    @classmethod
+    def validate_root(cls, value):
+        path = PurePosixPath(value)
+        if not path.is_absolute() or ".." in path.parts or path == PurePosixPath("/"):
+            raise ValueError("workspace root 必须是限定的绝对路径")
+        return str(path)
+
     @model_validator(mode="after")
     def validate_provider(self):
-        if not PurePosixPath(self.root).is_absolute():
-            raise ValueError("workspace root 必须是绝对路径")
         if self.mode == "opensandbox" and (
             self.opensandbox is None or self.sandbox is not None
         ):

@@ -8,6 +8,5 @@ def sandbox_runtime(root):
         "opensandbox": {
             "domain": "127.0.0.1:8090",
             "apiKeyEnv": "TEST_SANDBOX_KEY",
-            "hostRoot": str(root),
         },
     }

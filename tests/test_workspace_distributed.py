@@ -42,7 +42,6 @@ async def managers_at(storage, tmp_path, monkeypatch):
         manager = EgisSandboxManager(
             tmp_path,
             SandboxWorkspaceConfig(
-                host_root=str(tmp_path),
                 workdir=str(tmp_path / "runtime"),
                 gateway_home=str(tmp_path / "gateway"),
             ),

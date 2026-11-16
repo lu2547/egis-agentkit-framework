@@ -11,6 +11,33 @@ from egis_agentkit.client.nacos import (
 )
 
 
+@pytest.mark.parametrize("mode", ["opensandbox", "custom"])
+def test_workspace_configuration_accepts_one_shared_root(mode):
+    from egis_agentkit.client.nacos._settings import WorkspaceRuntimeConfig
+
+    provider = {"domain": "sandbox.internal:8090"} if mode == "opensandbox" else {}
+    runtime = WorkspaceRuntimeConfig.model_validate(
+        {
+            "root": "/mnt/company-nas/agentkit",
+            "mode": mode,
+            "opensandbox" if mode == "opensandbox" else "sandbox": provider,
+        }
+    )
+    assert runtime.root == "/mnt/company-nas/agentkit"
+
+
+@pytest.mark.parametrize("root", ["relative", "/", "/mnt/nas/../other"])
+def test_workspace_configuration_rejects_unbounded_mount_roots(root):
+    from pydantic import ValidationError
+
+    from egis_agentkit.client.nacos._settings import WorkspaceRuntimeConfig
+
+    with pytest.raises(ValidationError):
+        WorkspaceRuntimeConfig.model_validate(
+            {"root": root, "mode": "custom", "sandbox": {}}
+        )
+
+
 @pytest.mark.asyncio
 async def test_real_v33_config_query_envelope_extracts_content_and_rejects_nested_failure():
     body = {

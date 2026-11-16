@@ -27,7 +27,6 @@ def configuration(tmp_path):
     return config_type(
         domain="127.0.0.1:8090",
         api_key_env="TEST_SANDBOX_KEY",
-        host_root=str(tmp_path / "docker-host"),
     )
 
 
@@ -59,11 +58,11 @@ async def initialized_provider(workspace):
     )
 
 
-def test_opensandbox_configuration_rejects_invalid_connection_and_mount_root(tmp_path):
+def test_opensandbox_configuration_rejects_invalid_connection(tmp_path):
     config = configuration(tmp_path)
     assert config.use_server_proxy
     with pytest.raises(ValidationError):
-        type(config)(domain="http://user:secret@host/path", host_root="relative")
+        type(config)(domain="http://user:secret@host/path")
 
 
 @pytest.mark.asyncio
@@ -111,13 +110,12 @@ async def test_project_mounts_expose_only_current_project_and_protect_inputs(
             mount.name: (mount.source, mount.target, mount.read_only)
             for mount in mounts
         }
-        host = tmp_path / "docker-host/user/alice/projects/project"
         target = tmp_path / "app/user/alice/projects/project"
         assert sources == {
-            "project-inputs": (str(host), str(target), True),
-            "project-work": (str(host / ".work"), str(target / ".work"), False),
+            "project-inputs": (str(target), str(target), True),
+            "project-work": (str(target / ".work"), str(target / ".work"), False),
             "project-artifacts": (
-                str(host / "artifacts"),
+                str(target / "artifacts"),
                 str(target / "artifacts"),
                 False,
             ),

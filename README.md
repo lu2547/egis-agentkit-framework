@@ -2,6 +2,8 @@
 
 AgentScope 的配置管理与企业增强框架。首版已实现，不修改 AgentScope service 源码。
 
+首次环境初始化见 [scripts/init](scripts/init/README.md)：面向企业已提供的 NAS、Nacos、Redis、Kafka、PG，包含目录初始化、配置发布、Topic 创建和业务建表 SQL；脚本不安装或启动基础设施。
+
 `src/egis_agentkit/` 的 Agent 能力采用以下分层；其他业务仍保留现有目录，后续逐项梳理。
 
 | 目录 | 职责 |
@@ -50,9 +52,9 @@ python -m egis_agentkit_app upgrade-db --database agentscope --apply
 
 项目共享工作空间与删除规则见 [文件生命周期](docs/session-files.md)。
 
-OpenSandbox Docker 工作区已通过 `EgisSandboxManager` 接入，继承原生 `OpenSandboxWorkspaceManager`。缓存、并发复用、TTL、暂停和重连使用原生实现；Manager 只负责执行绑定和实例生命周期；Core 负责项目挂载及工具执行。授权资源由 SessionService 调用 ResourceService.prepare_workspace 装载。运行容器按用户、项目、Agent、会话隔离，同一绑定复用环境；项目上传资料只读，`.work/`、`artifacts/` 可写，项目数据仍由文件存储共享和持久化，不新增工作区表。
+OpenSandbox Docker 工作区通过 `EgisSandboxManager` 接入。Manager 实现原生 `WorkspaceManagerBase`，负责执行绑定、缓存、并发、续期和回收；Core 继承原生 `SandboxedWorkspaceBase`，复用初始化模板并实现项目挂载、Backend 和单实例生命周期；OpenSandbox SDK 通信位于 Client。授权资源由 SessionService 调用 ResourceService.prepare_workspace 装载。运行容器按用户、项目、Agent、会话隔离，同一绑定复用环境；项目上传资料默认只读，`.work/`、`artifacts/` 可写，项目数据由文件存储共享和持久化，不新增工作区表。
 
-部署时安装 `uv sync --extra opensandbox`，在 Nacos `agentkit.workspace.runtime` 设置 `mode: opensandbox`，并填写示例中的 `opensandbox` 配置。`root` 是应用访问的持久根目录，`hostRoot` 是 Docker daemon 看到的同一份存储；两者可以不同，但相对目录必须一致。OpenSandbox 服务的 `storage.allowed_host_paths` 必须包含该宿主根目录；本地 compose 通过 `AGENTKIT_WORKSPACE_HOST_ROOT` 设置白名单和服务端只读挂载。API 进程使用 `apiKeyEnv` 引用的环境变量，不把密钥写进 Nacos。修改镜像和挂载后需要重启 API。当前开发环境使用 OpenSandbox Docker；公司沙箱使用 `mode: custom` 和通用 `sandbox` 配置，并在 `init_agentkit` 注入 `sandbox_client_factory`。Manager、Workspace 直接实现原生通用基类，Backend 在 Core，只有 `client/sandbox/_opensandbox.py` 导入该提供方 SDK。能力与接入契约见下文。
+应用 Python 环境需安装 OpenSandbox extra，在 Nacos `agentkit.workspace.runtime` 设置 `mode: opensandbox`，并填写示例中的 `opensandbox` 配置。`root` 是唯一的 NAS 持久根目录，API 节点与 OpenSandbox Docker 宿主机必须将同一份 NAS 挂载到相同绝对路径。沙箱直接挂载该根目录下的当前用户项目，文件无需复制。OpenSandbox 服务的 `storage.allowed_host_paths` 必须包含 `root`。API 进程使用 `apiKeyEnv` 引用的环境变量，不把密钥写进 Nacos。修改镜像和挂载后需要重启 API。当前开发环境使用 OpenSandbox Docker；公司沙箱使用 `mode: custom` 和通用 `sandbox` 配置，并在 `init_agentkit` 注入 `sandbox_client_factory`。Manager、Workspace 直接实现原生通用基类，Backend 在 Core，只有 `client/sandbox/_opensandbox.py` 导入该提供方 SDK。能力与接入契约见下文。
 
 工具通过 EgisSandboxBackend 调用注入的沙箱 Client 执行；MCP 通过容器内原生网关连接，连接配置不写入 `.mcp`，网关临时内容只允许经过启动时验证为 tmpfs 的 `gatewayTmpDir`；技能在激活后暂存完整再安装，完成的同一内容直接复用，授权失效会移除运行副本。持久激活记录继续校验原资源内容。MCP 中的 `localhost` 指沙箱自身；访问宿主开发服务应使用沙箱可达地址。
 

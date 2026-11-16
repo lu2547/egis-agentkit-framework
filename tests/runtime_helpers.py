@@ -93,7 +93,7 @@ def sandbox_manager(root, monkeypatch):
     from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
 
     settings = OpenSandboxConfig(
-        domain="127.0.0.1:8090", api_key_env="TEST_SANDBOX_KEY", host_root=str(root)
+        domain="127.0.0.1:8090", api_key_env="TEST_SANDBOX_KEY"
     )
     return EgisSandboxManager(
         root,

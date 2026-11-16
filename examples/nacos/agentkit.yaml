@@ -47,7 +47,7 @@ agentkit:
       maxMembers: 20
   skill:
     storage:
-      root: /srv/agentkit/workspace/skill-archives
+      root: /mnt/company-nas/agentkit/skill-archives
     archive:
       maxBytes: 52428799
       maxExpandedBytes: null
@@ -215,11 +215,10 @@ agentkit:
       sampleBytes: 4096
       controlByteRatioThreshold: 0.3
     runtime:
-      root: /srv/agentkit/workspace
+      root: /mnt/company-nas/agentkit
       mode: opensandbox
       opensandbox:
         domain: 127.0.0.1:8090
-        hostRoot: /srv/agentkit/workspace
         apiKeyEnv: OPEN_SANDBOX_API_KEY
         protocol: http
         image: python:3.11-slim

@@ -21,7 +21,7 @@ import base64
 import hashlib
 import re
 import shlex
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from uuid import uuid4
 
 from agentscope.skill import Skill
@@ -107,22 +107,20 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
     # 公开执行能力：挂载、续期、资源装载、技能发布及实例关闭和销毁。
 
     def build_project_mounts(self) -> list[SandboxMount]:
-        """只描述当前项目的挂载意图，Client 负责转换提供方协议。"""
-        target = self.egis_files.project_root(self.egis_user_id, self.egis_project_id)
-        relative = target.relative_to(self.egis_files.root)
-        source = PurePosixPath(self.settings.host_root).joinpath(*relative.parts)
+        """从统一 NAS 根目录挂载当前项目，API 与沙箱直接访问同一份文件。"""
+        project = self.egis_files.project_root(self.egis_user_id, self.egis_project_id)
         return [
             SandboxMount(
                 "project-inputs",
-                str(source),
-                str(target),
+                str(project),
+                str(project),
                 self.settings.inputs_read_only,
             ),
-            SandboxMount("project-work", str(source / ".work"), str(target / ".work")),
+            SandboxMount("project-work", str(project / ".work"), str(project / ".work")),
             SandboxMount(
                 "project-artifacts",
-                str(source / "artifacts"),
-                str(target / "artifacts"),
+                str(project / "artifacts"),
+                str(project / "artifacts"),
             ),
         ]
 

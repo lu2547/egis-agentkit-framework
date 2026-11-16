@@ -41,7 +41,6 @@ def build_manager(tmp_path, *, client_factory):
     from egis_agentkit.service.workspace._egis_sandbox_manager import EgisSandboxManager
 
     settings = SandboxWorkspaceConfig(
-        host_root=str(tmp_path),
         workdir=str(tmp_path / "runtime"),
         gateway_home=str(tmp_path / "gateway"),
     )
@@ -166,7 +165,6 @@ async def test_custom_mode_needs_no_opensandbox_credentials(
                     "root": str(tmp_path),
                     "mode": "custom",
                     "sandbox": {
-                        "hostRoot": str(tmp_path),
                         "workdir": str(tmp_path / "runtime"),
                         "gatewayHome": str(tmp_path / "gateway"),
                     },
