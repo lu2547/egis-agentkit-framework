@@ -5,15 +5,15 @@ from agentscope.permission import PermissionBehavior
 from agentscope.state import AgentState
 from agentscope.tool import Read, Toolkit
 
+from egis_agentkit.bootstrap._middlewares import (
+    build_team_prompt_middleware,
+    build_tool_access_middleware,
+)
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.extension import (
+from egis_agentkit.middleware import (
     SkillBindingMiddleware,
 )
-from egis_agentkit.extension.resource._skill_loader_impl import LiveSkillLoader
-from egis_agentkit.extension.resource._tool_access_callback import (
-    team_prompt_middleware,
-    tool_access_middleware,
-)
+from egis_agentkit.service.resource._skill_loader import LiveSkillLoader
 from egis_agentkit.storage.model import User
 
 
@@ -41,7 +41,7 @@ async def test_tool_access_checks_current_collaborator_grants(tmp_path):
                 raise Forbidden("collaborator revoked")
             assert snapshot is root
 
-    middleware = tool_access_middleware(user, scope, Permissions())
+    middleware = build_tool_access_middleware(user, scope, Permissions())
 
     async def native(**kwargs):
         pytest.fail("Revoked access must stop before native permission")
@@ -63,7 +63,7 @@ async def test_team_prompt_reads_updated_roster():
         binding={"is_team": False, "collaboration": {"members": [member]}},
         collaborator_definitions={"123456789": {"agent_name": "writer"}},
     )
-    middleware = team_prompt_middleware(scope)
+    middleware = build_team_prompt_middleware(scope)
 
     assert "writer@12345678" not in await middleware.on_system_prompt(None, "system")
     member["status"] = "joined"

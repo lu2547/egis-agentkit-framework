@@ -4,22 +4,20 @@ from agentscope.app.storage import AgentData, AgentRecord, SessionConfig
 from agentscope.message import ToolCallBlock, ToolCallState
 from test_domain import agent_changes, expert, identities
 
+from egis_agentkit.core.session._context import session_execution_context
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.extension.runtime._session_lock_override import (
-    ExecutionCoordinator,
-    execution_scope,
-)
-from egis_agentkit.service._session import SessionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.session._preparation import SessionPreparationService
+from egis_agentkit.service.session._session import SessionService
 
 
 @pytest_asyncio.fixture
 async def runtime_storage(storage):
-    from egis_agentkit.extension.runtime._session_storage_override import (
-        ExecutionStorage,
+    from egis_agentkit.storage._session_execution import (
+        SessionExecutionStorage,
     )
 
-    async with ExecutionStorage("postgresql+asyncpg://unused", storage.engine) as projected:
+    async with SessionExecutionStorage("postgresql+asyncpg://unused", storage.engine) as projected:
         yield projected
 
 
@@ -35,9 +33,9 @@ async def test_session_resolves_pinned_definition_on_every_turn(storage, runtime
     assert native.data.system_prompt == "旧版"
     native.data.system_prompt = "placeholder"
     await storage.upsert_agent("alice", native)
-    coordinator = ExecutionCoordinator(storage, tmp_path)
+    coordinator = SessionPreparationService(storage, tmp_path)
     async with coordinator.bind(session_id):
-        assert execution_scope.get().session_id == session_id
+        assert session_execution_context.get().session_id == session_id
         assert (
             await runtime_storage.get_agent("alice", agent_id)
         ).data.system_prompt == "旧版"
@@ -58,7 +56,7 @@ async def test_session_resolves_pinned_definition_on_every_turn(storage, runtime
             [ToolCallBlock(id="approval", name="Read", input="{}", state=ToolCallState.ASKING)],
         )
         await storage.update_session_state("alice", agent_id, session_id, current.state)
-    assert execution_scope.get() is None
+    assert session_execution_context.get() is None
     assert (await tasks.get_session(alice, session_id))["is_waiting"]
     async with coordinator.bind(session_id) as scope:
         assert (
@@ -72,7 +70,7 @@ async def test_session_resolves_pinned_definition_on_every_turn(storage, runtime
         assert (
             await runtime_storage.get_agent("alice", agent_id)
         ).data.system_prompt == "旧版"
-    assert execution_scope.get() is None
+    assert session_execution_context.get() is None
     latest = await tasks.add_session(alice, source["id"], "private")
     async with coordinator.bind(latest["session_id"]):
         assert (
@@ -97,7 +95,7 @@ async def test_persistence_reads_are_not_replaced_by_execution_scope(storage, tm
     session = await storage.upsert_session("alice", native.id, SessionConfig(workspace_id="workspace"))
     projected = session.model_copy(deep=True)
     projected.config.name = "in-flight"
-    token = execution_scope.set(SimpleNamespace(
+    token = session_execution_context.set(SimpleNamespace(
         user_id="alice", agent_id=native.id, session_id=session.id,
         session_record=projected,
         definition={"agent_name": "running", "payload": {"system_prompt": "runtime"}},
@@ -106,7 +104,7 @@ async def test_persistence_reads_are_not_replaced_by_execution_scope(storage, tm
         assert (await storage.get_agent("alice", native.id)).data.system_prompt == "persisted"
         assert (await storage.get_session("alice", native.id, session.id)).config.name != "in-flight"
     finally:
-        execution_scope.reset(token)
+        session_execution_context.reset(token)
 
 
 @pytest.mark.asyncio
@@ -118,6 +116,6 @@ async def test_uninitialized_session_never_executes(storage, tmp_path):
         "alice", native.id, SessionConfig(workspace_id="workspace")
     )
     with pytest.raises(Forbidden):
-        async with ExecutionCoordinator(storage, tmp_path).bind(session.id):
+        async with SessionPreparationService(storage, tmp_path).bind(session.id):
             pass
-    assert execution_scope.get() is None
+    assert session_execution_context.get() is None

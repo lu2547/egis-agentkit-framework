@@ -8,6 +8,10 @@ from agentscope.app.workspace_manager import WorkspaceManagerBase
 from agentscope.workspace._sandboxed_base import SandboxedWorkspaceBase
 from sandbox_helpers import TestSandboxClient
 
+from egis_agentkit.middleware.workspace._workspace_read_guard_middleware_impl import (
+    ReadToolGuardMiddleware,
+)
+
 
 def test_workspace_and_manager_directly_implement_generic_native_bases():
     from egis_agentkit.core.workspace._egis_sandbox_workspace import (
@@ -39,7 +43,7 @@ def build_manager(tmp_path, *, client_factory):
         workdir=str(tmp_path / "runtime"),
         gateway_home=str(tmp_path / "gateway"),
     )
-    return EgisSandboxManager(tmp_path, settings, client_factory=client_factory)
+    return EgisSandboxManager(tmp_path, settings, client_factory=client_factory, read_guard_factory=ReadToolGuardMiddleware)
 
 
 @pytest.mark.asyncio

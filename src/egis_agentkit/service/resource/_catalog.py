@@ -128,7 +128,7 @@ class ResourceService:
         credential_key=None,
         config=None,
     ):
-        from egis_agentkit.extension.resource._resource_hubs_impl import (
+        from egis_agentkit.service.resource._hubs import (
             LocalMCPHub,
             LocalSkillHub,
         )
@@ -1251,6 +1251,21 @@ class ResourceService:
         headers = await self.mcp_authorization.headers(user, asset)
         client.mcp_config.headers = headers or None
         return AuthorizedMCPClient(**client.model_dump())
+
+    async def authorize_session_tool(
+        self, user_id, scope, workspace, agent, tool, parameters=None, *, users
+    ):
+        """工具调用时重新取得用户及授权状态，再按连接器或平台工具规则校验。"""
+        # 1. 工具展示后用户或资源可能被撤权，实际执行前重新装载受权资源。
+        current_user = await users.get(user_id)
+        if parameters is not None:
+            await self.prepare_workspace(current_user, scope, workspace)
+        # 2. 连接器按受管来源验证，其余工具交给既有工具登记能力。
+        if await self.authorize_mcp_tool(current_user, scope, tool):
+            return
+        await self.tool_registry.authorize(
+            current_user, scope, agent, tool, parameters
+        )
 
     async def authorize_mcp_tool(self, user, scope, tool):
         # 原生网关工具与本地 MCPTool 使用同一协议，二者并非同一具体类型。

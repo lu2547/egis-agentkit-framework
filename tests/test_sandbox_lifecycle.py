@@ -191,14 +191,14 @@ async def test_session_reply_wiring_protects_workspace_until_stream_finishes(
     from runtime_helpers import session_middlewares
     from test_runtime_middleware_components import Changes, Users, scope_at
 
-    from egis_agentkit.extension.runtime._session_lock_override import execution_scope
+    from egis_agentkit.core.session._context import session_execution_context
 
     async with sandbox_manager as manager:
         workspace = await manager.get_workspace(
             "alice", "agent-one", "session-two", project_id="project-one"
         )
         handle = workspace.client._sandbox
-        token = execution_scope.set(scope_at(tmp_path))
+        token = session_execution_context.set(scope_at(tmp_path))
         try:
             factory = session_middlewares(
                 None, users=Users(), file_changes=Changes(), workspace_manager=manager
@@ -220,7 +220,7 @@ async def test_session_reply_wiring_protects_workspace_until_stream_finishes(
             ]
             assert events == ["still executing"]
         finally:
-            execution_scope.reset(token)
+            session_execution_context.reset(token)
 
 
 def test_renew_interval_must_be_shorter_than_sandbox_lifetime(tmp_path):

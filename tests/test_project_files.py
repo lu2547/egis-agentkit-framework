@@ -87,18 +87,18 @@ async def test_native_workspace_uses_project_scope_for_shared_sessions(tmp_path,
 
     from runtime_helpers import sandbox_manager
 
-    from egis_agentkit.extension.runtime._session_lock_override import execution_scope
+    from egis_agentkit.core.session._context import session_execution_context
 
     manager = sandbox_manager(tmp_path, monkeypatch)
     manager.files.initialize_project("alice", "project")
-    scope = execution_scope.set(
+    scope = session_execution_context.set(
         SimpleNamespace(user_id="alice", project_id="project", session_id="first")
     )
     try:
         first = await manager.get_workspace(
             "alice", "agent", "first", project_id="project"
         )
-        execution_scope.set(
+        session_execution_context.set(
             SimpleNamespace(user_id="alice", project_id="project", session_id="second")
         )
         second = await manager.get_workspace(
@@ -115,7 +115,7 @@ async def test_native_workspace_uses_project_scope_for_shared_sessions(tmp_path,
         instructions = await second.get_instructions()
         assert str(manager.files.user_root("alice")) in instructions
     finally:
-        execution_scope.reset(scope)
+        session_execution_context.reset(scope)
         await manager.close_all()
 
 

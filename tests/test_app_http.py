@@ -10,8 +10,7 @@ from test_domain import identities
 
 from egis_agentkit.client.nacos import AgentKitConfig, NacosBootstrap, NacosClient
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.extension.runtime._agent_tools_callback import BoundToolFactory
-from egis_agentkit.extension.runtime._session_storage_override import ExecutionStorage
+from egis_agentkit.storage._session_execution import SessionExecutionStorage
 
 
 class Config:
@@ -89,17 +88,18 @@ async def test_http_identity_native_write_seal_and_real_task_files(
     services = app.state.egis_services
     assert services.sessions.projects is services.projects
     assert app.state.egis_bus.coordinator.projects is services.projects
-    assert isinstance(app.state.storage, ExecutionStorage)
+    assert isinstance(app.state.storage, SessionExecutionStorage)
     assert app.state.storage is not services.sessions.storage
     assert (
         app.state.storage.engine is services.sessions.storage.engine is storage.engine
     )
     assert app.state.egis_bus.coordinator.storage is services.sessions.storage
     assert services.resources.tool_registry is not None
-    assert isinstance(app.state.extra_agent_tools, BoundToolFactory)
+    assert isinstance(app.state.extra_agent_tools, partial)
+    assert app.state.extra_agent_tools.func.__self__ is services.sessions
     factory = app.state.extra_agent_middlewares
     assert isinstance(factory, partial)
-    assert factory.func.__self__ is services.sessions
+    assert factory.keywords["sessions"] is services.sessions
     assert factory.keywords["users"] is services.users
     assert app.state.egis_bus.coordinator.personal is services.personal
     assert services.sessions.personal is services.personal

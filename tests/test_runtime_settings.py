@@ -14,8 +14,8 @@ from egis_agentkit.client.nacos._settings import (
 )
 from egis_agentkit.core.message_bus import EgisMessageBus
 from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.service._session import SessionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.session._session import SessionService
 
 
 @pytest.mark.asyncio

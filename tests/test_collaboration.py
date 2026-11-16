@@ -13,21 +13,21 @@ from runtime_helpers import session_middlewares
 from test_app_http import app_snapshot
 from test_domain import expert, identities
 
+from egis_agentkit.bootstrap._middlewares import (
+    build_team_prompt_middleware,
+    build_tool_access_middleware,
+)
 from egis_agentkit.client.nacos._settings import AccessConfig
 from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.extension import ToolAccessMiddleware
-from egis_agentkit.extension.resource._tool_access_callback import (
-    team_prompt_middleware,
-    tool_access_middleware,
-)
-from egis_agentkit.extension.runtime._session_lock_override import ExecutionCoordinator
-from egis_agentkit.service._session import SessionService
+from egis_agentkit.middleware import ToolAccessMiddleware
 from egis_agentkit.service._user import UserService
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.agent._personal_manager import PersonalManager
 from egis_agentkit.service.project._file_manager import ProjectFileManager
+from egis_agentkit.service.session._preparation import SessionPreparationService
+from egis_agentkit.service.session._session import SessionService
 from egis_agentkit.service.team._collaboration import TeamCollaborationService
 from egis_agentkit.service.team._definition import TeamDefinition
 
@@ -70,7 +70,7 @@ async def test_middleware_keeps_the_policy_of_the_locked_run(storage, tmp_path):
     async def native_allow(**kwargs):
         return PermissionDecision(PermissionBehavior.ALLOW, "native")
 
-    async with ExecutionCoordinator(storage, tmp_path, config).bind(task["session_id"]):
+    async with SessionPreparationService(storage, tmp_path, config).bind(task["session_id"]):
         config.snapshot = app_snapshot(
             tmp_path, access=AccessConfig(allow_personal_self_use=False)
         )
@@ -135,15 +135,15 @@ async def test_expert_cannot_lead_collaboration(storage, tmp_path):
 async def test_pending_invitation_runs_on_user_input_with_bound_native_worker(
     storage, tmp_path
 ):
-    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
     from egis_agentkit.service.team._collaboration import validate_collaborators
+    from egis_agentkit.service.team._invitation import apply_invitations
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     async with InMemoryMessageBus() as bus:
         await TeamCollaborationService.stage_collaborators(
             tasks, alice, task["session_id"], bus, "request-1", [ref(writer)]
         )
-        async with ExecutionCoordinator(storage, tmp_path).bind(
+        async with SessionPreparationService(storage, tmp_path).bind(
             task["session_id"]
         ) as scope:
             state = scope.session_record.state
@@ -192,7 +192,7 @@ async def test_pending_invitation_runs_on_user_input_with_bound_native_worker(
             assert binding["definition_id"] == writer["id"]
             assert binding["resource_version"] == "1"
             assert binding["collaboration_parent_session_id"] == task["session_id"]
-            async with ExecutionCoordinator(storage, tmp_path).bind(
+            async with SessionPreparationService(storage, tmp_path).bind(
                 member.session_id
             ) as worker:
                 assert worker.definition["agent_type"] == "expert"
@@ -217,7 +217,7 @@ async def test_pending_invitation_runs_on_user_input_with_bound_native_worker(
         await TeamCollaborationService.stage_collaborators(
             tasks, alice, task["session_id"], bus, "request-2", [ref(writer)]
         )
-        async with ExecutionCoordinator(storage, tmp_path).bind(
+        async with SessionPreparationService(storage, tmp_path).bind(
             task["session_id"]
         ) as scope:
             native = TeamCreate(
@@ -257,7 +257,7 @@ async def test_pending_invitation_runs_on_user_input_with_bound_native_worker(
 async def test_revoked_pending_or_joined_collaborator_blocks_parent_execution(
     storage, tmp_path
 ):
-    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
+    from egis_agentkit.service.team._invitation import apply_invitations
     from egis_agentkit.storage.model import Grant
 
     users, admin, alice, _ = await identities(storage)
@@ -288,7 +288,7 @@ async def test_revoked_pending_or_joined_collaborator_blocks_parent_execution(
             "one",
             [dict(definition_id=writer["id"], resource_view_type="system")],
         )
-        async with ExecutionCoordinator(storage, tmp_path).bind(
+        async with SessionPreparationService(storage, tmp_path).bind(
             task["session_id"]
         ) as scope:
             await GrantService(storage).revoke(admin, grant["id"])
@@ -315,7 +315,7 @@ async def test_revoked_pending_or_joined_collaborator_blocks_parent_execution(
                 )
             assert scope.session_record.team_id is None
         with pytest.raises(Forbidden):
-            async with ExecutionCoordinator(storage, tmp_path).bind(task["session_id"]):
+            async with SessionPreparationService(storage, tmp_path).bind(task["session_id"]):
                 pytest.fail("revoked collaborator must stop execution")
         direct = [
             row
@@ -354,7 +354,7 @@ async def test_native_worker_keeps_its_version_and_permission_gate_blocks_roster
         await AgentManager(storage).update_definition(
             alice, changed.id, agent_changes(changed)
         )
-        async with ExecutionCoordinator(storage, tmp_path).bind(
+        async with SessionPreparationService(storage, tmp_path).bind(
             task["session_id"]
         ) as scope:
             toolkit = Toolkit(
@@ -378,10 +378,10 @@ async def test_native_worker_keeps_its_version_and_permission_gate_blocks_roster
                 ]
             )
             agent = SimpleNamespace(toolkit=toolkit, state=scope.session_record.state)
-            middleware = tool_access_middleware(
+            middleware = build_tool_access_middleware(
                 alice, scope, PermissionService(storage)
             )
-            team_prompt = team_prompt_middleware(scope)
+            team_prompt = build_team_prompt_middleware(scope)
 
             async def downstream(**kwargs):
                 yield "native reply"
@@ -421,7 +421,7 @@ async def test_native_worker_keeps_its_version_and_permission_gate_blocks_roster
                 f"{writer['agent_name']}@{member.agent_id[:8]}"
                 in await team_prompt.on_system_prompt(agent, "system")
             )
-        async with ExecutionCoordinator(storage, tmp_path).bind(
+        async with SessionPreparationService(storage, tmp_path).bind(
             member.session_id
         ) as scope:
             assert scope.definition["payload"]["system_prompt"] == "旧版"
@@ -487,7 +487,7 @@ async def test_collaboration_http_contract_stages_without_native_execution(
 async def test_invitation_delivery_failure_cleans_allocations_and_retries_same_request(
     storage, tmp_path
 ):
-    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
+    from egis_agentkit.service.team._invitation import apply_invitations
 
     class FailedDeliveryBus(InMemoryMessageBus):
         fail = True
@@ -505,7 +505,7 @@ async def test_invitation_delivery_failure_cleans_allocations_and_retries_same_r
         await TeamCollaborationService.stage_collaborators(
             tasks, alice, task["session_id"], bus, "one", [ref(writer)]
         )
-        async with ExecutionCoordinator(storage, tmp_path).bind(
+        async with SessionPreparationService(storage, tmp_path).bind(
             task["session_id"]
         ) as scope:
             native = TeamCreate(
@@ -572,7 +572,7 @@ async def test_parent_cancel_finishes_native_invite_checkpoint_without_duplicate
 ):
     import asyncio
 
-    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
+    from egis_agentkit.service.team._invitation import apply_invitations
 
     class PausedWakeBus(InMemoryMessageBus):
         def __init__(self):
@@ -590,7 +590,7 @@ async def test_parent_cancel_finishes_native_invite_checkpoint_without_duplicate
         await TeamCollaborationService.stage_collaborators(
             tasks, alice, task["session_id"], bus, "one", [ref(writer)]
         )
-        async with ExecutionCoordinator(storage, tmp_path).bind(
+        async with SessionPreparationService(storage, tmp_path).bind(
             task["session_id"]
         ) as scope:
             native = TeamCreate(
@@ -638,7 +638,7 @@ async def test_parent_cancel_finishes_native_invite_checkpoint_without_duplicate
 async def test_replacing_or_clearing_prepared_request_never_invites_removed_experts(
     storage, tmp_path
 ):
-    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
+    from egis_agentkit.service.team._invitation import apply_invitations
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     reviewer = await AgentManager(storage).add_definition(
@@ -663,7 +663,7 @@ async def test_replacing_or_clearing_prepared_request_never_invites_removed_expe
             tasks, alice, task["session_id"], bus, "one", [ref(writer)]
         )
         assert retried["collaborators"] == []
-        async with ExecutionCoordinator(storage, tmp_path).bind(
+        async with SessionPreparationService(storage, tmp_path).bind(
             task["session_id"]
         ) as scope:
             native = TeamCreate(
@@ -693,7 +693,7 @@ async def test_replacing_or_clearing_prepared_request_never_invites_removed_expe
 async def test_failed_native_team_creation_removes_only_new_team_and_retries(
     storage, tmp_path, monkeypatch
 ):
-    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
+    from egis_agentkit.service.team._invitation import apply_invitations
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     original = storage.set_session_team_id
@@ -711,7 +711,7 @@ async def test_failed_native_team_creation_removes_only_new_team_and_retries(
             tasks, alice, task["session_id"], bus, "one", [ref(writer)]
         )
         monkeypatch.setattr(storage, "set_session_team_id", fail_first_binding)
-        async with ExecutionCoordinator(storage, tmp_path).bind(
+        async with SessionPreparationService(storage, tmp_path).bind(
             task["session_id"]
         ) as scope:
             native = TeamCreate(
@@ -751,14 +751,14 @@ async def test_recovery_delivers_task_when_native_membership_committed_before_in
     storage, tmp_path
 ):
     """Native membership alone cannot prove the initial task reached its inbox."""
-    from egis_agentkit.extension.team._team_invite_callback import apply_invitations
+    from egis_agentkit.service.team._invitation import apply_invitations
 
     alice, writer, tasks, task = await setup_task(storage, tmp_path)
     async with InMemoryMessageBus() as bus:
         await TeamCollaborationService.stage_collaborators(
             tasks, alice, task["session_id"], bus, "one", [ref(writer)]
         )
-        async with ExecutionCoordinator(storage, tmp_path).bind(
+        async with SessionPreparationService(storage, tmp_path).bind(
             task["session_id"]
         ) as scope:
             native = TeamCreate(
@@ -800,7 +800,7 @@ async def test_recovery_delivers_task_when_native_membership_committed_before_in
                 task["session_id"],
                 scope.session_record.state,
             )
-        async with ExecutionCoordinator(storage, tmp_path).bind(
+        async with SessionPreparationService(storage, tmp_path).bind(
             task["session_id"]
         ) as scope:
             native = TeamCreate(

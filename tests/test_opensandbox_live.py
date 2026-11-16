@@ -12,6 +12,10 @@ from uuid import uuid4
 
 import pytest
 
+from egis_agentkit.middleware.workspace._workspace_read_guard_middleware_impl import (
+    ReadToolGuardMiddleware,
+)
+
 pytestmark = pytest.mark.skipif(
     not os.environ.get("AGENTKIT_TEST_OPENSANDBOX_ROOT"),
     reason="需要显式提供 OpenSandbox 服务、凭据和允许挂载的持久根目录",
@@ -26,10 +30,10 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
     from opensandbox.config.connection import ConnectionConfig
     from opensandbox.models.sandboxes import SandboxFilter
 
-    from egis_agentkit.client.nacos._settings import OpenSandboxConfig
-    from egis_agentkit.extension.workspace._gateway_mcp_client_override import (
+    from egis_agentkit.client.mcp._gateway_mcp_client_override import (
         AuthorizedGatewayMCPClient,
     )
+    from egis_agentkit.client.nacos._settings import OpenSandboxConfig
     from egis_agentkit.service.workspace._egis_sandbox_manager import (
         EgisSandboxManager,
     )
@@ -62,6 +66,7 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
     manager = EgisSandboxManager(
         root,
         settings,
+        read_guard_factory=ReadToolGuardMiddleware,
         client_factory=partial(
             OpenSandboxClient, settings, api_key=os.environ[settings.api_key_env]
         ),
@@ -244,6 +249,7 @@ async def test_real_docker_recovers_missing_sandbox_without_losing_project_files
     manager = EgisSandboxManager(
         root,
         settings,
+        read_guard_factory=ReadToolGuardMiddleware,
         client_factory=partial(
             OpenSandboxClient, settings, api_key=os.environ[settings.api_key_env]
         ),

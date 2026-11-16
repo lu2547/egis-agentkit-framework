@@ -1,4 +1,4 @@
-"""Public service and extension entry points are independent of the HTTP app."""
+"""业务能力和中间件可脱离 HTTP App 独立导入，底层依赖保持单向。"""
 
 import importlib
 
@@ -18,13 +18,13 @@ import pytest
         ("egis_agentkit.service.access._grant", "GrantService"),
         ("egis_agentkit.service.access._share", "ShareService"),
         ("egis_agentkit.service._model", "ModelService"),
-        ("egis_agentkit.service._session", "SessionService"),
+        ("egis_agentkit.service.session._session", "SessionService"),
         ("egis_agentkit.service.project._project_manager", "ProjectManager"),
         ("egis_agentkit.service.resource._catalog", "ResourceService"),
         ("egis_agentkit.service._user", "UserService"),
         ("egis_agentkit.client.nacos", "NacosClient"),
-        ("egis_agentkit.extension.resource._resource_hubs_impl", "LocalSkillHub"),
-        ("egis_agentkit.extension.resource._resource_hubs_impl", "LocalMCPHub"),
+        ("egis_agentkit.service.resource._hubs", "LocalSkillHub"),
+        ("egis_agentkit.service.resource._hubs", "LocalMCPHub"),
         (
             "egis_agentkit.service.workspace._egis_sandbox_manager",
             "EgisSandboxManager",
@@ -40,7 +40,7 @@ def test_public_entry_points_load_without_application(module, symbol):
     assert callable(exported)
 
 
-def test_storage_and_client_do_not_depend_on_runtime_extensions():
+def test_storage_and_client_do_not_depend_on_middleware_or_services():
     import ast
     from pathlib import Path
 
@@ -55,7 +55,7 @@ def test_storage_and_client_do_not_depend_on_runtime_extensions():
                     isinstance(node, ast.ImportFrom)
                     and node.module
                     and (
-                        node.module.startswith("egis_agentkit.extension")
+                        node.module.startswith("egis_agentkit.middleware")
                         or node.module.startswith("egis_agentkit.service")
                     )
                 ):

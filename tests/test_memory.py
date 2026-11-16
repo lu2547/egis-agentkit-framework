@@ -9,11 +9,11 @@ from runtime_helpers import session_middlewares
 
 from egis_agentkit.client.nacos import AgentKitConfig
 from egis_agentkit.client.nacos._settings import MemoryConfig
-from egis_agentkit.extension.personal._personal_memory_callback import MemoryService
-from egis_agentkit.extension.runtime._session_lock_override import (
-    ExecutionScope,
-    execution_scope,
+from egis_agentkit.core.session._context import (
+    SessionExecutionContext,
+    session_execution_context,
 )
+from egis_agentkit.service.agent._personal_memory import PersonalMemoryService
 
 original = importlib.util.find_spec
 
@@ -60,13 +60,13 @@ def test_enabled_memory_rejects_missing_dependency(monkeypatch, tmp_path):
     )
     config = SimpleNamespace(snapshot=memory_snapshot(tmp_path, is_enabled=True))
     with pytest.raises(RuntimeError, match="reme-ai"):
-        MemoryService(None, tmp_path, config)
+        PersonalMemoryService(None, tmp_path, config)
 
 
 @pytest.mark.asyncio
 async def test_native_middleware_is_cached_per_user_and_closed(monkeypatch, tmp_path):
-    from egis_agentkit.extension.personal import _personal_memory_callback as memory
-    from egis_agentkit.extension.personal._personal_memory_callback import MemoryService
+    from egis_agentkit.service.agent import _personal_memory as memory
+    from egis_agentkit.service.agent._personal_memory import PersonalMemoryService
 
     monkeypatch.setattr(memory.importlib.util, "find_spec", lambda name: object())
     calls = []
@@ -84,7 +84,7 @@ async def test_native_middleware_is_cached_per_user_and_closed(monkeypatch, tmp_
     config = SimpleNamespace(
         snapshot=memory_snapshot(tmp_path, is_enabled=True, top_k=3)
     )
-    service = MemoryService(None, tmp_path, config)
+    service = PersonalMemoryService(None, tmp_path, config)
     alice = SimpleNamespace(user_id="alice")
     bob = SimpleNamespace(user_id="bob")
     one, same = await asyncio.gather(service.for_user(alice), service.for_user(alice))
@@ -127,7 +127,7 @@ async def test_factory_adds_memory_only_for_personal(tmp_path):
     )
     marker = object()
     for kind, expected in [("personal", True), ("private", False)]:
-        scope = ExecutionScope(
+        scope = SessionExecutionContext(
             user_id="alice",
             agent_id="a",
             session_id="s",
@@ -138,12 +138,12 @@ async def test_factory_adds_memory_only_for_personal(tmp_path):
             workdir=tmp_path / ".work",
             artifacts_dir=tmp_path / "artifacts",
         )
-        token = execution_scope.set(scope)
+        token = session_execution_context.set(scope)
         try:
             result = await factory("alice", "a", "s", None)
             assert (marker in result) is expected
         finally:
-            execution_scope.reset(token)
+            session_execution_context.reset(token)
 
 
 @pytest.mark.asyncio
@@ -153,7 +153,7 @@ async def test_enabled_service_uses_native_model_and_starts_reme(
     pytest.importorskip("reme")
     monkeypatch.setenv("MEMORY_TEST_MODEL_KEY", "unused-offline-key")
     snapshot = memory_snapshot(tmp_path, is_enabled=True)
-    service = MemoryService(storage, tmp_path, SimpleNamespace(snapshot=snapshot))
+    service = PersonalMemoryService(storage, tmp_path, SimpleNamespace(snapshot=snapshot))
     try:
         middleware = await service.for_user(SimpleNamespace(user_id="alice"))
         assert middleware._parameters.chat_model.model == "offline-test"

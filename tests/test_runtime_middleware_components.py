@@ -20,20 +20,24 @@ from agentscope.skill import Skill
 from agentscope.state import AgentState
 from agentscope.tool import Read, Toolkit
 from agentscope.workspace import WorkspaceBase
-from runtime_helpers import file_middleware, project_prompt, session_middlewares
+from runtime_helpers import (
+    file_middleware,
+    project_prompt,
+    session_middlewares,
+    tools_callback,
+)
 
-import egis_agentkit.extension as components
+import egis_agentkit.middleware as components
+from egis_agentkit.bootstrap._middlewares import (
+    build_team_prompt_middleware,
+    build_tool_access_middleware,
+)
+from egis_agentkit.core.session._context import (
+    SessionExecutionContext,
+    session_execution_context,
+)
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.extension import RuntimeCallbackMiddleware
-from egis_agentkit.extension.resource._tool_access_callback import (
-    team_prompt_middleware,
-    tool_access_middleware,
-)
-from egis_agentkit.extension.runtime._agent_tools_callback import BoundToolFactory
-from egis_agentkit.extension.runtime._session_lock_override import (
-    ExecutionScope,
-    execution_scope,
-)
+from egis_agentkit.middleware import SessionCallbackMiddleware
 
 
 def test_core_middleware_import_leaves_enterprise_wiring_unloaded():
@@ -43,18 +47,17 @@ def test_core_middleware_import_leaves_enterprise_wiring_unloaded():
             "-c",
             """
 import sys
-from egis_agentkit.extension import (
-    RuntimeCallbackMiddleware,
+from egis_agentkit.middleware import (
+    SessionCallbackMiddleware,
     SkillBindingMiddleware,
     TeamPromptMiddleware,
     ToolAccessMiddleware,
     UserPreferenceMiddleware,
 )
-from egis_agentkit.extension.resource._skill_loader_impl import LiveSkillLoader
 
 forbidden = (
     "egis_agentkit.service",
-    "egis_agentkit.extension.runtime._session_lock_override",
+    "egis_agentkit.core.session._context",
     "egis_agentkit_app",
 )
 loaded = sorted(
@@ -79,7 +82,7 @@ def component(name):
 
 def scope_at(tmp_path, *, kind="private", team=False):
     project = tmp_path / "user" / "alice" / "projects" / "project-one"
-    return ExecutionScope(
+    return SessionExecutionContext(
         user_id="alice",
         agent_id="agent-one",
         session_id="session-two",
@@ -110,6 +113,10 @@ def scope_at(tmp_path, *, kind="private", team=False):
 
 
 class Resources:
+    from egis_agentkit.service.resource._catalog import ResourceService
+
+    authorize_session_tool = ResourceService.authorize_session_tool
+
     def __init__(self, tmp_path, trace):
         self.trace = trace
         self.workspace_root = tmp_path
@@ -183,7 +190,7 @@ class Permissions:
 def skill_loader(user, scope, resources):
     # Fail with a useful assertion before importing a not-yet-created package.
     component("SkillBindingMiddleware")
-    from egis_agentkit.extension.resource._skill_loader_impl import LiveSkillLoader
+    from egis_agentkit.service.resource._skill_loader import LiveSkillLoader
 
     return LiveSkillLoader(user, scope, resources)
 
@@ -219,7 +226,7 @@ async def test_skill_binding_and_access_share_native_viewer_state(
     user = SimpleNamespace(user_id="alice")
     permissions = Permissions(trace)
     loader = skill_loader(user, scope, resources)
-    access = tool_access_middleware(user, scope, permissions, loader)
+    access = build_tool_access_middleware(user, scope, permissions, loader)
     binding = component("SkillBindingMiddleware")(loader, bind_state=loader.bind_state)
     middlewares = [access, binding]
     toolkit = Toolkit()
@@ -279,7 +286,7 @@ async def test_skill_binding_and_access_share_native_viewer_state(
 async def test_snapshot_validation_precedes_dynamic_tool_denial(tmp_path, name):
     trace = []
     permissions = Permissions(trace)
-    access = tool_access_middleware(object(), scope_at(tmp_path), permissions)
+    access = build_tool_access_middleware(object(), scope_at(tmp_path), permissions)
 
     async def native(**kwargs):
         pytest.fail("A forbidden tool must not reach native execution")
@@ -303,7 +310,7 @@ async def test_skill_activation_requires_native_allow_and_current_snapshot(tmp_p
     resources = Resources(tmp_path, trace)
     loader = skill_loader(object(), scope, resources)
     permissions = Permissions(trace)
-    access = tool_access_middleware(object(), scope, permissions, loader)
+    access = build_tool_access_middleware(object(), scope, permissions, loader)
     agent = SimpleNamespace(state=AgentState())
     native_decision = PermissionDecision(PermissionBehavior.ASK, "native confirmation")
 
@@ -353,7 +360,7 @@ async def test_skill_activation_requires_native_allow_and_current_snapshot(tmp_p
 )
 async def test_project_read_keeps_native_permission_decision(tmp_path, behavior):
     scope = scope_at(tmp_path)
-    access = tool_access_middleware(object(), scope, Permissions([]))
+    access = build_tool_access_middleware(object(), scope, Permissions([]))
     rule = PermissionRule(
         tool_name="Read", rule_content=None, behavior=behavior, source="userSettings"
     )
@@ -402,7 +409,7 @@ async def test_path_guard_limits_project_writes_and_activated_skill_reads(
         "archive": tmp_path / "user" / "alice" / "uploads" / "input.pdf",
         "escape": scope.workdir / "escape" / "private.txt",
     }
-    access = tool_access_middleware(object(), scope, Permissions([]), loader)
+    access = build_tool_access_middleware(object(), scope, Permissions([]), loader)
     data = {"path" if tool in ("Glob", "Grep") else "file_path": str(paths[area])}
     result = await access.on_check_permission(agent, call_input(tool, **data), allow)
     permitted = area in ("work", "artifacts") or (
@@ -417,7 +424,7 @@ async def test_path_guard_limits_project_writes_and_activated_skill_reads(
 async def test_unactivated_skills_and_parent_traversal_are_not_readable(tmp_path):
     scope = scope_at(tmp_path)
     loader = skill_loader(object(), scope, Resources(tmp_path, []))
-    access = tool_access_middleware(object(), scope, Permissions([]), loader)
+    access = build_tool_access_middleware(object(), scope, Permissions([]), loader)
     agent = SimpleNamespace(state=AgentState())
     for path in (
         tmp_path / "skills" / "report" / "SKILL.md",
@@ -509,7 +516,7 @@ async def test_workspace_prompt_has_bounded_file_and_directory_scan(tmp_path):
 
 @pytest.mark.asyncio
 async def test_team_and_preference_prompts_are_independent(tmp_path):
-    team = team_prompt_middleware
+    team = build_team_prompt_middleware
     preference = component("UserPreferenceMiddleware")
     assert await team(scope_at(tmp_path)).on_system_prompt(None, "base") == "base"
     prompt = await team(scope_at(tmp_path, team=True)).on_system_prompt(None, "base")
@@ -517,7 +524,7 @@ async def test_team_and_preference_prompts_are_independent(tmp_path):
     assert await preference("").on_system_prompt(None, prompt) == prompt
     prompt = await preference("Answer briefly").on_system_prompt(None, prompt)
     assert prompt.count("Answer briefly") == 1 and "不能扩大工具权限" in prompt
-    access = tool_access_middleware(
+    access = build_tool_access_middleware(
         object(), scope_at(tmp_path, team=True), Permissions([])
     )
     assert (
@@ -571,14 +578,14 @@ async def test_factories_use_injected_services_and_the_exact_bound_scope(
     resources = Resources(tmp_path, [])
     resources.tool_registry = SimpleNamespace(resolve=resolve)
 
-    tools = BoundToolFactory(resources, users)
+    tools = tools_callback(resources, users)
     middleware = session_middlewares(
         None,
         users=users,
         file_changes=changes,
         resources=resources,
     )
-    assert list(inspect.signature(tools).parameters) == [
+    assert list(inspect.signature(tools).parameters)[:3] == [
         "user_id",
         "agent_id",
         "session_id",
@@ -593,14 +600,14 @@ async def test_factories_use_injected_services_and_the_exact_bound_scope(
         "session_id",
         "workspace",
     ]
-    token = execution_scope.set(scope)
+    token = session_execution_context.set(scope)
     try:
         assert await tools("alice", "agent-one", "session-two") == [bound_tool]
         result = await middleware("alice", "agent-one", "session-two", workspace)
     finally:
-        execution_scope.reset(token)
+        session_execution_context.reset(token)
     assert seen == [scope]
-    assert isinstance(result[0], RuntimeCallbackMiddleware)
+    assert isinstance(result[0], SessionCallbackMiddleware)
     assert result[0].reply.func.__self__.observe_safe == changes.observe_safe
     access = next(
         mw for mw in result if isinstance(mw, component("ToolAccessMiddleware"))
@@ -633,10 +640,10 @@ async def test_factories_use_injected_services_and_the_exact_bound_scope(
 @pytest.mark.asyncio
 async def test_both_factories_reject_missing_or_mismatched_execution_scope(tmp_path):
     users = Users()
-    tools = BoundToolFactory(None, users)
+    tools = tools_callback(None, users)
     middleware = session_middlewares(None, users=users, file_changes=Changes())
     for scope in (None, scope_at(tmp_path)):
-        token = execution_scope.set(scope)
+        token = session_execution_context.set(scope)
         try:
             for ids in (
                 ("other", "agent-one", "session-two"),
@@ -648,7 +655,7 @@ async def test_both_factories_reject_missing_or_mismatched_execution_scope(tmp_p
                 with pytest.raises(Forbidden):
                     await middleware(*ids, None)
         finally:
-            execution_scope.reset(token)
+            session_execution_context.reset(token)
 
 
 @pytest.mark.asyncio
@@ -664,7 +671,7 @@ async def test_factories_do_not_reresolve_or_mix_scopes_across_sessions(tmp_path
     resources = Resources(tmp_path, [])
     resources.tool_registry = SimpleNamespace(resolve=resolve)
     users = Users()
-    tools = BoundToolFactory(resources, users)
+    tools = tools_callback(resources, users)
     middleware = session_middlewares(
         None,
         users=users,
@@ -675,14 +682,14 @@ async def test_factories_do_not_reresolve_or_mix_scopes_across_sessions(tmp_path
     two = replace(one, session_id="session-three")
 
     async def build(scope):
-        token = execution_scope.set(scope)
+        token = session_execution_context.set(scope)
         try:
             ids = (scope.user_id, scope.agent_id, scope.session_id)
             assert await tools(*ids) == []
             result = await middleware(*ids, WorkspaceBase())
             assert result[0].reply.args == (scope,)
         finally:
-            execution_scope.reset(token)
+            session_execution_context.reset(token)
 
     await asyncio.gather(build(one), build(two))
     assert len(seen) == 2 and one in seen and two in seen

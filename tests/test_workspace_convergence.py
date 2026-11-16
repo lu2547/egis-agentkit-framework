@@ -7,9 +7,10 @@ from unittest.mock import AsyncMock
 import pytest
 from pydantic import ValidationError
 
+from egis_agentkit.bootstrap._middlewares import build_middlewares
 from egis_agentkit.client.nacos._settings import WorkspaceRuntimeConfig
-from egis_agentkit.extension.runtime._session_lock_override import execution_scope
-from egis_agentkit.service._session import SessionService
+from egis_agentkit.core.session._context import session_execution_context
+from egis_agentkit.service.session._session import SessionService
 
 
 def test_workspace_has_one_sandbox_implementation_and_no_local_branch(tmp_path):
@@ -45,17 +46,18 @@ async def test_session_prepares_authorized_workspace_before_returning_toolkit_in
     workspace = object()
     resources = SimpleNamespace(prepare_workspace=AsyncMock(), tool_registry=None)
     sessions = SessionService(None, tmp_path)
-    token = execution_scope.set(scope)
+    token = session_execution_context.set(scope)
     try:
-        await sessions.build_middlewares(
+        await build_middlewares(
             scope.user_id,
             scope.agent_id,
             scope.session_id,
             workspace,
+            sessions=sessions,
             users=SimpleNamespace(get=AsyncMock(return_value=user)),
             file_changes=SimpleNamespace(on_reply=AsyncMock(), on_acting=AsyncMock()),
             resources=resources,
         )
     finally:
-        execution_scope.reset(token)
+        session_execution_context.reset(token)
     resources.prepare_workspace.assert_awaited_once_with(user, scope, workspace)

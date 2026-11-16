@@ -76,7 +76,8 @@ core/workspace/_sandbox_backend.py          原生工具的命令、字节文件
 client/sandbox/_protocol.py                 SandboxClient 通信契约
 client/sandbox/_models.py                   中立挂载与实例数据
 client/sandbox/_opensandbox.py              当前开发提供方 SDK 通信
-extension/workspace/                        Read 拦截、网关工具来源标记
+middleware/workspace/                       Read 二进制拦截
+client/mcp/_gateway_mcp_client_override.py   网关 MCP 工具来源标记
 ```
 
 `EgisSandboxManager → WorkspaceManagerBase`，`EgisSandboxWorkspace → SandboxedWorkspaceBase`，`SandboxBackend → BackendBase`，均直接实现通用原生基类。调用链为 `Manager → Core Workspace/Backend → 注入的 Client → 提供方`；不按 init/start/runtime/end 再建目录，也不新增表。用户逻辑工作区、会话执行绑定及 NAS 路径保持稳定。
@@ -88,3 +89,5 @@ extension/workspace/                        Read 拦截、网关工具来源标�
 Workspace/Project 的职责、目录、表结构和运行顺序见 [Workspace与Project](docs/Workspace与Project.md)。项目文件与预览配置位于 `agentkit.project`，Workspace 只保留 `agentkit.workspace.runtime`；升级前需运行显式数据库升级。
 
 外部系统连接与配置入口见 [Client 接入](docs/Client接入.md)。
+
+Core、Service、Middleware 的能力归属、依赖方向和原生接入流程见 [框架分层](ARCHITECTURE.md)。隔离工作区运行集成测试时，可用 `AGENTKIT_TEST_PG_ENV` 指定现有测试数据库环境文件；测试始终创建独立临时 schema，不清理业务表。

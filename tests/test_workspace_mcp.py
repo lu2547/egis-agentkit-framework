@@ -7,10 +7,10 @@ from agentscope.mcp import HttpMCPConfig, MCPClient
 from agentscope.workspace._gateway_client import GatewayClient
 from runtime_helpers import sandbox_manager
 
-from egis_agentkit.errors import Forbidden
-from egis_agentkit.extension.workspace._gateway_mcp_client_override import (
+from egis_agentkit.client.mcp._gateway_mcp_client_override import (
     AuthorizedGatewayMCPClient,
 )
+from egis_agentkit.errors import Forbidden
 
 
 @pytest.mark.asyncio

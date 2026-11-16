@@ -2,9 +2,9 @@ import pytest
 from test_domain import agent_changes, expert, identities
 
 from egis_agentkit.errors import Forbidden
-from egis_agentkit.extension.runtime._session_lock_override import ExecutionCoordinator
-from egis_agentkit.service._session import SessionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.session._preparation import SessionPreparationService
+from egis_agentkit.service.session._session import SessionService
 from egis_agentkit.service.team._definition import TeamDefinition
 
 
@@ -66,7 +66,7 @@ async def test_static_team_has_owned_orchestrator_and_new_member_states(
     assert binding["definition_id"] == team["id"]
     assert binding["resource_version"] == "1"
     assert "snapshot" not in binding
-    async with ExecutionCoordinator(storage, tmp_path).bind(member_session.id) as scope:
+    async with SessionPreparationService(storage, tmp_path).bind(member_session.id) as scope:
         assert scope.definition["payload"]["system_prompt"] == "旧版"
     assert (await storage.get_agent("alice", task["agent_id"])).user_id == "alice"
 

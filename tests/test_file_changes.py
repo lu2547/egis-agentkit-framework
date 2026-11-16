@@ -2,10 +2,10 @@ import pytest
 from test_domain import expert, identities
 
 from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.service._session import SessionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.project._file_manager import ProjectFileManager
 from egis_agentkit.service.project._project_manager import ProjectManager
+from egis_agentkit.service.session._session import SessionService
 
 
 class Bus:

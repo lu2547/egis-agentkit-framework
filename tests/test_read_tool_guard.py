@@ -9,6 +9,9 @@ from agentscope.state import AgentState
 from agentscope.tool import Read, Toolkit
 from runtime_helpers import project_prompt, sandbox_manager
 
+from egis_agentkit.middleware.workspace._workspace_read_guard_middleware_impl import (
+    ReadToolGuardMiddleware,
+)
 from egis_agentkit.storage._message_bus import PostgresPrimitives
 
 FIXTURES = Path(__file__).parents[2] / "egis-agentkit-frontend/tests/fixtures"
@@ -172,7 +175,7 @@ async def test_prompt_names_read_formats_without_upload_archive_instruction(tmp_
 async def test_guard_sniffs_only_one_chunk_and_never_executes_binary_read(tmp_path):
     from agentscope.tool import LocalBackend
 
-    from egis_agentkit.extension.workspace._workspace_read_guard_middleware_impl import (
+    from egis_agentkit.middleware.workspace._workspace_read_guard_middleware_impl import (
         ReadToolGuardMiddleware,
     )
 
@@ -229,7 +232,7 @@ async def test_nacos_guard_limits_control_actual_workspace_read(
     manager = EgisSandboxManager(
         tmp_path,
         config.runtime.opensandbox,
-        read_guard=config.read_guard,
+        read_guard_factory=partial(ReadToolGuardMiddleware, settings=config.read_guard),
         client_factory=partial(
             OpenSandboxClient, config.runtime.opensandbox, api_key="test-only"
         ),

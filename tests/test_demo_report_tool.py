@@ -5,14 +5,18 @@ from egis_agentkit_app.bootstrap._demo import seed_demo
 from test_app_http import app_snapshot
 from test_domain import expert, identities
 
-from egis_agentkit.errors import Forbidden
-from egis_agentkit.extension.demo._demo_report_tool_impl import (
+from egis_agentkit.bootstrap._demo_tools import (
     CreateDemoReport,
     deploy_demo_report_tools,
 )
+from egis_agentkit.errors import Forbidden
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.storage.project._files import ProjectFileStorage
+
+
+def test_example_tool_is_outside_framework_business_layers():
+    assert CreateDemoReport.__module__.startswith("egis_agentkit_examples.")
 
 
 async def test_deployed_report_tool_writes_project_artifact(tmp_path):

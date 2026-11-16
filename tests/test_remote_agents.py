@@ -55,8 +55,8 @@ async def test_remote_definition_cannot_be_registered_by_an_ordinary_user(storag
 
 
 async def test_sync_transport_reuses_id_on_retry_and_reuses_saved_result(storage, monkeypatch):
-    from egis_agentkit.extension.remote_agent._remote_agent_callback import (
-        RemoteAgentRuntime,
+    from egis_agentkit.service.agent._remote_agent import (
+        RemoteAgentService,
     )
 
     monkeypatch.setenv("EGIS_REMOTE_AGENT_TEST_TOKEN", "finance-token")
@@ -74,7 +74,7 @@ async def test_sync_transport_reuses_id_on_retry_and_reuses_saved_result(storage
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as http:
         async with InMemoryMessageBus() as bus:
-            service = RemoteAgentRuntime(storage.remote_runs, bus, http=http)
+            service = RemoteAgentService(storage.remote_runs, bus, http=http)
             agent = service.get_client("finance", config())
             result = await service.send_request(agent, request())
             assert result.output.text == "250 元"
@@ -91,8 +91,8 @@ async def test_sync_transport_reuses_id_on_retry_and_reuses_saved_result(storage
 
 async def test_callback_checks_connection_signature_and_accepts_exact_replay(storage, monkeypatch):
     from egis_agentkit.errors import AgentKitError
-    from egis_agentkit.extension.remote_agent._remote_agent_callback import (
-        RemoteAgentRuntime,
+    from egis_agentkit.service.agent._remote_agent import (
+        RemoteAgentService,
     )
 
     monkeypatch.setenv("EGIS_REMOTE_AGENT_TEST_TOKEN", "finance-token")
@@ -123,12 +123,12 @@ async def test_callback_checks_connection_signature_and_accepts_exact_replay(sto
     final = {"run_id": "job", "status": "completed", "output": {"text": "250 元"}}
     async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as http:
         async with InMemoryMessageBus() as bus:
-            service = RemoteAgentRuntime(
+            service = RemoteAgentService(
                 storage.remote_runs, bus, callback_base_url="https://egis.test", http=http
             )
             # The callback is handled by another service instance and uses the
             # same persisted run instead of sharing an in-memory request map.
-            callback = RemoteAgentRuntime(storage.remote_runs, bus)
+            callback = RemoteAgentService(storage.remote_runs, bus)
             agent = service.get_client(
                 "finance", config(transport="http_callback", callback_secret_ref="EGIS_REMOTE_AGENT_TEST_CALLBACK_SECRET")
             )
@@ -154,8 +154,8 @@ async def test_callback_checks_connection_signature_and_accepts_exact_replay(sto
 
 
 async def test_callback_timeout_is_terminal_and_stops_resubmission(storage, monkeypatch):
-    from egis_agentkit.extension.remote_agent._remote_agent_callback import (
-        RemoteAgentRuntime,
+    from egis_agentkit.service.agent._remote_agent import (
+        RemoteAgentService,
     )
 
     monkeypatch.setenv("EGIS_REMOTE_AGENT_TEST_TOKEN", "finance-token")
@@ -168,7 +168,7 @@ async def test_callback_timeout_is_terminal_and_stops_resubmission(storage, monk
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as http:
         async with InMemoryMessageBus() as bus:
-            service = RemoteAgentRuntime(
+            service = RemoteAgentService(
                 storage.remote_runs, bus, callback_base_url="https://egis.test", http=http
             )
             agent = service.get_client(
@@ -188,8 +188,8 @@ async def test_callback_timeout_is_terminal_and_stops_resubmission(storage, monk
 async def test_websocket_reconnect_preserves_id_and_cancel_is_acknowledged(storage, monkeypatch):
     from websockets.asyncio.server import serve
 
-    from egis_agentkit.extension.remote_agent._remote_agent_callback import (
-        RemoteAgentRuntime,
+    from egis_agentkit.service.agent._remote_agent import (
+        RemoteAgentService,
     )
 
     monkeypatch.setenv("EGIS_REMOTE_AGENT_TEST_TOKEN", "finance-token")
@@ -221,7 +221,7 @@ async def test_websocket_reconnect_preserves_id_and_cancel_is_acknowledged(stora
     async with serve(provider, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
         async with InMemoryMessageBus() as bus:
-            service = RemoteAgentRuntime(storage.remote_runs, bus)
+            service = RemoteAgentService(storage.remote_runs, bus)
             agent = service.get_client(
                 "finance", config(transport="websocket", endpoint=f"ws://127.0.0.1:{port}")
             )
@@ -246,8 +246,8 @@ async def test_websocket_does_not_forward_credentials_to_redirect_targets(storag
 
     from websockets.asyncio.server import serve
 
-    from egis_agentkit.extension.remote_agent._remote_agent_callback import (
-        RemoteAgentRuntime,
+    from egis_agentkit.service.agent._remote_agent import (
+        RemoteAgentService,
     )
 
     monkeypatch.setenv("EGIS_REMOTE_AGENT_TEST_TOKEN", "finance-token")
@@ -267,7 +267,7 @@ async def test_websocket_does_not_forward_credentials_to_redirect_targets(storag
     async with serve(target, "127.0.0.1", 0, process_request=redirect) as server:
         port = server.sockets[0].getsockname()[1]
         async with InMemoryMessageBus() as bus:
-            service = RemoteAgentRuntime(storage.remote_runs, bus)
+            service = RemoteAgentService(storage.remote_runs, bus)
             agent = service.get_client(
                 "finance",
                 config(

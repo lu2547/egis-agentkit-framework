@@ -14,26 +14,21 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
-from functools import partial
 from pathlib import Path
 from typing import Callable
 
 from agentscope.app.workspace_manager import IsolationPolicy, WorkspaceManagerBase
 
+from egis_agentkit.client.mcp._gateway_mcp_client_override import (
+    AuthorizedGatewayMCPClient,
+)
 from egis_agentkit.client.nacos._settings import (
     SandboxWorkspaceConfig,
-    WorkspaceReadGuardConfig,
 )
 from egis_agentkit.client.sandbox import SandboxClient, SandboxInstanceNotFound
 from egis_agentkit.core.workspace._egis_sandbox_workspace import EgisSandboxWorkspace
 from egis_agentkit.core.workspace._identity import sandbox_binding_for, workspace_id_for
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
-from egis_agentkit.extension.workspace._gateway_mcp_client_override import (
-    AuthorizedGatewayMCPClient,
-)
-from egis_agentkit.extension.workspace._workspace_read_guard_middleware_impl import (
-    ReadToolGuardMiddleware,
-)
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
 logger = logging.getLogger(__name__)
@@ -48,14 +43,12 @@ class EgisSandboxManager(WorkspaceManagerBase):
         settings: SandboxWorkspaceConfig,
         *,
         client_factory: Callable[[], SandboxClient],
-        read_guard: WorkspaceReadGuardConfig | None = None,
+        read_guard_factory: Callable,
     ):
         super().__init__(isolation=IsolationPolicy.PER_USER)
         self.files = ProjectFileStorage(Path(workspace_root))
         self.settings = settings
-        self.read_guard_settings = (
-            read_guard if read_guard is not None else WorkspaceReadGuardConfig()
-        )
+        self._read_guard_factory = read_guard_factory
         self._client_factory = client_factory
         self._cache: dict[str, tuple[EgisSandboxWorkspace, float]] = {}
         self._active_workspaces: dict[str, int] = {}
@@ -150,16 +143,16 @@ class EgisSandboxManager(WorkspaceManagerBase):
         project_id: str | None = None,
     ) -> EgisSandboxWorkspace:
         """取得当前项目的沙箱，缓存命中后仍检查实例归属。"""
-        from egis_agentkit.extension.runtime._session_lock_override import (
-            execution_scope,
-            execution_setup_error,
+        from egis_agentkit.core.session._context import (
+            session_execution_context,
+            session_setup_error,
         )
 
         # 1. 检查当前会话上下文，确定唯一项目绑定。
-        error = execution_setup_error.get()
+        error = session_setup_error.get()
         if error is not None:
             raise error
-        scope = execution_scope.get()
+        scope = session_execution_context.get()
         if scope is not None and scope.user_id != user_id:
             raise Forbidden("工作区执行上下文与用户不一致")
         if (
@@ -347,9 +340,7 @@ class EgisSandboxManager(WorkspaceManagerBase):
                 files=self.files,
                 client=client,
                 settings=self.settings,
-                read_guard_factory=partial(
-                    ReadToolGuardMiddleware, settings=self.read_guard_settings
-                ),
+                read_guard_factory=self._read_guard_factory,
                 mcp_client_factory=AuthorizedGatewayMCPClient,
                 workspace_id=workspace_id_for(user_id),
                 runtime_binding_id=runtime_id,

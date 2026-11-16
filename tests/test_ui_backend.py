@@ -3,9 +3,9 @@ from agentscope.app.message_bus import MessageBusKeys
 from test_domain import expert, identities
 
 from egis_agentkit.errors import Conflict, Forbidden
-from egis_agentkit.service._session import SessionService
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.session._session import SessionService
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
 

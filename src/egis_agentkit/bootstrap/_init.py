@@ -10,35 +10,28 @@ from pathlib import Path
 from agentscope.app.workspace_manager import WorkspaceManagerBase
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from egis_agentkit.bootstrap._demo_tools import deploy_demo_report_tools
+from egis_agentkit.bootstrap._middlewares import build_middlewares
 from egis_agentkit.client._postgres import check_postgres, create_postgres_engine
 from egis_agentkit.client.nacos import NacosClient, NacosConfigProvider
 from egis_agentkit.client.nacos._config import LivePolicies
 from egis_agentkit.client.sandbox import SandboxClient
 from egis_agentkit.core.agent._expert_definition import ExpertDefinition
 from egis_agentkit.core.agent._remote_definition import RemoteDefinition
-from egis_agentkit.extension.demo._demo_report_tool_impl import deploy_demo_report_tools
-from egis_agentkit.extension.personal._personal_memory_callback import MemoryService
-from egis_agentkit.extension.remote_agent._remote_agent_callback import (
-    RemoteAgentRuntime,
+from egis_agentkit.middleware.workspace._workspace_read_guard_middleware_impl import (
+    ReadToolGuardMiddleware,
 )
-from egis_agentkit.extension.resource._resource_hubs_impl import (
-    LocalMCPHub,
-    LocalSkillHub,
-)
-from egis_agentkit.extension.runtime._agent_tools_callback import BoundToolFactory
-from egis_agentkit.extension.runtime._session_lock_override import (
-    ExecutionCoordinator,
-    ScopedMessageBus,
-)
-from egis_agentkit.extension.runtime._session_storage_override import ExecutionStorage
 from egis_agentkit.service._composer import ComposerService
 from egis_agentkit.service._model import ModelService
-from egis_agentkit.service._session import SessionService
 from egis_agentkit.service._session_feedback import SessionFeedbackService
 from egis_agentkit.service._user import UserService
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.agent._personal_memory import PersonalMemoryService
+from egis_agentkit.service.agent._remote_agent import (
+    RemoteAgentService,
+)
 from egis_agentkit.service.project._document_preview import DocumentPreviewService
 from egis_agentkit.service.project._file_manager import ProjectFileManager
 from egis_agentkit.service.project._presentation_manager import (
@@ -46,12 +39,20 @@ from egis_agentkit.service.project._presentation_manager import (
 )
 from egis_agentkit.service.project._project_manager import ProjectManager
 from egis_agentkit.service.resource._catalog import ResourceService
+from egis_agentkit.service.resource._hubs import (
+    LocalMCPHub,
+    LocalSkillHub,
+)
 from egis_agentkit.service.resource._skill_import import SkillImportService
+from egis_agentkit.service.session._message_bus_override import SessionMessageBus
+from egis_agentkit.service.session._preparation import SessionPreparationService
+from egis_agentkit.service.session._session import SessionService
 from egis_agentkit.service.team._definition import TeamDefinition
 from egis_agentkit.service.workspace._egis_sandbox_manager import (
     EgisSandboxManager,
 )
 from egis_agentkit.storage import AgentKitStorage
+from egis_agentkit.storage._session_execution import SessionExecutionStorage
 from egis_agentkit.storage.project._files import ProjectFileStorage
 from egis_agentkit.storage.project._preview_cache import PreviewCacheStorage
 
@@ -61,19 +62,19 @@ from ._services import AgentKitServices
 @dataclass(frozen=True, slots=True)
 class AgentKit:
     services: AgentKitServices
-    native_storage: ExecutionStorage
-    bus: ScopedMessageBus
+    native_storage: SessionExecutionStorage
+    bus: SessionMessageBus
     workspace: WorkspaceManagerBase
     skill_hub: LocalSkillHub
     mcp_hub: LocalMCPHub
-    tools: BoundToolFactory
+    tools: Callable
     middlewares: Callable
-    remote_agents: RemoteAgentRuntime
+    remote_agents: RemoteAgentService
     _storage: AgentKitStorage
     _config: NacosConfigProvider
     _owned_client: NacosClient | None
     _skill_imports: SkillImportService
-    _memory: MemoryService | None
+    _memory: PersonalMemoryService | None
     _owns_engine: bool
 
     async def check_database(self) -> None:
@@ -135,9 +136,9 @@ def init_agentkit(
             max_overflow=postgres.pool.max_overflow,
         )
     storage = AgentKitStorage(database_url, engine)
-    native_storage = ExecutionStorage(database_url, engine)
-    bus = ScopedMessageBus(engine=engine, kafka=snapshot.client.kafka)
-    remote_agents = RemoteAgentRuntime(storage.remote_runs, bus, config=config)
+    native_storage = SessionExecutionStorage(database_url, engine)
+    bus = SessionMessageBus(engine=engine, kafka=snapshot.client.kafka)
+    remote_agents = RemoteAgentService(storage.remote_runs, bus, config=config)
     root = Path(workspace.runtime.root)
     policies = LivePolicies(config)
     users = UserService(storage)
@@ -152,7 +153,7 @@ def init_agentkit(
     )
     models = ModelService(storage, config)
     memory = (
-        MemoryService(storage, root, config)
+        PersonalMemoryService(storage, root, config)
         if snapshot.agent.personal.memory.is_enabled
         else None
     )
@@ -162,7 +163,7 @@ def init_agentkit(
         root,
         sandbox_settings,
         client_factory=sandbox_client_factory,
-        read_guard=workspace.read_guard,
+        read_guard_factory=partial(ReadToolGuardMiddleware, settings=workspace.read_guard),
     )
     projects = ProjectManager(
         storage,
@@ -175,7 +176,7 @@ def init_agentkit(
     tasks = SessionService(
         storage, root, models, config, projects=projects, personal=personal
     )
-    bus.coordinator = ExecutionCoordinator(
+    bus.coordinator = SessionPreparationService(
         storage,
         root,
         config,
@@ -224,9 +225,10 @@ def init_agentkit(
         workspace=workspace_manager,
         skill_hub=resources.skill_hub,
         mcp_hub=resources.mcp_hub,
-        tools=BoundToolFactory(resources=resources, users=users),
+        tools=partial(tasks.build_tools, resources=resources, users=users),
         middlewares=partial(
-            tasks.build_middlewares,
+            build_middlewares,
+            sessions=tasks,
             users=users,
             file_changes=project_files,
             memory=memory,

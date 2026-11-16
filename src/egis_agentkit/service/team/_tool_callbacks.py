@@ -1,0 +1,56 @@
+"""为工具权限检查提供实时授权、协作资格和专家邀请回调。
+
+核心能力
+- tool_access_callbacks 组织权限校验和原生专家邀请，不创建中间件。
+- team_prompt_arguments 从已校验的固定成员及临时成员构建提示词参数。
+"""
+
+from egis_agentkit.service.team._collaboration import collaborators, team_say_allowed
+from egis_agentkit.service.team._invitation import apply_invitations
+
+
+def tool_access_callbacks(user, scope, permissions):
+    """生成每次工具调用使用的实时授权及专家协作回调。"""
+
+    async def validate_access():
+        await permissions.require_execution(
+            user, scope.root_definition, allow_pinned=True
+        )
+        for definition in scope.collaborator_definitions.values():
+            await permissions.require_execution(user, definition, allow_pinned=True)
+
+    async def prepare_collaboration(agent, inputs):
+        if scope.binding.get("collaboration"):
+            native_create = await agent.toolkit.get_tool("TeamCreate")
+            await apply_invitations(
+                user, scope, agent.state, native_create, inputs, permissions
+            )
+
+    def may_send_team_message():
+        return team_say_allowed(scope.session_record, scope.binding)
+
+    return validate_access, may_send_team_message, prepare_collaboration
+
+
+def team_prompt_arguments(scope):
+    """从定义记录取得固定成员和临时协作成员名称。"""
+
+    def invited_members():
+        members = collaborators(scope.binding)
+        if not members:
+            return None
+        return [
+            scope.collaborator_definitions[member["native_agent_id"]]["agent_name"]
+            + "@"
+            + member["native_agent_id"][:8]
+            for member in members
+            if member["status"] == "joined"
+        ]
+
+    fixed_members = (
+        [definition["agent_name"] for definition in scope.member_definitions.values()]
+        if scope.binding.get("is_team")
+        else None
+    )
+    invited_member = bool(scope.binding.get("collaboration_parent_session_id"))
+    return fixed_members, invited_member, invited_members

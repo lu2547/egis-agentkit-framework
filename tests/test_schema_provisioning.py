@@ -34,7 +34,7 @@ async def test_project_schema_upgrade_preserves_workspace_data_and_checks_legacy
 ):
     from test_domain import expert, identities
 
-    from egis_agentkit.service._session import SessionService
+    from egis_agentkit.service.session._session import SessionService
     from egis_agentkit.service.team._definition import TeamDefinition
     from egis_agentkit.storage._schema import cleanup_schema, upgrade_schema
 

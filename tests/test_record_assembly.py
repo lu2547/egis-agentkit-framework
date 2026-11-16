@@ -5,7 +5,7 @@ def test_agent_factory_prepares_invitable_team_record_and_projects_pinned_data()
     from types import SimpleNamespace
 
     from egis_agentkit.core.agent._definition_base import AgentDefinitionBase
-    from egis_agentkit.extension.runtime._session_lock_override import projected_agent
+    from egis_agentkit.core.session._context import build_agent_record
 
     agent = AgentDefinitionBase.build_agent(
         "alice",
@@ -19,7 +19,7 @@ def test_agent_factory_prepares_invitable_team_record_and_projects_pinned_data()
     assert agent.data.chat_config.invite_config.invitable
     assert agent.data.chat_config.invite_config.invite_description == "Expert analyst"
 
-    projected = projected_agent(
+    projected = build_agent_record(
         agent,
         SimpleNamespace(
             definition={"agent_type": "expert", "agent_name": "pinned", "payload": {"system_prompt": "old"}}

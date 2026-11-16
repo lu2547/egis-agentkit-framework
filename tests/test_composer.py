@@ -7,11 +7,11 @@ from test_domain import expert, identities
 from test_resources import put_asset
 
 from egis_agentkit.service._composer import ComposerService
-from egis_agentkit.service._session import SessionService
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.agent._personal_manager import PersonalManager
 from egis_agentkit.service.resource._catalog import ResourceService
+from egis_agentkit.service.session._session import SessionService
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
 

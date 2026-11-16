@@ -41,9 +41,9 @@ async def test_same_user_two_projects_keep_one_workspace_identity(storage, tmp_p
     from test_domain import expert, identities
 
     from egis_agentkit.core.workspace._egis_sandbox_workspace import workspace_id_for
-    from egis_agentkit.service._session import SessionService
     from egis_agentkit.service.agent._agent_manager import AgentManager
     from egis_agentkit.service.project._project_manager import ProjectManager
+    from egis_agentkit.service.session._session import SessionService
 
     _, _, alice, bob = await identities(storage)
     sessions = SessionService(storage, tmp_path)
@@ -88,16 +88,16 @@ def test_generic_runtime_callback_has_no_project_or_storage_dependencies():
     import ast
     from pathlib import Path
 
-    from egis_agentkit.extension.runtime import _runtime_callback_middleware_impl
+    from egis_agentkit.middleware.session import _session_callback_middleware_impl
 
-    source = Path(_runtime_callback_middleware_impl.__file__).read_text()
+    source = Path(_session_callback_middleware_impl.__file__).read_text()
     imports = [
         node.module
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.ImportFrom)
     ]
     assert imports == ["agentscope.middleware"]
-    extension = Path(_runtime_callback_middleware_impl.__file__).parent.parent
+    extension = Path(_session_callback_middleware_impl.__file__).parent.parent
     assert not (extension / "_workspace_prompt_middleware_impl.py").exists()
     assert not (extension / "_workspace_file_changes_middleware_impl.py").exists()
     assert not (extension / "_session_middlewares_callback.py").exists()

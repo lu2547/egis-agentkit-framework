@@ -330,8 +330,8 @@ async def test_system_default_workspace_tools_load_without_installation_or_grant
     from runtime_helpers import sandbox_manager
     from test_read_tool_guard import execute
 
+    from egis_agentkit.core.session._context import session_execution_context
     from egis_agentkit.errors import Conflict
-    from egis_agentkit.extension.runtime._session_lock_override import execution_scope
 
     _, admin, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
@@ -344,7 +344,7 @@ async def test_system_default_workspace_tools_load_without_installation_or_grant
         project_id="project",
         definition={"agent_type": "personal", "payload": {}},
     )
-    token = execution_scope.set(scope)
+    token = session_execution_context.set(scope)
     try:
         workspace = await manager.get_workspace(alice.user_id, "agent", "one")
         await resources.prepare_workspace(alice, scope, workspace)
@@ -383,7 +383,7 @@ async def test_system_default_workspace_tools_load_without_installation_or_grant
                 admin, "tool", "Read", "1.0.0", False, admin=True
             )
     finally:
-        execution_scope.reset(token)
+        session_execution_context.reset(token)
         await manager.close_all()
 
 

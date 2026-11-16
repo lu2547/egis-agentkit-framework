@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..service._composer import ComposerService
     from ..service._model import ModelService
-    from ..service._session import SessionService
     from ..service._session_feedback import SessionFeedbackService
     from ..service._user import UserService
     from ..service.access._grant import GrantService
@@ -18,6 +17,7 @@ if TYPE_CHECKING:
     from ..service.project._project_manager import ProjectManager
     from ..service.resource._catalog import ResourceService
     from ..service.resource._skill_import import SkillImportService
+    from ..service.session._session import SessionService
     from ..service.team._definition import TeamDefinition
 
 

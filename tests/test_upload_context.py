@@ -6,16 +6,14 @@ from agentscope.tool import Read
 from runtime_helpers import project_prompt
 from test_domain import expert, identities
 
-from egis_agentkit.extension.resource._tool_access_callback import (
-    tool_access_middleware,
+from egis_agentkit.bootstrap._middlewares import (
+    build_tool_access_middleware,
 )
-from egis_agentkit.extension.runtime._session_lock_override import (
-    ExecutionCoordinator,
-    execution_scope,
-)
-from egis_agentkit.service._session import SessionService
+from egis_agentkit.core.session._context import session_execution_context
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.session._preparation import SessionPreparationService
+from egis_agentkit.service.session._session import SessionService
 
 
 @pytest.mark.asyncio
@@ -49,9 +47,9 @@ async def test_uploaded_pdf_is_named_by_its_readable_project_path(storage, tmp_p
     foreign = tasks.files.write(
         alice.user_id, "other-project", "private.txt", b"private", area="uploads"
     )
-    async with ExecutionCoordinator(storage, tmp_path).bind(second["session_id"]):
-        scope = execution_scope.get()
-        policy = tool_access_middleware(alice, scope, PermissionService(storage))
+    async with SessionPreparationService(storage, tmp_path).bind(second["session_id"]):
+        scope = session_execution_context.get()
+        policy = build_tool_access_middleware(alice, scope, PermissionService(storage))
         prompt = await project_prompt(scope).on_system_prompt(None, "system")
         assert str(target) in prompt and "pages" in prompt
         assert (

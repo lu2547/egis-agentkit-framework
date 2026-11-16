@@ -15,6 +15,9 @@ from pydantic import ValidationError
 from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
 from egis_agentkit.core.workspace._egis_sandbox_workspace import EgisSandboxWorkspace
 from egis_agentkit.errors import Forbidden
+from egis_agentkit.middleware.workspace._workspace_read_guard_middleware_impl import (
+    ReadToolGuardMiddleware,
+)
 
 
 def configuration(tmp_path):
@@ -37,6 +40,7 @@ def manager_type():
         kwargs.setdefault(
             "client_factory", partial(OpenSandboxClient, settings, api_key="test-only")
         )
+        kwargs.setdefault("read_guard_factory", ReadToolGuardMiddleware)
         return module.EgisSandboxManager(root, settings, **kwargs)
 
     return factory
@@ -190,7 +194,7 @@ async def test_gateway_tools_keep_managed_connection_source():
     from agentscope.mcp import HttpMCPConfig
 
     module = importlib.import_module(
-        "egis_agentkit.extension.workspace._gateway_mcp_client_override"
+        "egis_agentkit.client.mcp._gateway_mcp_client_override"
     )
 
     class ToolEndpoint:
@@ -227,7 +231,7 @@ async def test_skill_loader_publishes_runtime_path_but_persists_host_cache(tmp_p
     from egis_agentkit.core.workspace._egis_sandbox_workspace import (
         EgisSandboxWorkspace,
     )
-    from egis_agentkit.extension.resource._skill_loader_impl import LiveSkillLoader
+    from egis_agentkit.service.resource._skill_loader import LiveSkillLoader
     from egis_agentkit.storage.project._files import ProjectFileStorage
 
     root = tmp_path / "app"
@@ -375,15 +379,13 @@ async def test_gateway_tool_uses_same_resource_authorization_and_revocation(
 
     from test_domain import expert, identities
 
-    from egis_agentkit.extension.runtime._session_lock_override import (
-        ExecutionCoordinator,
-    )
-    from egis_agentkit.extension.workspace._gateway_mcp_client_override import (
+    from egis_agentkit.client.mcp._gateway_mcp_client_override import (
         AuthorizedGatewayMCPClient,
     )
-    from egis_agentkit.service._session import SessionService
     from egis_agentkit.service.agent._agent_manager import AgentManager
     from egis_agentkit.service.resource._catalog import ResourceService
+    from egis_agentkit.service.session._preparation import SessionPreparationService
+    from egis_agentkit.service.session._session import SessionService
 
     _, _, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
@@ -419,7 +421,7 @@ async def test_gateway_tool_uses_same_resource_authorization_and_revocation(
                 [{"name": "echo", "inputSchema": {"type": "object"}}]
             ).encode()
 
-    async with ExecutionCoordinator(storage, tmp_path).bind(
+    async with SessionPreparationService(storage, tmp_path).bind(
         session["session_id"]
     ) as scope:
         declaration = (

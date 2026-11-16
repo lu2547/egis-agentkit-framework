@@ -8,8 +8,8 @@ from agentscope.message import AssistantMsg, UserMsg
 from test_domain import expert, identities
 
 from egis_agentkit.errors import Conflict, Forbidden, InvalidRequest, NotFound
-from egis_agentkit.service._session import SessionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.session._session import SessionService
 from egis_agentkit.storage.model import utcnow
 
 
