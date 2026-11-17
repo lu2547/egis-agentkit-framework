@@ -24,6 +24,71 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.asyncio
+async def test_user_standard_directories_persist_on_nas_across_sandbox_recreation():
+    from egis_agentkit.client.nacos._settings import SandboxConfig
+    from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
+    from egis_agentkit.core.workspace._egis_sandbox_workspace import (
+        EgisSandboxWorkspace,
+    )
+    from egis_agentkit.storage.project._files import ProjectFileStorage
+
+    root = Path(os.environ["AGENTKIT_TEST_OPENSANDBOX_ROOT"]).resolve()
+    files = ProjectFileStorage(root)
+    user_id = "nas-layout-test-" + uuid4().hex
+    settings = SandboxConfig(
+        domain=os.environ["AGENTKIT_TEST_OPENSANDBOX_DOMAIN"],
+        image=os.environ["AGENTKIT_TEST_OPENSANDBOX_IMAGE"],
+    )
+    clients, workspaces, instances = [], [], set()
+
+    async def initialize(agent_id, session_id):
+        client = OpenSandboxClient(settings, api_key=os.environ[settings.api_key_env])
+        clients.append(client)
+        workspace = EgisSandboxWorkspace(
+            user_id=user_id, agent_id=agent_id, session_id=session_id,
+            project_id="project", files=files, settings=settings, client=client,
+        )
+        workspaces.append(workspace)
+        try:
+            await workspace.initialize()
+        finally:
+            if workspace.sandbox_id is not None:
+                instances.add(workspace.sandbox_id)
+        return workspace
+
+    files.initialize_project(user_id, "project")
+    try:
+        first = await initialize("writer", "one")
+        runtime = Path(first.workdir)
+        for name, target in (("data", "data"), ("skills", "skills"), ("session", "sessions"), ("mcp", "mcp")):
+            await first.get_backend().write_file(str(runtime / target / "keep.txt"), name.encode())
+            source = files.user_root(user_id) / name
+            if name != "data":
+                source /= first.runtime_binding_id
+            assert (source / "keep.txt").read_bytes() == name.encode()
+        second = await initialize("reviewer", "two")
+        assert await second.get_backend().read_file(str(runtime / "data/keep.txt")) == b"data"
+        assert not await second.get_backend().file_exists(str(runtime / "skills/keep.txt"))
+        previous_id = first.sandbox_id
+        await first.close_workspace()
+        await first.client.destroy_instance(previous_id)
+        instances.remove(previous_id)
+        restored = await initialize("writer", "one")
+        assert restored.sandbox_id != previous_id
+        for name, target in (("data", "data"), ("skills", "skills"), ("session", "sessions"), ("mcp", "mcp")):
+            assert await restored.get_backend().read_file(str(runtime / target / "keep.txt")) == name.encode()
+    finally:
+        for workspace in workspaces:
+            if workspace.is_alive:
+                await workspace.close_workspace()
+        for identifier in instances:
+            await clients[0].destroy_instance(identifier)
+        for client in clients:
+            await client.close()
+        shutil.rmtree(files.user_root(user_id))
+
+
+@pytest.mark.asyncio
 async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
     from agentscope.mcp import StdioMCPConfig
     from agentscope.skill import Skill

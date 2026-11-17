@@ -105,13 +105,18 @@ async def test_project_mounts_expose_only_current_project_and_protect_inputs(
         workspace = await manager.get_workspace(
             "alice", "agent", "session", project_id="project"
         )
-        mounts = workspace.build_project_mounts()
+        mounts = workspace.build_mounts()
         sources = {
             mount.name: (mount.source, mount.target, mount.read_only)
             for mount in mounts
         }
         target = tmp_path / "app/user/alice/projects/project"
+        binding = workspace.runtime_binding_id
         assert sources == {
+            "user-data": (str(target.parents[1] / "data"), "/workspace/data", False),
+            "user-skills": (str(target.parents[1] / "skills" / binding), "/workspace/skills", False),
+            "user-session": (str(target.parents[1] / "session" / binding), "/workspace/sessions", False),
+            "user-mcp": (str(target.parents[1] / "mcp" / binding), "/workspace/mcp", False),
             "project-inputs": (str(target), str(target), True),
             "project-work": (str(target / ".work"), str(target / ".work"), False),
             "project-artifacts": (
@@ -468,11 +473,11 @@ async def test_agents_and_sessions_do_not_share_running_resources(
         assert (
             len({a.runtime_binding_id, b.runtime_binding_id, c.runtime_binding_id}) == 3
         )
-        assert (
-            a.build_project_mounts()
-            == b.build_project_mounts()
-            == c.build_project_mounts()
-        )
+        mounts = [{mount.name: mount for mount in workspace.build_mounts()} for workspace in (a, b, c)]
+        for name in ("user-data", "project-inputs", "project-work", "project-artifacts"):
+            assert mounts[0][name] == mounts[1][name] == mounts[2][name]
+        for name in ("user-skills", "user-session", "user-mcp"):
+            assert len({mount[name].source for mount in mounts}) == 3
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,7 @@
 
 公开能力
 - check_ready：工作区内部校验入口，检查实现封装于 _checks，不作为独立组件。
-- build_project_mounts：构造当前项目挂载，资料只读，工作和交付目录可写。
+- build_mounts：挂载 NAS 用户标准目录及当前项目，资料只读，工作和交付目录可写。
 - renew_workspace / close_workspace：续期或暂停当前实例，关闭 SDK 和 MCP 连接。
 - destroy_sandbox_instances：校验归属并销毁指定用户、项目的全部底层实例。
 - get_builtin_tools / configure_workspace_resources：构造原生工具，装载已授权工具和 MCP。
@@ -92,7 +92,7 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
         self._gateway_home = settings.gateway_home
         self.gateway_port = settings.gateway_port
         super().__init__(workspace_id=logical_id)
-        mounts = self.build_project_mounts()
+        mounts = self.build_mounts()
         self._binding_metadata = {
             # 外部身份可以包含 Unicode 或邮箱，不能直接作为 provider label。
             "agentkit.user.hash": self._hash_metadata(user_id.encode()),
@@ -106,10 +106,19 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
 
     # 公开执行能力：挂载、续期、资源装载、技能发布及实例关闭和销毁。
 
-    def build_project_mounts(self) -> list[SandboxMount]:
-        """从统一 NAS 根目录挂载当前项目，API 与沙箱直接访问同一份文件。"""
+    def build_mounts(self) -> list[SandboxMount]:
+        """用户目录持久化到 NAS，只挂入当前项目，不暴露其他项目或用户。"""
+        user = self.egis_files.user_root(self.egis_user_id)
+        runtime = Path(self.workdir)
+        binding = self.runtime_binding_id
         project = self.egis_files.project_root(self.egis_user_id, self.egis_project_id)
         return [
+            SandboxMount("user-data", str(user / "data"), str(runtime / "data")),
+            # 运行资源仍按绑定隔离，但实际文件均落在该用户的 NAS 目录下。
+            SandboxMount("user-skills", str(user / "skills" / binding), str(runtime / "skills")),
+            # NAS 按约定使用单数 session，沙箱内复用 SDK 的 sessions 路径。
+            SandboxMount("user-session", str(user / "session" / binding), str(runtime / "sessions")),
+            SandboxMount("user-mcp", str(user / "mcp" / binding), str(runtime / "mcp")),
             SandboxMount(
                 "project-inputs",
                 str(project),
@@ -318,7 +327,13 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
 
     async def _provision_backend(self):
         """原生 initialize 的接入点：检查持久身份、连接实例并绑定 Core Backend。"""
-        # 1. 查找实例不代表可以接入，必须逐项检查执行绑定和挂载身份。
+        # 1. 先准备 NAS 挂载源；这里只创建用户标准目录，不代替项目创建。
+        await asyncio.to_thread(
+            self.egis_files.initialize_user_workspace,
+            self.egis_user_id,
+            self.runtime_binding_id,
+        )
+        # 2. 查找实例不代表可以接入，必须逐项检查执行绑定和挂载身份。
         existing = await self.client.find_instance(self.runtime_binding_id)
         if existing is not None:
             if any(
@@ -329,9 +344,9 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
             await self.client.connect_instance(existing)
         else:
             await self.client.create_instance(
-                dict(self.sandbox_metadata), self.build_project_mounts()
+                dict(self.sandbox_metadata), self.build_mounts()
             )
-        # 2. 命令和文件能力由 Core Backend 统一提供，不导入厂商 Backend。
+        # 3. 命令和文件能力由 Core Backend 统一提供，不导入厂商 Backend。
         self._backend = EgisSandboxBackend(self.client, self.workdir)
 
     async def _teardown_backend(self):

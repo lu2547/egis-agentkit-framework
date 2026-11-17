@@ -48,7 +48,7 @@ bash scripts/init/nas.sh
 - 已存在的 `user/` 不能是符号链接；持久根、用户根和技能根均执行读写探针。
 - 不递归修改已有权限，不预建具体用户或项目；文件探针执行后会清理。
 
-所有 API/技能导入节点与沙箱执行宿主机必须将同一份 NAS 挂载到相同绝对路径。Nacos 的 `workspace.runtime.root` 是唯一持久根目录，值与 `NAS_ROOT` 一致；沙箱直接挂载当前项目目录，无需复制项目文件。使用 OpenSandbox 开发适配器时，服务端的 `storage.allowed_host_paths` 必须包含该根目录。原生 `data/skills/sessions` 运行目录由 Workspace 初始化流程创建，不在这里预置。
+所有 API/技能导入节点与沙箱执行宿主机必须将同一份 NAS 挂载到相同绝对路径。Nacos 的 `workspace.runtime.root` 是唯一持久根目录，值与 `NAS_ROOT` 一致；沙箱直接挂载当前项目目录，无需复制项目文件。使用 OpenSandbox 开发适配器时，服务端的 `storage.allowed_host_paths` 必须包含该根目录。用户 NAS 目录按 `user/{uid}/{data,skills,session,mcp,projects}` 组织，由 Workspace 初始化补齐；初始化脚本不预建具体用户。`data` 按用户共享，`skills/session/mcp` 下按执行绑定分区并挂入沙箱，NAS `session` 对应 SDK `sessions`。项目创建时建立项目基础目录，会话创建时安全补齐缺失目录。
 
 ## 3 PostgreSQL
 

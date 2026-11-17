@@ -1,6 +1,7 @@
 """提供受管目录的安全文件读写，复用于用户文档和项目文件。
 
 核心能力
+- initialize_user_workspace：按既定 NAS 布局补齐用户标准目录，不创建具体项目。
 - 校验标识、配置中的路径限额及目录边界，禁止跟随符号链接。
 - 在文件锁内读取、原子替换用户文档，统一上传覆盖冲突处理。
 - 通过目录描述符完成枚举和删除，避免跨目录访问。
@@ -26,6 +27,9 @@ from egis_agentkit.errors import Conflict, Forbidden, NotFound, UploadNameConfli
 class FileStorage:
     """受管文件 IO 的公共实现，不处理项目生命周期或业务授权。"""
 
+    USER_WORKSPACE_DIRECTORIES = ("data", "skills", "session", "mcp", "projects")
+    USER_RUNTIME_DIRECTORIES = ("skills", "session", "mcp")
+
     def __init__(
         self,
         root: Path,
@@ -50,6 +54,18 @@ class FileStorage:
 
     def user_root(self, user_id):
         return self.root / "user" / self._identifier(user_id)
+
+    def initialize_user_workspace(self, user_id, runtime_binding_id=None):
+        """补齐用户目录及执行分区；已有内容保留，每一级都拒绝符号链接。"""
+        root = self.user_root(user_id)
+        for directory in self.USER_WORKSPACE_DIRECTORIES:
+            fd = self._directory_fd(root, [directory], create=True)
+            os.close(fd)
+        if runtime_binding_id is not None:
+            binding = self._identifier(runtime_binding_id)
+            for directory in self.USER_RUNTIME_DIRECTORIES:
+                fd = self._directory_fd(root, [directory, binding], create=True)
+                os.close(fd)
 
     @contextmanager
     def _user_files_lock(self, user_id, directory, *, exclusive):

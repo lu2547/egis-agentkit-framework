@@ -71,7 +71,7 @@ async def test_missing_cached_sandbox_is_rebuilt_with_original_project_files(
         )
         assert recovered is not old
         assert handle.closed
-        assert recovered.build_project_mounts() == old.build_project_mounts()
+        assert recovered.build_mounts() == old.build_mounts()
         assert (
             await recovered.get_backend().read_file(
                 str(manager.files.project_root("alice", "project") / "input.txt")

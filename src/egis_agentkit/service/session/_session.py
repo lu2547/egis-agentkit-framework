@@ -1,5 +1,6 @@
 """会话生命周期及输入区可选能力。"""
 
+import asyncio
 from pathlib import Path
 
 from agentscope.app.message_bus import MessageBusKeys
@@ -182,6 +183,8 @@ class SessionService:
         )
         if root["definition_type"] == "agent" and root["agent_type"] == "orchestrator":
             raise Forbidden("编排智能体只能在专家团内使用")
+        # 普通会话与分支均持有项目保护；只补齐缺失目录，不覆盖已有文件。
+        await asyncio.to_thread(self.files.initialize_project, user.user_id, project_id)
         is_team = root["definition_type"] == "team"
         agents = await team_member_definitions(self.storage, root)
         leader_id = (
@@ -306,10 +309,6 @@ class SessionService:
                 else:
                     await self.storage.update_session_state(
                         user.user_id, aid, sid, session.state
-                    )
-                for area in ("work", "artifacts", "uploads"):
-                    self.files.area_root(user.user_id, project_id, area).mkdir(
-                        parents=True, exist_ok=True
                     )
             return await self.get_session(user, leader_session.id)
         except BaseException:

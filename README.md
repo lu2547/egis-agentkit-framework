@@ -52,9 +52,9 @@ python -m egis_agentkit_app upgrade-db --database agentscope --apply
 
 项目共享工作空间与删除规则见 [文件生命周期](docs/session-files.md)。
 
-OpenSandbox Docker 工作区通过 `EgisSandboxManager` 接入。Manager 实现原生 `WorkspaceManagerBase`，负责执行绑定、缓存、并发、续期和回收；Core 继承原生 `SandboxedWorkspaceBase`，复用初始化模板并实现项目挂载、Backend 和单实例生命周期；OpenSandbox SDK 通信位于 Client。授权资源由 SessionService 调用 ResourceService.prepare_workspace 装载。运行容器按用户、项目、Agent、会话隔离，同一绑定复用环境；项目上传资料默认只读，`.work/`、`artifacts/` 可写，项目数据由文件存储共享和持久化，不新增工作区表。
+OpenSandbox Docker 工作区通过 `EgisSandboxManager` 接入。Manager 实现原生 `WorkspaceManagerBase`，负责执行绑定、缓存、并发、续期和回收；Core 继承原生 `SandboxedWorkspaceBase`，复用初始化模板并实现项目挂载、Backend 和单实例生命周期；OpenSandbox SDK 通信位于 Client。授权资源由 SessionService 调用 ResourceService.prepare_workspace 装载。运行容器按用户、项目、Agent、会话隔离，同一绑定复用环境；项目上传资料默认只读，`.work/`、`artifacts/` 可写，用户标准目录位于 NAS 的 `user/{uid}/{data,skills,session,mcp,projects}`。`data` 按用户共享；`skills/session/mcp` 下按执行绑定分区并挂入对应沙箱，避免运行资源串用；NAS 的 `session` 映射到 SDK 的 `sessions`。项目目录由创建项目时初始化，创建会话时安全补齐缺失目录，Workspace 初始化只负责用户标准目录和挂载。项目数据由文件存储共享和持久化，不新增工作区表。
 
-沙箱配置统一使用 `agentkit.workspace.runtime.mode: pks` 和同级 `sandbox` 节点。`root` 是唯一的 NAS 持久根目录，API 节点与沙箱执行宿主机必须将同一份 NAS 挂载到相同绝对路径。沙箱直接挂载该根目录下的当前用户项目，文件无需复制。当前开发通信仍由 `OpenSandboxClient` 对接已有 SDK；开发环境需安装 OpenSandbox extra，服务端的 `storage.allowed_host_paths` 必须包含 `root`。`apiKeyEnv` 引用部署环境变量，不把密钥写进 Nacos。公司 PKS 接入通过 `init_agentkit(..., sandbox_client_factory=...)` 注入实际 Client，配置命名调整不代表已经实现公司通信协议。修改镜像和挂载后需要重启 API。Manager、Workspace 直接实现原生通用基类，Backend 在 Core，提供方 SDK 仅位于 Client。
+沙箱配置统一使用 `agentkit.workspace.runtime.mode: pks` 和同级 `sandbox` 节点。`root` 是唯一的 NAS 持久根目录，API 节点与沙箱执行宿主机必须将同一份 NAS 挂载到相同绝对路径。沙箱直接挂载该根目录下的当前用户项目，文件无需复制。当前开发通信仍由 `OpenSandboxClient` 对接已有 SDK；开发环境需安装 OpenSandbox extra，服务端的 `storage.allowed_host_paths` 必须包含 `root`。`apiKeyEnv` 引用部署环境变量，不把密钥写进 Nacos。公司 PKS 接入通过 `init_agentkit(..., sandbox_client_factory=...)` 注入实际 Client，配置命名调整不代表已经实现公司通信协议。修改镜像和挂载后需要重启 API；已有沙箱的挂载不会自动改变，需在停止其执行后重建实例，NAS 文件保留。Manager、Workspace 直接实现原生通用基类，Backend 在 Core，提供方 SDK 仅位于 Client。
 
 工具通过 EgisSandboxBackend 调用注入的沙箱 Client 执行；MCP 通过容器内原生网关连接，连接配置不写入 `.mcp`，网关临时内容只允许经过启动时验证为 tmpfs 的 `gatewayTmpDir`；技能在激活后暂存完整再安装，完成的同一内容直接复用，授权失效会移除运行副本。持久激活记录继续校验原资源内容。MCP 中的 `localhost` 指沙箱自身；访问宿主开发服务应使用沙箱可达地址。
 
