@@ -104,9 +104,11 @@ class ProjectManager:
 
     async def rename(self, user, project_id, project_name):
         """更新处于活动状态的所属项目。"""
-        name = self.project.normalize_name(project_name)
         async with self.storage.projects.lifetime(project_id) as projects:
-            self._require(await projects.get(user.user_id, project_id))
+            project = self._require(await projects.get(user.user_id, project_id))
+            name = self.project.validate_name(
+                project_name, is_default=project["is_default"]
+            )
             await projects.rename(user.user_id, project_id, name)
         return await self.get(user, project_id)
 

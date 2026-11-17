@@ -3,6 +3,7 @@
 核心能力
 - build 生成独立的项目初始配置，不创建数据库记录或目录。
 - normalize_name 按当前配置整理名称并检查长度。
+- validate_name 保留默认项目名称，避免普通项目与系统默认项目混淆。
 - require_available 判断项目是否存在、是否允许当前状态下的操作。
 - require_deletable 保护用户的默认项目，普通项目允许继续删除清理。
 """
@@ -41,12 +42,19 @@ class Project:
         return {
             "id": new_id(),
             "owner_id": owner_id,
-            "project_name": self.normalize_name(name),
+            "project_name": self.validate_name(name, is_default=is_default),
             "status_type": "active",
             "is_default": is_default,
             "created_by": owner_id,
             "updated_by": owner_id,
         }
+
+    def validate_name(self, name, *, is_default):
+        """先检查名称格式，再限制普通项目使用当前配置的默认名称。"""
+        name = self.normalize_name(name)
+        if not is_default and name == self.defaults().name:
+            raise Conflict("默认项目由系统维护，请使用其他项目名称")
+        return name
 
     @staticmethod
     def require_available(project, *, allow_deleting=False):

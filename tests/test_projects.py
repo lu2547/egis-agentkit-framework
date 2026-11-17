@@ -40,6 +40,21 @@ async def assert_bus_removed(bus, session_id):
 
 
 @pytest.mark.asyncio
+async def test_custom_project_cannot_use_the_reserved_default_name(storage, tmp_path):
+    _, _, alice, _ = await identities(storage)
+    projects = ProjectManager(storage, tmp_path)
+    default = await projects.default(alice)
+    with pytest.raises(Conflict, match="默认项目"):
+        await projects.create(alice, "  默认项目  ")
+    custom = await projects.create(alice, "Research")
+    with pytest.raises(Conflict, match="默认项目"):
+        await projects.rename(alice, custom["id"], "默认项目")
+    assert len(await projects.list(alice)) == 2
+    assert (await projects.get(alice, custom["id"]))["project_name"] == "Research"
+    assert (await projects.default(alice))["id"] == default["id"]
+
+
+@pytest.mark.asyncio
 async def test_default_project_is_unique_and_project_access_is_owner_scoped(
     storage, tmp_path
 ):
