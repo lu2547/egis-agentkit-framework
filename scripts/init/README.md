@@ -113,14 +113,20 @@ python scripts/init/nacos.py --file "$HOME/.config/agentkit/agentkit.yaml"
 | `skill.storage.root` | `SKILL_STORAGE_ROOT` |
 | `workspace.runtime.mode` | 固定为 `pks` |
 | `workspace.runtime.sandbox` | 沙箱服务地址、镜像、凭据引用及执行参数；公司 Client 由接入方注入 |
-| `client.postgres.connection.urlEnv` | 应用运行时数据库连接串的环境变量名称，默认 `AGENTKIT_DATABASE_URL` |
+| `client.postgres.connection` | PostgreSQL 的 mode、host、port、database、username、TLS 和取密配置，见下节 |
+| `logging.level/format/accessLog` | Framework 控制台日志与 HTTP 访问日志，默认 INFO、JSON、开启访问日志 |
+| `client.tracing` | Phoenix OTLP HTTP 端点、项目、采样及导出限制；需要时设 enabled 为 true |
 | `client.kafka.connection.deploymentMode` | 企业跨进程运行设为 `cluster` |
 | `client.kafka.connection.bootstrapServers/topicPrefix` | Kafka 地址、`KAFKA_TOPIC_PREFIX` |
 | `client.kafka.topics.partitions/replicationFactor` | 与创建 Topic 时相同的分区和副本数 |
 | `model.catalog/selection` | 实际模型地址、模型标识、凭据环境变量和选择配置 |
 | `user.identity` | 公司 issuer、audience、RS256 和 JWKS 地址 |
 
-配置正文不放实际密码或令牌。地址只填 Nacos origin，不带 `/nacos` 路径。脚本直接读取环境变量中的 `NACOS_SERVER_URL/NACOS_NAMESPACE_ID/NACOS_GROUP`；Data ID 固定为 `agentkit.yaml`，默认 Group 为 `EGIS_AGENTKIT`。
+数据库 `key` 模式按约定从 Nacos `client.postgres.connection.password` 读取密码，因此必须限制此配置的读取、发布及导出权限；模板的空密码必须填写后才能启动。`cyberark` 模式删除 password，填写 `cyberark.endpoint/appId/safe/objectName`，通过 HTTPS CCP REST `AIMWebService/api/Accounts` 获取响应 Content；按公司要求配置 CA 和成对的客户端证书/私钥。每次新建物理数据库连接前取密，池中已连接的会话正常复用，不按每条 SQL 取密；取密失败拒绝新建连接。应用不再读取完整连接串环境变量。
+
+数据库普通连接参数、取密、日志与 Tracing 配置变更需要重启应用。模型及沙箱等其他凭据仍通过其配置项引用部署环境变量。地址只填 Nacos origin，不带 `/nacos` 路径。脚本直接读取环境变量中的 `NACOS_SERVER_URL/NACOS_NAMESPACE_ID/NACOS_GROUP`；Data ID 固定为 `agentkit.yaml`，默认 Group 为 `EGIS_AGENTKIT`。
+
+Phoenix 自建部署可使用 `http://phoenix.company.internal:6006/v1/traces`；这是 API 进程可访问的 OTLP HTTP 地址，不能只填 UI 根地址，也不要填容器内部才可达的主机名。打开 `agentkit.client.tracing.enabled` 后，Framework 管理导出生命周期，原生 TracingMiddleware 记录回复、模型及工具调用。`headers` 可填写平台要求的鉴权头，按密码同样保护；开发 Phoenix 未开启认证可保持空对象。日志只输出关键节点、耗时、标识和安全错误类型，不输出提示词、工具参数及密码。Framework/App 日志与原生 AgentScope Loguru、Uvicorn 日志分别由各自组件输出。
 
 需要经 Nacos 3 console 发布时另设 `NACOS_CONSOLE_URL`；读取配置使用 server 接口，发布权限单独按平台认证方式提供。脚本不创建 namespace，不执行用户名密码登录或自动续 token。
 

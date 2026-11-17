@@ -4,6 +4,8 @@ AgentScope 的配置管理与企业增强框架。首版已实现，不修改 Ag
 
 首次环境初始化见 [scripts/init](scripts/init/README.md)：面向企业已提供的 NAS、Nacos、Redis、Kafka、PG，包含目录初始化、配置发布、Topic 创建和业务建表 SQL；脚本不安装或启动基础设施。
 
+数据库支持 Nacos `agentkit.client.postgres.connection.mode: key | cyberark`：key 使用 password 字段，cyberark 使用 CCP REST 获取新建连接所需密码。日志配置位于 `agentkit.logging`；Phoenix 导出位于 `agentkit.client.tracing`，启动后由原生 TracingMiddleware 记录回复、模型和工具调用，Framework 管理导出和关闭。配置示例及运维步骤见上述初始化说明。
+
 `src/egis_agentkit/` 的 Agent 能力采用以下分层；其他业务仍保留现有目录，后续逐项梳理。
 
 | 目录 | 职责 |

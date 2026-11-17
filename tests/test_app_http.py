@@ -29,7 +29,6 @@ def app_snapshot(tmp_path, **domains):
     return AgentKitConfig.model_validate(
         {
             "revision": 1,
-            "client": {"postgres": {"connection": {"url_env": "TEST_DB_URL"}}},
             "workspace": {"runtime": sandbox_runtime(tmp_path)},
             "skill": {"storage": {"root": str(tmp_path / "nas")}},
             "project": {
@@ -70,7 +69,6 @@ async def test_http_identity_native_write_seal_and_real_task_files(
     storage, tmp_path, monkeypatch
 ):
     _, admin, alice, bob = await identities(storage)
-    monkeypatch.setenv("TEST_DB_URL", "postgresql+asyncpg://unused")
     monkeypatch.setenv(
         "TEST_DOWNLOAD", "download-secret-with-more-than-thirty-two-bytes"
     )

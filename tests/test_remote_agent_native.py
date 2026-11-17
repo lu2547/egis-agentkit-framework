@@ -72,7 +72,6 @@ async def test_finance_through_native_chat_invite_and_teamsay(
 ):
     stub_sandbox_provider(monkeypatch)
     _, admin, _, _ = await identities(storage)
-    monkeypatch.setenv("TEST_DB_URL", "postgresql+asyncpg://unused")
     monkeypatch.setenv("TEST_DOWNLOAD", "download-secret-with-more-than-thirty-two-bytes")
     monkeypatch.setenv("TEST_JWT", "jwt-secret-with-more-than-thirty-two-bytes")
     monkeypatch.setenv("TEST_LOGIN", "a-test-password-with-enough-entropy")

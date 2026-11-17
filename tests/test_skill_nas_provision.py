@@ -30,11 +30,10 @@ async def test_upgrade_preview_is_available_before_nas_configuration(
     operation = AsyncMock(
         return_value=_schema.SchemaReport("test", "public", {"技能文件存储": "pending"})
     )
-    monkeypatch.setenv("TEST_DB_URL", "postgresql+asyncpg://unused")
     monkeypatch.setattr(_provision, "NacosClient", lambda *args: Client())
     monkeypatch.setattr(_provision, "NacosConfigProvider", lambda *args: provider)
     monkeypatch.setattr(
-        _provision, "create_postgres_engine", lambda *args, **kwargs: engine
+        _provision, "create_postgres_engine_from_config", lambda *args, **kwargs: engine
     )
     monkeypatch.setattr(_schema, "upgrade_schema", operation)
     if apply:

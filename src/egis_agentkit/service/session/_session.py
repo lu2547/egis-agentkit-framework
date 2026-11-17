@@ -1,6 +1,8 @@
 """会话生命周期及输入区可选能力。"""
 
 import asyncio
+import logging
+import time
 from pathlib import Path
 
 from agentscope.app.message_bus import MessageBusKeys
@@ -9,6 +11,7 @@ from agentscope.app.storage import (
 )
 from agentscope.app.storage._model._session import TeamOrigin
 from agentscope.app.storage._utils import _resolve_team_leader
+from agentscope.event import ReplyEndEvent, ReplyFinishedReason
 from agentscope.permission import PermissionMode
 
 from egis_agentkit.client.nacos._settings import (
@@ -45,6 +48,8 @@ from egis_agentkit.storage.model._definition import (
     build_definition_options,
 )
 from egis_agentkit.storage.project._files import ProjectFileStorage
+
+logger = logging.getLogger(__name__)
 
 
 class SessionService:
@@ -310,7 +315,21 @@ class SessionService:
                     await self.storage.update_session_state(
                         user.user_id, aid, sid, session.state
                     )
-            return await self.get_session(user, leader_session.id)
+            result = await self.get_session(user, leader_session.id)
+            logger.info(
+                "session.created",
+                extra={
+                    "context": {
+                        "user_id": user.user_id,
+                        "project_id": project_id,
+                        "session_id": leader_session.id,
+                        "agent_id": leader.id,
+                        "definition_id": definition_id,
+                        "is_team": is_team,
+                    }
+                },
+            )
+            return result
         except BaseException:
             # 创建失败时只清理由本次请求分配的记录。
             if created_team_id is not None:
@@ -649,6 +668,41 @@ class SessionService:
         self, manager, workspace, handler, agent, input_kwargs, next_handler
     ):
         """在整个回复流期间持有沙箱租约，项目产物仍由原回复回调处理。"""
-        async with manager.renew_workspace(workspace):
-            async for event in handler(agent, input_kwargs, next_handler):
-                yield event
+        started = time.monotonic()
+        context = {
+            "user_id": workspace.egis_user_id,
+            "project_id": workspace.egis_project_id,
+            "session_id": workspace.egis_session_id,
+            "agent_id": workspace.egis_agent_id,
+        }
+        logger.info("reply.started", extra={"context": context})
+        reason = "interrupted"
+        try:
+            async with manager.renew_workspace(workspace):
+                async for event in handler(agent, input_kwargs, next_handler):
+                    if isinstance(event, ReplyEndEvent):
+                        reason = ReplyFinishedReason(event.finished_reason).value
+                    yield event
+        except Exception as exc:
+            reason = "error"
+            logger.error(
+                "reply.failed",
+                extra={
+                    "context": {
+                        **context,
+                        "error_type": type(exc).__name__,
+                    }
+                },
+            )
+            raise
+        finally:
+            logger.info(
+                "reply.finished",
+                extra={
+                    "context": {
+                        **context,
+                        "reason": reason,
+                        "duration_ms": round((time.monotonic() - started) * 1000),
+                    }
+                },
+            )

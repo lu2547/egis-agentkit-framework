@@ -223,6 +223,15 @@ class EgisSandboxManager(WorkspaceManagerBase):
             entry = self._cache.get(runtime_id)
             if entry is not None:
                 workspace = entry[0]
+                logger.debug(
+                    "workspace.cache_hit",
+                    extra={
+                        "context": {
+                            "session_id": session_id,
+                            "runtime_binding_id": runtime_id,
+                        }
+                    },
+                )
             else:
                 async with self._lock:
                     self._require_open(user_id, project_id)
@@ -423,6 +432,15 @@ class EgisSandboxManager(WorkspaceManagerBase):
         self, runtime_id, user_id, project_id, agent_id, session_id
     ):
         """构建 Core Workspace，具体 Client 由 Bootstrap 注入。"""
+        started = time.monotonic()
+        context = {
+            "user_id": user_id,
+            "project_id": project_id,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "runtime_binding_id": runtime_id,
+        }
+        logger.info("workspace.preparing", extra={"context": context})
         client = self._client_factory()
         workspace = None
         try:
@@ -448,8 +466,28 @@ class EgisSandboxManager(WorkspaceManagerBase):
                 ) from None
             await workspace.renew_workspace()
             await workspace.check_ready(full=True)
+            logger.info(
+                "workspace.ready",
+                extra={
+                    "context": {
+                        **context,
+                        "sandbox_id": workspace.sandbox_id,
+                        "duration_ms": round((time.monotonic() - started) * 1000),
+                    }
+                },
+            )
             return workspace
-        except BaseException:
+        except BaseException as exc:
+            logger.warning(
+                "workspace.prepare_failed",
+                extra={
+                    "context": {
+                        **context,
+                        "error_type": type(exc).__name__,
+                        "duration_ms": round((time.monotonic() - started) * 1000),
+                    }
+                },
+            )
             if workspace is not None:
                 # 取消可能来自租约丢失；此时只释放句柄，禁止暂停新持有者的实例。
                 try:

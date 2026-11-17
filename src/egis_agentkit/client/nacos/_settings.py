@@ -9,6 +9,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SecretStr,
     StrictBool,
     StringConstraints,
     field_validator,
@@ -30,7 +31,11 @@ DEFAULT_WORKSPACE_TREE_BYTES = 200 * 1024 * 1024
 
 class ConfigModel(BaseModel):
     model_config = ConfigDict(
-        frozen=True, extra="forbid", alias_generator=to_camel, populate_by_name=True
+        frozen=True,
+        extra="forbid",
+        alias_generator=to_camel,
+        populate_by_name=True,
+        hide_input_in_errors=True,
     )
 
 
@@ -628,8 +633,65 @@ class ModelConfig(ConfigModel):
     selection: ModelSelectionConfig
 
 
+class CyberArkConfig(ConfigModel):
+    """CCP REST 定位及 TLS 配置；账号密码仅在建立物理连接前获取。"""
+
+    endpoint: NonEmptyString
+    app_id: NonEmptyString
+    safe: NonEmptyString
+    object_name: NonEmptyString
+    folder: NonEmptyString = "Root"
+    timeout_seconds: Seconds = 10
+    tls_ca_file: NonEmptyString | None = None
+    client_cert_file: NonEmptyString | None = None
+    client_key_file: NonEmptyString | None = None
+
+    @model_validator(mode="after")
+    def check_transport(self):
+        url = urlsplit(self.endpoint)
+        if (
+            url.scheme != "https"
+            or not url.hostname
+            or url.username is not None
+            or url.password is not None
+            or url.query
+            or url.fragment
+        ):
+            raise ValueError("CCP requires an HTTPS endpoint without URL credentials")
+        if bool(self.client_cert_file) != bool(self.client_key_file):
+            raise ValueError(
+                "CCP client certificate and key must be configured together"
+            )
+        return self
+
+
 class PostgresConnectionConfig(ConfigModel):
-    url_env: SecretRef = "AGENTKIT_DATABASE_URL"
+    """数据库地址与取密模式；密码用 SecretStr 避免配置对象意外输出明文。"""
+
+    mode: Literal["key", "cyberark"] = "key"
+    host: NonEmptyString = "127.0.0.1"
+    port: Annotated[int, Field(strict=True, gt=0, le=65535)] = 5432
+    database: NonEmptyString = "agentscope"
+    username: NonEmptyString = "agentkit"
+    password: SecretStr | None = None
+    cyberark: CyberArkConfig | None = None
+    connect_timeout_seconds: Seconds = 10
+    ssl_mode: Literal["disable", "require", "verify-full"] = "disable"
+    ssl_ca_file: NonEmptyString | None = None
+
+    @model_validator(mode="after")
+    def check_credentials(self):
+        if self.mode == "cyberark" and (
+            self.cyberark is None or self.password is not None
+        ):
+            raise ValueError(
+                "cyberark mode requires CCP settings and no static password"
+            )
+        if self.mode == "key" and self.cyberark is not None:
+            raise ValueError("key mode cannot contain CCP settings")
+        if self.ssl_ca_file is not None and self.ssl_mode != "verify-full":
+            raise ValueError("sslCaFile requires verify-full mode")
+        return self
 
 
 class PostgresPoolConfig(ConfigModel):
@@ -695,10 +757,55 @@ class NacosConfig(ConfigModel):
     refresh: NacosRefreshConfig = Field(default_factory=NacosRefreshConfig)
 
 
+class TracingConfig(ConfigModel):
+    """OTLP HTTP 导出、采样和批处理限制；启动后变更需要重启。"""
+
+    enabled: StrictBool = False
+    endpoint: NonEmptyString = "http://127.0.0.1:6006/v1/traces"
+    project_name: NonEmptyString = "egis-agentkit"
+    service_name: NonEmptyString = "egis-agentkit"
+    sample_ratio: Annotated[
+        float, Field(strict=True, ge=0, le=1, allow_inf_nan=False)
+    ] = 1.0
+    export_timeout_seconds: Seconds = 10
+    shutdown_timeout_milliseconds: PositiveInt = 5000
+    max_queue_size: PositiveInt = 2048
+    max_export_batch_size: PositiveInt = 512
+    schedule_delay_milliseconds: PositiveInt = 5000
+    headers: dict[str, SecretStr] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def check_export(self):
+        url = urlsplit(self.endpoint)
+        if (
+            url.scheme not in ("http", "https")
+            or not url.hostname
+            or url.username is not None
+            or url.password is not None
+            or url.query
+            or url.fragment
+        ):
+            raise ValueError(
+                "OTLP requires an HTTP(S) endpoint without URL credentials"
+            )
+        if self.max_export_batch_size > self.max_queue_size:
+            raise ValueError("maxExportBatchSize exceeds maxQueueSize")
+        return self
+
+
+class LoggingConfig(ConfigModel):
+    """Framework 日志级别、输出格式及 HTTP 访问日志开关。"""
+
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    format: Literal["json", "text"] = "json"
+    access_log: StrictBool = True
+
+
 class ClientConfig(ConfigModel):
     postgres: PostgresConfig = Field(default_factory=PostgresConfig)
     kafka: KafkaConfig = Field(default_factory=KafkaConfig)
     nacos: NacosConfig = Field(default_factory=NacosConfig)
+    tracing: TracingConfig = Field(default_factory=TracingConfig)
 
 
 class AgentKitConfig(ConfigModel):
@@ -715,3 +822,4 @@ class AgentKitConfig(ConfigModel):
     workspace: WorkspaceConfig
     model: ModelConfig
     client: ClientConfig = Field(default_factory=ClientConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)

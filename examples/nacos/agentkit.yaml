@@ -262,10 +262,33 @@ agentkit:
       allowOverride: true
       allowedKeys:
       - company
+  logging:
+    level: INFO
+    format: json
+    accessLog: true
   client:
     postgres:
       connection:
-        urlEnv: AGENTKIT_DATABASE_URL
+        mode: key
+        host: pg.company.internal
+        port: 5432
+        database: agentscope
+        username: agentkit
+        password: ''  # key 模式在 Nacos 填写实际密码；生产限制本配置的读写权限。
+        connectTimeoutSeconds: 10.0
+        sslMode: verify-full
+        sslCaFile: /etc/agentkit/certs/pg-ca.pem
+        # cyberark 模式删除 password，并填写以下 CCP REST 配置：
+        # cyberark:
+        #   endpoint: https://ccp.company.internal/AIMWebService/api/Accounts
+        #   appId: agentkit
+        #   safe: database
+        #   objectName: postgres-agentkit
+        #   folder: Root
+        #   timeoutSeconds: 10.0
+        #   tlsCaFile: /etc/agentkit/certs/ccp-ca.pem
+        #   clientCertFile: /etc/agentkit/certs/ccp-client.pem
+        #   clientKeyFile: /etc/agentkit/certs/ccp-client.key
       pool:
         size: 10
         maxOverflow: 10
@@ -298,3 +321,15 @@ agentkit:
       refresh:
         intervalSeconds: 10.0
         failureIntervalSeconds: 10.0
+    tracing:
+      enabled: false
+      endpoint: http://127.0.0.1:6006/v1/traces
+      projectName: egis-agentkit
+      serviceName: egis-agentkit
+      sampleRatio: 1.0
+      exportTimeoutSeconds: 10.0
+      shutdownTimeoutMilliseconds: 5000
+      maxQueueSize: 2048
+      maxExportBatchSize: 512
+      scheduleDelayMilliseconds: 5000
+      headers: {}

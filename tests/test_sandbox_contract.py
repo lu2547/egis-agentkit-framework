@@ -173,7 +173,6 @@ async def test_pks_injected_client_needs_no_opensandbox_credentials(
     kit = init_agentkit(
         config,
         None,
-        "postgresql+asyncpg://unused",
         engine=storage.engine,
         owns_client=False,
         sandbox_client_factory=TestSandboxClient,

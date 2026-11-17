@@ -3,7 +3,6 @@
 import argparse
 import asyncio
 import json
-import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -21,7 +20,6 @@ async def main(args):
         kit = init_agentkit(
             config,
             client,
-            os.environ[config.snapshot.client.postgres.connection.url_env],
             owns_client=False,
         )
         try:

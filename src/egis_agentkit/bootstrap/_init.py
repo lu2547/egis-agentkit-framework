@@ -1,5 +1,6 @@
 """组装 AgentKit 的业务服务和运行时扩展，管理组件启动和关闭顺序。"""
 
+import logging
 import os
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
@@ -12,7 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from egis_agentkit.bootstrap._demo_tools import deploy_demo_report_tools
 from egis_agentkit.bootstrap._middlewares import build_middlewares
-from egis_agentkit.client._postgres import check_postgres, create_postgres_engine
+from egis_agentkit.client._logging import LoggingClient
+from egis_agentkit.client._postgres import (
+    check_postgres,
+    create_postgres_engine_from_config,
+    postgres_url,
+)
+from egis_agentkit.client._tracing import TracingClient
 from egis_agentkit.client.nacos import NacosClient, NacosConfigProvider
 from egis_agentkit.client.nacos._config import LivePolicies
 from egis_agentkit.client.sandbox import SandboxClient
@@ -58,6 +65,8 @@ from egis_agentkit.storage.project._preview_cache import PreviewCacheStorage
 
 from ._services import AgentKitServices
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class AgentKit:
@@ -76,6 +85,8 @@ class AgentKit:
     _skill_imports: SkillImportService
     _memory: PersonalMemoryService | None
     _owns_engine: bool
+    _logging: LoggingClient
+    _tracing: TracingClient
 
     async def check_database(self) -> None:
         await check_postgres(self._storage.engine)
@@ -83,6 +94,9 @@ class AgentKit:
     @asynccontextmanager
     async def lifespan(self, native_lifespan: AbstractAsyncContextManager):
         async with AsyncExitStack() as stack:
+            # 1. 先开启日志和 Trace，启动失败及后续清理也能被观测。
+            stack.callback(self._logging.close)
+            stack.push_async_callback(self._tracing.aclose)
             if self._owns_engine:
                 stack.push_async_callback(self._storage.engine.dispose)
             if self._owned_client is not None:
@@ -90,20 +104,34 @@ class AgentKit:
             stack.push_async_callback(self._config.close)
             if self._memory is not None:
                 stack.push_async_callback(self._memory.close)
-
+            # 所有已创建对象先登记清理；观测初始化失败同样完整释放。
+            self._logging.start()
+            self._tracing.start()
+            logger.info(
+                "agentkit.starting",
+                extra={
+                    "context": {
+                        "revision": self._config.snapshot.revision,
+                        "tracing_enabled": self._config.snapshot.client.tracing.enabled,
+                    }
+                },
+            )
             await self._config.start()
             await stack.enter_async_context(self._storage)
             await self.services.resources.seed_builtin_tools()
             await stack.enter_async_context(native_lifespan)
             stack.push_async_callback(self._skill_imports.close)
             await self._skill_imports.start()
-            yield
+            logger.info("agentkit.ready")
+            try:
+                yield
+            finally:
+                logger.info("agentkit.stopping")
 
 
 def init_agentkit(
     config: NacosConfigProvider,
     client: NacosClient,
-    database_url: str,
     *,
     engine: AsyncEngine | None = None,
     owns_client: bool = True,
@@ -128,11 +156,8 @@ def init_agentkit(
         )
     owns_engine = engine is None
     if engine is None:
-        engine = create_postgres_engine(
-            database_url,
-            pool_size=postgres.pool.size,
-            max_overflow=postgres.pool.max_overflow,
-        )
+        engine = create_postgres_engine_from_config(postgres)
+    database_url = postgres_url(postgres)
     storage = AgentKitStorage(database_url, engine)
     native_storage = SessionExecutionStorage(database_url, engine)
     bus = SessionMessageBus(engine=engine, kafka=snapshot.client.kafka)
@@ -238,6 +263,7 @@ def init_agentkit(
             resources=resources,
             remote_agents=remote_agents,
             workspace_manager=workspace_manager,
+            tracing_enabled=snapshot.client.tracing.enabled,
         ),
         remote_agents=remote_agents,
         _storage=storage,
@@ -246,4 +272,6 @@ def init_agentkit(
         _skill_imports=skill_imports,
         _memory=memory,
         _owns_engine=owns_engine,
+        _logging=LoggingClient(snapshot.logging),
+        _tracing=TracingClient(snapshot.client.tracing),
     )

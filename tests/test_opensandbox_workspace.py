@@ -315,7 +315,6 @@ async def test_bootstrap_selects_native_sandbox_manager(storage, tmp_path, monke
     kit = init_agentkit(
         config,
         None,
-        "postgresql+asyncpg://unused",
         engine=storage.engine,
         owns_client=False,
     )

@@ -8,7 +8,7 @@ def test_external_connections_are_available_from_client():
     postgres = importlib.import_module("egis_agentkit.client._postgres")
     nacos = importlib.import_module("egis_agentkit.client.nacos")
     kafka = importlib.import_module("egis_agentkit.client._kafka")
-    assert callable(postgres.create_postgres_engine)
+    assert callable(postgres.create_postgres_engine_from_config)
     assert callable(nacos.NacosClient)
     assert callable(kafka.KafkaTransport)
     source = Path(postgres.__file__).parents[1]

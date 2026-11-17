@@ -1,6 +1,7 @@
 """读取并发布经过验证的 Nacos 配置快照。"""
 
 import asyncio
+import logging
 
 import yaml
 from agentscope.permission import PermissionMode
@@ -13,6 +14,7 @@ from egis_agentkit.client.nacos._settings import (
 )
 
 AGENTKIT_DATA_ID = "agentkit.yaml"
+logger = logging.getLogger(__name__)
 
 
 class LivePolicies:
@@ -131,6 +133,8 @@ def _fixed_components(snapshot: AgentKitConfig) -> dict:
         "agentkit.connector.oauth.credentialKeyEnv": snapshot.connector.oauth.credential_key_env,
         "agentkit.client.postgres": snapshot.client.postgres,
         "agentkit.client.kafka": snapshot.client.kafka,
+        "agentkit.client.tracing": snapshot.client.tracing,
+        "agentkit.logging": snapshot.logging,
         "agentkit.user.identity": snapshot.user.identity,
         "agentkit.workspace.runtime": snapshot.workspace.runtime,
         "agentkit.workspace.probe": snapshot.workspace.probe,
@@ -207,10 +211,30 @@ class NacosConfigProvider:
                         self.restart_required = True
                         raise NacosError(", ".join(changed) + ": restart required")
             except NacosError as exc:
+                # 仅在状态或错误改变时输出；轮询重试不重复刷屏。
+                if self.is_connected or self.last_error != str(exc):
+                    logger.warning(
+                        "config.refresh_failed",
+                        extra={
+                            "context": {
+                                "error": str(exc),
+                                "restart_required": self.restart_required,
+                            }
+                        },
+                    )
                 self.is_connected = False
                 self.last_error = str(exc)
                 raise
 
+            if self._snapshot != candidate or not self.is_connected:
+                logger.info(
+                    "config.loaded",
+                    extra={
+                        "context": {
+                            "revision": candidate.revision,
+                        }
+                    },
+                )
             self._snapshot = candidate
             self.is_connected = True
             self.restart_required = False

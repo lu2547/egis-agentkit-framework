@@ -6,9 +6,11 @@
 - 中间件顺序、原生 next_handler 及异常语义保持不变。
 """
 
+import logging
+import time
 from functools import partial
 
-from agentscope.middleware import MiddlewareBase
+from agentscope.middleware import MiddlewareBase, TracingMiddleware
 from agentscope.workspace import WorkspaceBase
 
 from egis_agentkit.core.session._context import get_session_execution_context
@@ -30,6 +32,8 @@ from egis_agentkit.service.team._tool_callbacks import (
     team_prompt_arguments,
     tool_access_callbacks,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def build_tool_access_middleware(
@@ -70,8 +74,12 @@ async def build_middlewares(
     resources=None,
     remote_agents=None,
     workspace_manager=None,
+    tracing_enabled=False,
 ) -> list[MiddlewareBase]:
     """组合已绑定会话的运行回调、授权、资源和远程执行扩展。"""
+    started = time.monotonic()
+    context = {"user_id": user_id, "agent_id": agent_id, "session_id": session_id}
+    logger.info("session.preparing", extra={"context": context})
     scope = get_session_execution_context(user_id, agent_id, session_id)
     user = await users.get(user_id)
     if resources is not None:
@@ -118,6 +126,9 @@ async def build_middlewares(
         ),
         build_team_prompt_middleware(scope),
     ]
+    # 原生 TracingMiddleware 包住回复、模型和工具链；导出由 Client 生命周期管理。
+    if tracing_enabled:
+        result.insert(0, TracingMiddleware())
     if scope.definition["agent_type"] == "remote":
         if remote_agents is None:
             raise Forbidden("未配置远程专家执行服务")
@@ -135,4 +146,13 @@ async def build_middlewares(
         )
     if personal and memory is not None:
         result.append(await memory.for_user(user))
+    logger.info(
+        "session.prepared",
+        extra={
+            "context": {
+                **context,
+                "duration_ms": round((time.monotonic() - started) * 1000),
+            }
+        },
+    )
     return result

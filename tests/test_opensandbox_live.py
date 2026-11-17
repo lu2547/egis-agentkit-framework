@@ -11,8 +11,9 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy.ext.asyncio import create_async_engine
 
+from egis_agentkit.client._postgres import create_postgres_engine_from_config
+from egis_agentkit.client.nacos import NacosClient, NacosConfigProvider, nacos_bootstrap
 from egis_agentkit.middleware.workspace._workspace_read_guard_middleware_impl import (
     ReadToolGuardMiddleware,
 )
@@ -135,9 +136,10 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
     from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
     from egis_agentkit.core.message_bus import EgisMessageBus
 
-    engine = create_async_engine(
-        os.environ["AGENTKIT_DATABASE_URL"], hide_parameters=True
-    )
+    async with NacosClient(nacos_bootstrap()) as nacos:
+        config = NacosConfigProvider(nacos)
+        await config.refresh()
+        engine = create_postgres_engine_from_config(config.snapshot.client.postgres)
     bus = EgisMessageBus(deployment_mode="cluster", engine=engine)
     manager = EgisSandboxManager(
         root,
@@ -330,9 +332,10 @@ async def test_real_docker_recovers_missing_sandbox_without_losing_project_files
     from egis_agentkit.client.sandbox._opensandbox import OpenSandboxClient
     from egis_agentkit.core.message_bus import EgisMessageBus
 
-    engine = create_async_engine(
-        os.environ["AGENTKIT_DATABASE_URL"], hide_parameters=True
-    )
+    async with NacosClient(nacos_bootstrap()) as nacos:
+        config = NacosConfigProvider(nacos)
+        await config.refresh()
+        engine = create_postgres_engine_from_config(config.snapshot.client.postgres)
     bus = EgisMessageBus(deployment_mode="cluster", engine=engine)
     manager = EgisSandboxManager(
         root,

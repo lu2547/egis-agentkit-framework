@@ -140,7 +140,9 @@ async def test_client_rejects_cross_origin_paths_and_scrubs_server_errors():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fixed_component", ["workspace", "skill-storage"])
+@pytest.mark.parametrize(
+    "fixed_component", ["workspace", "skill-storage", "tracing", "logging"]
+)
 async def test_snapshot_reads_one_document_and_updates_typed_hot_settings(
     fixed_component,
 ):
@@ -180,10 +182,16 @@ async def test_snapshot_reads_one_document_and_updates_typed_hot_settings(
             docs["agentkit.yaml"]["agentkit"]["workspace"]["runtime"]["root"] = (
                 "/different"
             )
-        else:
+        elif fixed_component == "skill-storage":
             docs["agentkit.yaml"]["agentkit"].setdefault("skill", {})["storage"] = {
                 "root": "/different-nas"
             }
+        elif fixed_component == "tracing":
+            docs["agentkit.yaml"]["agentkit"].setdefault("client", {})["tracing"] = {
+                "enabled": True,
+            }
+        else:
+            docs["agentkit.yaml"]["agentkit"]["logging"] = {"level": "DEBUG"}
         with pytest.raises(NacosError, match="restart"):
             await provider.refresh()
         assert provider.restart_required is True
