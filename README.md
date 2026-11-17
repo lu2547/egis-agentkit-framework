@@ -6,6 +6,8 @@ AgentScope 的配置管理与企业增强框架。首版已实现，不修改 Ag
 
 数据库支持 Nacos `agentkit.client.postgres.connection.mode: key | cyberark`：key 使用 password 字段，cyberark 使用 CCP REST 获取新建连接所需密码。日志配置位于 `agentkit.logging`；Phoenix 导出位于 `agentkit.client.tracing`，启动后由原生 TracingMiddleware 记录回复、模型和工具调用，Framework 管理导出和关闭。配置示例及运维步骤见上述初始化说明。
 
+Phoenix 的运行主项目默认 `egis-agentkit`，以 `chat.run` 为根记录会话、项目、沙箱、资源、记忆、原生 Agent/模型/工具和收尾阶段，使用 `session.id` 对应实际会话。普通 HTTP 与 FastAPI 内部 Span 默认进入 `egis-agentkit-http`，由 `client.tracing.httpProjectName` 配置。Span 结束后导出，执行中的父阶段不提前标记完成。Framework 日志输出到 stdout；当前开发机的 `/private/tmp/agentkit-observability-api.log` 是启动时重定向文件，不是沙箱目录，也不代表已经配置生产文件落盘或轮转。
+
 `src/egis_agentkit/` 的 Agent 能力采用以下分层；其他业务仍保留现有目录，后续逐项梳理。
 
 | 目录 | 职责 |

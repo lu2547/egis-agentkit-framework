@@ -20,6 +20,7 @@ from typing import Callable
 from agentscope.app.message_bus import MessageBus, MessageBusKeys
 from agentscope.app.workspace_manager import IsolationPolicy, WorkspaceManagerBase
 
+from egis_agentkit.client._tracing import annotate_runtime, trace_phase
 from egis_agentkit.client.mcp._gateway_mcp_client_override import (
     AuthorizedGatewayMCPClient,
 )
@@ -214,12 +215,14 @@ class EgisSandboxManager(WorkspaceManagerBase):
             raise Forbidden("会话工作区与用户归属不一致")
         if not project_id:
             raise NotFound("会话未绑定项目")
+        annotate_runtime(name="chat.run")
         # 项目目录由 ProjectFileManager 管理，此处只选择用户工作区的执行环境。
         runtime_id = sandbox_binding_for(user_id, project_id, agent_id, session_id)
         async with self._instance_lock(runtime_id):
             async with self._lock:
                 self._require_open(user_id, project_id)
-            await self._refresh_cached_workspace(runtime_id)
+            with trace_phase("workspace.cache_check"):
+                await self._refresh_cached_workspace(runtime_id)
             entry = self._cache.get(runtime_id)
             if entry is not None:
                 workspace = entry[0]
@@ -459,13 +462,15 @@ class EgisSandboxManager(WorkspaceManagerBase):
                 runtime_binding_id=runtime_id,
             )
             try:
-                await workspace.initialize()
+                with trace_phase("sandbox.initialize"):
+                    await workspace.initialize()
             except RuntimeError:
                 raise WorkspaceProbeError(
                     "runtime", "initialization_failed", retryable=False
                 ) from None
-            await workspace.renew_workspace()
-            await workspace.check_ready(full=True)
+            with trace_phase("sandbox.probe"):
+                await workspace.renew_workspace()
+                await workspace.check_ready(full=True)
             logger.info(
                 "workspace.ready",
                 extra={

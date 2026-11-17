@@ -763,6 +763,7 @@ class TracingConfig(ConfigModel):
     enabled: StrictBool = False
     endpoint: NonEmptyString = "http://127.0.0.1:6006/v1/traces"
     project_name: NonEmptyString = "egis-agentkit"
+    http_project_name: NonEmptyString | None = "egis-agentkit-http"
     service_name: NonEmptyString = "egis-agentkit"
     sample_ratio: Annotated[
         float, Field(strict=True, ge=0, le=1, allow_inf_nan=False)

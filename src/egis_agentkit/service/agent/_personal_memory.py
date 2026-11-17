@@ -20,7 +20,9 @@ from egis_agentkit.storage._files import FileStorage
 class PersonalMemoryService:
     """按用户管理记忆组件的创建、复用和关闭，不承担对话钩子的具体实现。"""
 
-    def __init__(self, storage, workspace_root, config_provider):
+    def __init__(
+        self, storage, workspace_root, config_provider, *, middleware_factory=None
+    ):
         if importlib.util.find_spec("reme") is None:
             raise RuntimeError(
                 "启用长期记忆需要安装 reme-ai：pip install 'egis-agentkit-framework[memory]'"
@@ -31,6 +33,7 @@ class PersonalMemoryService:
         self.access = ResourceAccessService(storage, DenyAllResourceAccessPolicy())
         self._middlewares = {}
         self._lock = asyncio.Lock()
+        self._middleware_factory = middleware_factory or ReMeMiddleware
 
     async def for_user(self, user):
         async with self._lock:
@@ -38,7 +41,7 @@ class PersonalMemoryService:
                 path = self.files.user_root(user.user_id) / "memory"
                 config = await self.models.resolve(user)
                 model = await get_model(user.user_id, config, self.access)
-                self._middlewares[user.user_id] = ReMeMiddleware(
+                self._middlewares[user.user_id] = self._middleware_factory(
                     workspace_dir=str(path),
                     parameters=ReMeMiddleware.Parameters(
                         chat_model=model, top_k=self.settings.top_k

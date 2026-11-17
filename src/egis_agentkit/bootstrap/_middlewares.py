@@ -13,6 +13,7 @@ from functools import partial
 from agentscope.middleware import MiddlewareBase, TracingMiddleware
 from agentscope.workspace import WorkspaceBase
 
+from egis_agentkit.client._tracing import trace_phase
 from egis_agentkit.core.session._context import get_session_execution_context
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.middleware import (
@@ -84,7 +85,8 @@ async def build_middlewares(
     user = await users.get(user_id)
     if resources is not None:
         # 原生 ChatService 随后才收集 Workspace 工具与 MCP，必须先完成授权装载。
-        await resources.prepare_workspace(user, scope, workspace)
+        with trace_phase("resources.prepare"):
+            await resources.prepare_workspace(user, scope, workspace)
     policies = scope.policies
     personal = scope.definition["agent_type"] == "personal"
     skills = (

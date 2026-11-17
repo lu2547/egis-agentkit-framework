@@ -30,6 +30,7 @@ from agentscope.workspace._gateway_client import GatewayMCPClient
 from agentscope.workspace._sandboxed_base import SandboxedWorkspaceBase
 from agentscope.workspace._utils import _GATEWAY_BASE_REQUIREMENTS, UV_VERSION
 
+from egis_agentkit.client._tracing import trace_phase
 from egis_agentkit.client.nacos._settings import (
     SandboxWorkspaceConfig,
     WorkspaceProbeConfig,
@@ -116,9 +117,15 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
         return [
             SandboxMount("user-data", str(user / "data"), str(runtime / "data")),
             # 运行资源仍按绑定隔离，但实际文件均落在该用户的 NAS 目录下。
-            SandboxMount("user-skills", str(user / "skills" / binding), str(runtime / "skills")),
+            SandboxMount(
+                "user-skills", str(user / "skills" / binding), str(runtime / "skills")
+            ),
             # NAS 按约定使用单数 session，沙箱内复用 SDK 的 sessions 路径。
-            SandboxMount("user-session", str(user / "session" / binding), str(runtime / "sessions")),
+            SandboxMount(
+                "user-session",
+                str(user / "session" / binding),
+                str(runtime / "sessions"),
+            ),
             SandboxMount("user-mcp", str(user / "mcp" / binding), str(runtime / "mcp")),
             SandboxMount(
                 "project-inputs",
@@ -126,7 +133,9 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
                 str(project),
                 self.settings.inputs_read_only,
             ),
-            SandboxMount("project-work", str(project / ".work"), str(project / ".work")),
+            SandboxMount(
+                "project-work", str(project / ".work"), str(project / ".work")
+            ),
             SandboxMount(
                 "project-artifacts",
                 str(project / "artifacts"),
@@ -192,7 +201,8 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
     async def get_builtin_tools(self):
         """原生工具使用本次执行的 Backend 和目录，Read 增强由管理层注入。"""
         backend = self.get_backend()
-        tools = await super().list_tools()
+        with trace_phase("tools.load_defaults"):
+            tools = await super().list_tools()
         result = []
         for tool in tools:
             if tool.name == "Bash":
@@ -342,11 +352,13 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
                 for key, value in self.sandbox_metadata.items()
             ):
                 raise Forbidden("已有沙箱的用户、项目或挂载与当前绑定不一致")
-            await self.client.connect_instance(existing)
+            with trace_phase("sandbox.connect"):
+                await self.client.connect_instance(existing)
         else:
-            await self.client.create_instance(
-                dict(self.sandbox_metadata), self.build_mounts()
-            )
+            with trace_phase("sandbox.create"):
+                await self.client.create_instance(
+                    dict(self.sandbox_metadata), self.build_mounts()
+                )
         # 3. 命令和文件能力由 Core Backend 统一提供，不导入厂商 Backend。
         self._backend = EgisSandboxBackend(self.client, self.workdir)
 
@@ -383,7 +395,8 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
 
     async def _setup_mcp_gateway(self):
         """复用原生网关，只允许请求和响应临时内容经过内存文件系统。"""
-        await super()._setup_mcp_gateway()
+        with trace_phase("mcp.gateway.initialize"):
+            await super()._setup_mcp_gateway()
         result = await self.get_backend().exec_shell(
             ["stat", "-f", "-c", "%T", self.settings.gateway_tmp_dir]
         )

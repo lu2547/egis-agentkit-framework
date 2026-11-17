@@ -128,6 +128,10 @@ python scripts/init/nacos.py --file "$HOME/.config/agentkit/agentkit.yaml"
 
 Phoenix 自建部署可使用 `http://phoenix.company.internal:6006/v1/traces`；这是 API 进程可访问的 OTLP HTTP 地址，不能只填 UI 根地址，也不要填容器内部才可达的主机名。打开 `agentkit.client.tracing.enabled` 后，Framework 管理导出生命周期，原生 TracingMiddleware 记录回复、模型及工具调用。`headers` 可填写平台要求的鉴权头，按密码同样保护；开发 Phoenix 未开启认证可保持空对象。日志只输出关键节点、耗时、标识和安全错误类型，不输出提示词、工具参数及密码。Framework/App 日志与原生 AgentScope Loguru、Uvicorn 日志分别由各自组件输出。
 
+运行主项目 `projectName` 默认 `egis-agentkit`：会话运行根关联 session/user/project/agent 标识，包含锁等待、会话及项目准备、沙箱创建/接入、网关、资源和工具装配、原生 Agent/模型/工具、记忆作业、产物汇总、状态保存等实际阶段。以 `session.id` 查询同一会话；根上的 Link 可关联触发它的 HTTP 请求。`httpProjectName` 默认 `egis-agentkit-http`，普通 API 和 FastAPI 内部 Span 放入这个独立项目；设为 null 则不导出这些 HTTP Span。已有历史 Trace 不移动。标准 OTLP 在 Span 结束后导出，尚未结束的父阶段不会提前伪造成已完成；排查执行中状态可结合结构化日志和已完成子阶段。
+
+Framework 本身输出到标准输出，不自行指定日志文件或轮转。企业平台应采集进程/容器 stdout；本机开发启动若用 shell 重定向，其路径由启动命令决定，`/tmp/agentkit-observability-api.log` 仅是当前开发进程的宿主临时文件，不在沙箱中。
+
 需要经 Nacos 3 console 发布时另设 `NACOS_CONSOLE_URL`；读取配置使用 server 接口，发布权限单独按平台认证方式提供。脚本不创建 namespace，不执行用户名密码登录或自动续 token。
 
 首次不存在时才发布；配置相同则保留，不同则拒绝覆盖。仅明确的配置不存在码 `20004` 当作首次创建，网络、403 等其他错误直接失败。发布后读回比较，输出只包含结果和版本，不打印配置正文或密钥。

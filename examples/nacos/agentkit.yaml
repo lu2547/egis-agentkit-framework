@@ -325,6 +325,7 @@ agentkit:
       enabled: false
       endpoint: http://127.0.0.1:6006/v1/traces
       projectName: egis-agentkit
+      httpProjectName: egis-agentkit-http
       serviceName: egis-agentkit
       sampleRatio: 1.0
       exportTimeoutSeconds: 10.0

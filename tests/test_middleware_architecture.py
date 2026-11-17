@@ -66,7 +66,12 @@ def test_internal_import_targets_exist_including_type_checking_blocks():
 def test_middleware_contains_only_native_or_http_middleware():
     root = ROOT / "middleware"
     assert root.is_dir()
-    allowed_bases = {"MiddlewareBase", "ToolMiddlewareBase", "Protocol"}
+    allowed_bases = {
+        "MiddlewareBase",
+        "ToolMiddlewareBase",
+        "ReMeMiddleware",
+        "Protocol",
+    }
     http_middleware = {"IdentityGuard", "StreamReady"}
     violations = []
     for path in root.rglob("*.py"):

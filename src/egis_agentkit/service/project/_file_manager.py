@@ -18,6 +18,7 @@ from typing import Any
 from agentscope.event import ReplyEndEvent
 from agentscope.tool import ToolResponse
 
+from egis_agentkit.client._tracing import trace_phase
 from egis_agentkit.client.nacos._settings import (
     ProjectChangesConfig,
     ProjectContextConfig,
@@ -549,12 +550,13 @@ class ProjectFileManager:
         try:
             async for event in next_handler(**input_kwargs):
                 if isinstance(event, ReplyEndEvent):
-                    await self.finalize_reply(
-                        scope.user_id,
-                        scope.project_id,
-                        scope.session_id,
-                        event.reply_id,
-                    )
+                    with trace_phase("artifacts.finalize"):
+                        await self.finalize_reply(
+                            scope.user_id,
+                            scope.project_id,
+                            scope.session_id,
+                            event.reply_id,
+                        )
                 yield event
         finally:
             await self.observe_safe(scope.user_id, scope.project_id)

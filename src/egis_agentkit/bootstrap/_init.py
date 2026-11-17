@@ -25,6 +25,9 @@ from egis_agentkit.client.nacos._config import LivePolicies
 from egis_agentkit.client.sandbox import SandboxClient
 from egis_agentkit.core.agent._expert_definition import ExpertDefinition
 from egis_agentkit.core.agent._remote_definition import RemoteDefinition
+from egis_agentkit.middleware.agent._personal_memory_middleware_override import (
+    PersonalMemoryMiddlewareOverride,
+)
 from egis_agentkit.middleware.workspace._workspace_read_guard_middleware_impl import (
     ReadToolGuardMiddleware,
 )
@@ -160,7 +163,8 @@ def init_agentkit(
     database_url = postgres_url(postgres)
     storage = AgentKitStorage(database_url, engine)
     native_storage = SessionExecutionStorage(database_url, engine)
-    bus = SessionMessageBus(engine=engine, kafka=snapshot.client.kafka)
+    tracing = TracingClient(snapshot.client.tracing)
+    bus = SessionMessageBus(engine=engine, kafka=snapshot.client.kafka, tracing=tracing)
     remote_agents = RemoteAgentService(storage.remote_runs, bus, config=config)
     root = Path(workspace.runtime.root)
     policies = LivePolicies(config)
@@ -176,7 +180,9 @@ def init_agentkit(
     )
     models = ModelService(storage, config)
     memory = (
-        PersonalMemoryService(storage, root, config)
+        PersonalMemoryService(
+            storage, root, config, middleware_factory=PersonalMemoryMiddlewareOverride
+        )
         if snapshot.agent.personal.memory.is_enabled
         else None
     )
@@ -273,5 +279,5 @@ def init_agentkit(
         _memory=memory,
         _owns_engine=owns_engine,
         _logging=LoggingClient(snapshot.logging),
-        _tracing=TracingClient(snapshot.client.tracing),
+        _tracing=tracing,
     )

@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from pathlib import Path
 
+from egis_agentkit.client._tracing import annotate_runtime, trace_phase
 from egis_agentkit.core.session._context import (
     SessionExecutionContext,
     session_execution_context,
@@ -53,9 +54,8 @@ class SessionPreparationService:
             else ProjectManager(storage, workspace_root)
         )
 
-    @asynccontextmanager
-    async def bind(self, session_id):
-        """从会话引用重建执行上下文，结束时释放上下文变量。"""
+    async def _prepare(self, session_id):
+        """加载身份与固定定义，校验实时授权并装配本次执行上下文。"""
         locator = await self.storage.locate_session(session_id)
         if locator is None:
             raise NotFound("会话不存在")
@@ -123,8 +123,34 @@ class SessionPreparationService:
             if definition["agent_type"] == "personal"
             else None,
         )
-        async with projects.guard(user, project["id"]):
-            await asyncio.to_thread(projects.initialize_files, user_id, project["id"])
+        return scope, user
+
+    @asynccontextmanager
+    async def bind(self, session_id):
+        """分别观察准备与项目目录阶段，整个执行期间保留原有上下文与项目保护。"""
+        # 1. 准备阶段只计身份、定义和授权装配，不把整个回复算作准备时间。
+        with trace_phase("session.prepare"):
+            scope, user = await self._prepare(session_id)
+        annotate_runtime(
+            attributes={
+                "user.id": scope.user_id,
+                "agentkit.agent.id": scope.agent_id,
+                "agentkit.project.id": scope.project_id,
+                "agentkit.agent.type": scope.definition["agent_type"],
+                "agentkit.definition.id": scope.definition["id"],
+                **(
+                    {"agentkit.team.id": scope.session_record.team_id}
+                    if scope.session_record.team_id
+                    else {}
+                ),
+            }
+        )
+        # 2. 复用原项目保护，补齐目录后才开放执行；退出、失败和取消均恢复上下文。
+        async with self.projects.guard(user, scope.project_id):
+            with trace_phase("project.prepare"):
+                await asyncio.to_thread(
+                    self.projects.initialize_files, scope.user_id, scope.project_id
+                )
             token = session_execution_context.set(scope)
             try:
                 yield scope

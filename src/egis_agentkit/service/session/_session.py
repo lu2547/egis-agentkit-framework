@@ -14,6 +14,7 @@ from agentscope.app.storage._utils import _resolve_team_leader
 from agentscope.event import ReplyEndEvent, ReplyFinishedReason
 from agentscope.permission import PermissionMode
 
+from egis_agentkit.client._tracing import mark_runtime_error, trace_phase
 from egis_agentkit.client.nacos._settings import (
     SessionBranchConfig,
     SessionListingConfig,
@@ -662,7 +663,8 @@ class SessionService:
         if resources is None or resources.tool_registry is None:
             return []
         user = await users.get(user_id)
-        return await resources.tool_registry.resolve(user, scope)
+        with trace_phase("tools.prepare"):
+            return await resources.tool_registry.resolve(user, scope)
 
     async def on_workspace_reply(
         self, manager, workspace, handler, agent, input_kwargs, next_handler
@@ -682,9 +684,12 @@ class SessionService:
                 async for event in handler(agent, input_kwargs, next_handler):
                     if isinstance(event, ReplyEndEvent):
                         reason = ReplyFinishedReason(event.finished_reason).value
+                        if reason == ReplyFinishedReason.ERROR.value:
+                            mark_runtime_error("ReplyError")
                     yield event
         except Exception as exc:
             reason = "error"
+            mark_runtime_error(type(exc).__name__)
             logger.error(
                 "reply.failed",
                 extra={

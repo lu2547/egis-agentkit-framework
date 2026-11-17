@@ -4,6 +4,8 @@
 - 原生 TracingMiddleware 负责创建 span，本模块只配置导出、采样和批处理。
 - 复用已有 SDK provider，只关闭本客户端创建的 processor 与 exporter。
 - 导出副本携带 Phoenix 项目资源，不修改宿主 provider 或其他导出器的数据。
+- span / trace_phase 为真实运行和阶段提供安全上下文，运行根以 Link 关联触发请求。
+- annotate_runtime / mark_runtime_error 补充身份与终态；HTTP Span 分项目存放。
 """
 
 from __future__ import annotations
@@ -12,22 +14,89 @@ import asyncio
 import logging
 import threading
 from concurrent.futures import Future
+from contextlib import contextmanager
+from contextvars import ContextVar
 from weakref import WeakKeyDictionary
 
 from opentelemetry import trace
+from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased, TraceIdRatioBased
+from opentelemetry.trace import Link, Span, StatusCode
 
 from egis_agentkit.client.nacos._settings import TracingConfig
 
 logger = logging.getLogger(__name__)
 _provider_lock = threading.Lock()
+_runtime_root: ContextVar[Span | None] = ContextVar(
+    "agentkit_runtime_trace", default=None
+)
 _dispatchers: WeakKeyDictionary[TracerProvider, _DispatchProcessor] = (
     WeakKeyDictionary()
 )
+
+
+def annotate_runtime(*, name=None, attributes=None):
+    """补充运行身份；只更新当前任务的运行根，不修改其他请求的 Trace。"""
+    span = _runtime_root.get()
+    if span is not None:
+        if name is not None:
+            span.update_name(name)
+        if attributes:
+            span.set_attributes(attributes)
+
+
+def mark_runtime_error(error_type, *, session_id=None):
+    """原生流程已捕获错误时，仍把安全错误类别记到运行根。"""
+    span = _runtime_root.get()
+    if span is not None and span.is_recording():
+        if session_id is not None and span.attributes.get("session.id") != session_id:
+            return
+        span.set_attribute("error.type", error_type)
+        span.set_status(StatusCode.ERROR)
+
+
+@contextmanager
+def _phase_span(name, attributes=None, *, root=False, required=True):
+    """创建有界阶段，异常仅记录类别，避免上游错误文本泄漏凭据。"""
+    parent = trace.get_current_span().get_span_context()
+    links = [Link(parent)] if root and parent.is_valid else []
+    with trace.get_tracer("egis_agentkit").start_as_current_span(
+        name,
+        context=Context() if root else None,
+        links=links,
+        attributes={"openinference.span.kind": "CHAIN", **(attributes or {})},
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
+        token = _runtime_root.set(span) if root else None
+        try:
+            yield span
+        except BaseException as exc:
+            span.set_attribute("error.type", type(exc).__name__)
+            span.set_status(StatusCode.ERROR)
+            if required:
+                mark_runtime_error(type(exc).__name__)
+            raise
+        else:
+            if span.is_recording() and span.status.status_code != StatusCode.ERROR:
+                span.set_status(StatusCode.OK)
+        finally:
+            if token is not None:
+                _runtime_root.reset(token)
+
+
+@contextmanager
+def trace_phase(name, attributes=None, *, required=True):
+    """在已启用的运行根内记录阶段；管理请求及关闭 tracing 时不产生额外 Span。"""
+    if _runtime_root.get() is None:
+        yield trace.INVALID_SPAN
+        return
+    with _phase_span(name, attributes, required=required) as span:
+        yield span
 
 
 class _ExportProcessor(SpanProcessor):
@@ -44,6 +113,16 @@ class _ExportProcessor(SpanProcessor):
                 "openinference.project.name": settings.project_name,
             }
         )
+        self._http_resource = (
+            Resource(
+                {
+                    "service.name": settings.service_name,
+                    "openinference.project.name": settings.http_project_name,
+                }
+            )
+            if settings.http_project_name is not None
+            else None
+        )
 
     def on_end(self, span: ReadableSpan) -> None:
         batch = self._batch
@@ -53,11 +132,25 @@ class _ExportProcessor(SpanProcessor):
         decision = self._sampler.should_sample(None, span.context.trace_id, span.name)
         if not decision.decision.is_sampled():
             return
+        # 页面轮询与接口内部 Span 单列项目，保留排查入口并避免淹没 Agent 运行记录。
+        scope = span.instrumentation_scope.name if span.instrumentation_scope else ""
+        is_http = (
+            "http.route" in (span.attributes or {})
+            or span.name.startswith("fastapi.")
+            or scope
+            in {
+                "opentelemetry.instrumentation.fastapi",
+                "opentelemetry.instrumentation.asgi",
+            }
+        )
+        if is_http and self._http_resource is None:
+            return
+        resource = self._http_resource if is_http else self._resource
         exported = ReadableSpan(
             name=span.name,
             context=span.context,
             parent=span.parent,
-            resource=span.resource.merge(self._resource),
+            resource=span.resource.merge(resource),
             attributes=span.attributes,
             events=span.events,
             links=span.links,
@@ -132,6 +225,20 @@ class TracingClient:
         self._processor: _ExportProcessor | None = None
         self._dispatcher: _DispatchProcessor | None = None
         self._closing_futures: set[Future[None]] = set()
+
+    @contextmanager
+    def span(self, name, *, attributes=None, root=False):
+        """为真实运行入口建立独立根并链接请求；阶段共用同一 Trace。"""
+        if not self.settings.enabled:
+            token = _runtime_root.set(None) if root else None
+            try:
+                yield trace.INVALID_SPAN
+            finally:
+                if token is not None:
+                    _runtime_root.reset(token)
+            return
+        with _phase_span(name, attributes, root=root) as span:
+            yield span
 
     def start(self) -> None:
         """启用时才配置 SDK；已有 provider 的采样和资源保持原状。"""

@@ -1,5 +1,6 @@
 """覆盖原生 Agent 和 Session 读取，提供锁内已解析的配置。"""
 
+from egis_agentkit.client._tracing import trace_phase
 from egis_agentkit.core.session._context import (
     build_agent_record,
     session_execution_context,
@@ -32,3 +33,10 @@ class SessionExecutionStorage(AgentKitStorage):
         ):
             return build_agent_record(record, scope)
         return record
+
+    async def update_session_state(self, user_id, agent_id, session_id, state):
+        """观察运行收尾的状态持久化，SQL 与事务仍由父类执行。"""
+        with trace_phase("session.persist"):
+            return await super().update_session_state(
+                user_id, agent_id, session_id, state
+            )

@@ -30,8 +30,151 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
 from opentelemetry.util._once import Once
 
+from egis_agentkit.client import _tracing
 from egis_agentkit.client._tracing import TracingClient
 from egis_agentkit.client.nacos._settings import TracingConfig
+
+
+async def test_runtime_root_links_request_and_keeps_native_model_tool_tree(monkeypatch):
+    exporter = memory_export(monkeypatch)
+    client = TracingClient(TracingConfig(enabled=True))
+    client.start()
+    tracer = trace.get_tracer("http-test")
+    try:
+        with tracer.start_as_current_span(
+            "POST /chat/", attributes={"http.route": "/chat/"}
+        ) as request:
+            request_id = request.get_span_context().trace_id
+            with client.span(
+                "session.operation", root=True, attributes={"session.id": "session-one"}
+            ) as run:
+                with _tracing.trace_phase("session.prepare"):
+                    pass
+                agent = Agent(
+                    name="runtime-agent",
+                    system_prompt="test",
+                    model=StreamModel(),
+                    toolkit=Toolkit(tools=[Weather()]),
+                    middlewares=[TracingMiddleware()],
+                )
+                async for _ in agent.reply_stream(
+                    UserMsg(name="user", content="上海天气")
+                ):
+                    pass
+                run_id = run.get_span_context().trace_id
+    finally:
+        await client.aclose()
+    spans = exporter.get_finished_spans()
+    run = next(s for s in spans if s.name == "session.operation")
+    assert run.parent is None and run.context.trace_id != request_id
+    assert run.links[0].context.trace_id == request_id
+    phase = next(s for s in spans if s.name == "session.prepare")
+    reply = next(s for s in spans if s.name == "invoke_agent runtime-agent")
+    assert phase.parent.span_id == reply.parent.span_id == run.context.span_id
+    assert all(s.context.trace_id == run_id for s in spans if s.name != "POST /chat/")
+    http = next(s for s in spans if s.name == "POST /chat/")
+    assert (
+        http.resource.attributes["openinference.project.name"] == "egis-agentkit-http"
+    )
+    assert reply.resource.attributes["openinference.project.name"] == "egis-agentkit"
+
+
+async def test_runtime_phase_failure_is_safe_and_context_is_released(monkeypatch):
+    exporter = memory_export(monkeypatch)
+    client = TracingClient(TracingConfig(enabled=True))
+    client.start()
+    try:
+        with client.span("session.operation", root=True):
+            with pytest.raises(ValueError):
+                with _tracing.trace_phase("resources.prepare"):
+                    raise ValueError("must-not-export-this-password")
+        with _tracing.trace_phase("outside-run"):
+            pass
+    finally:
+        await client.aclose()
+    spans = exporter.get_finished_spans()
+    assert {s.name for s in spans} == {"session.operation", "resources.prepare"}
+    assert all(s.status.status_code.name == "ERROR" for s in spans)
+    assert all(not s.events for s in spans)
+    assert "must-not-export-this-password" not in repr(
+        [dict(s.attributes) for s in spans]
+    )
+
+
+async def test_disabled_runtime_does_not_create_spans(monkeypatch):
+    exporter = memory_export(monkeypatch)
+    client = TracingClient(TracingConfig(enabled=False))
+    client.start()
+    with client.span("session.operation", root=True):
+        with _tracing.trace_phase("session.prepare"):
+            pass
+    await client.aclose()
+    assert not exporter.get_finished_spans()
+
+
+async def test_http_project_can_be_disabled_without_dropping_runtime(monkeypatch):
+    exporter = memory_export(monkeypatch)
+    client = TracingClient(TracingConfig(enabled=True, http_project_name=None))
+    client.start()
+    try:
+        with trace.get_tracer("http-test").start_as_current_span("fastapi.endpoint"):
+            pass
+        with client.span("chat.run", root=True):
+            pass
+    finally:
+        await client.aclose()
+    assert [span.name for span in exporter.get_finished_spans()] == ["chat.run"]
+
+
+async def test_standard_asgi_child_spans_follow_http_project(monkeypatch):
+    exporter = memory_export(monkeypatch)
+    client = TracingClient(TracingConfig(enabled=True))
+    client.start()
+    try:
+        tracer = trace.get_tracer("opentelemetry.instrumentation.asgi")
+        with tracer.start_as_current_span("GET /sessions http send"):
+            pass
+    finally:
+        await client.aclose()
+    assert (
+        exporter.get_finished_spans()[0].resource.attributes[
+            "openinference.project.name"
+        ]
+        == "egis-agentkit-http"
+    )
+
+
+async def test_memory_job_has_its_own_phase_and_does_not_fail_successful_reply(
+    monkeypatch,
+):
+    from agentscope.middleware import ReMeMiddleware
+
+    from egis_agentkit.middleware.agent._personal_memory_middleware_override import (
+        PersonalMemoryMiddlewareOverride,
+    )
+
+    async def job(self, name, **kwargs):
+        if name == "auto_memory":
+            raise RuntimeError("private-memory-response")
+        return kwargs["query"]
+
+    monkeypatch.setattr(ReMeMiddleware, "_run_job", job)
+    exporter = memory_export(monkeypatch)
+    client = TracingClient(TracingConfig(enabled=True))
+    client.start()
+    memory = PersonalMemoryMiddlewareOverride()
+    try:
+        with client.span("chat.run", root=True):
+            assert await memory._run_job("search", query="test query") == "test query"
+            with pytest.raises(RuntimeError):
+                await memory._run_job("auto_memory")
+    finally:
+        await client.aclose()
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    assert set(spans) == {"chat.run", "memory.search", "memory.auto_memory"}
+    assert spans["chat.run"].status.status_code.name == "OK"
+    assert spans["memory.auto_memory"].status.status_code.name == "ERROR"
+    assert not spans["memory.auto_memory"].events
 
 
 @pytest.fixture(autouse=True)
