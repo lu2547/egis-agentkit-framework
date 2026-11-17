@@ -88,7 +88,8 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
         self._skill_publication_lock = asyncio.Lock()
         self._bootstrap_cmd_timeout = settings.bootstrap_timeout_seconds
         self.client = client
-        self.workdir = settings.workdir
+        # Workspace 根目录属于用户；Nacos 只提供 NAS 基础路径，不单独配置通用 workdir。
+        self.workdir = str(files.user_root(user_id))
         self._gateway_home = settings.gateway_home
         self.gateway_port = settings.gateway_port
         super().__init__(workspace_id=logical_id)

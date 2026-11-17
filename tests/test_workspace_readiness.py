@@ -44,7 +44,6 @@ async def workspace_at(tmp_path, monkeypatch):
             runtime_commands=[[sys.executable, "-c", "import sys"]],
         ),
         settings=SandboxWorkspaceConfig(
-            workdir=str(tmp_path / "runtime"),
             gateway_home=str(tmp_path / "gateway"),
         ),
     )

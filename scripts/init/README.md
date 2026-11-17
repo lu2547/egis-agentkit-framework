@@ -109,7 +109,7 @@ python scripts/init/nacos.py --file "$HOME/.config/agentkit/agentkit.yaml"
 | YAML 字段 | 初始化参数或平台提供内容 |
 | --- | --- |
 | `revision` | 首次配置版本，模板为 1 |
-| `workspace.runtime.root` | 唯一的 NAS 根目录，与 `NAS_ROOT` 一致；API 与沙箱执行宿主机使用相同路径 |
+| `workspace.runtime.root` | 唯一的 NAS 根目录，与 `NAS_ROOT` 一致；`workdir` 自动派生为该根目录下的 `user/{uid}`，不单独配置 |
 | `skill.storage.root` | `SKILL_STORAGE_ROOT` |
 | `workspace.runtime.mode` | 固定为 `pks` |
 | `workspace.runtime.sandbox` | 沙箱服务地址、镜像、凭据引用及执行参数；公司 Client 由接入方注入 |

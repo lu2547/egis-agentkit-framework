@@ -329,7 +329,6 @@ class SandboxWorkspaceConfig(ConfigModel):
     gateway_port: Annotated[int, Field(strict=True, ge=1, le=65535)] = 5600
     gateway_tmp_dir: NonEmptyString = "/dev/shm"
     gateway_home: NonEmptyString = "/root/.agentscope"
-    workdir: NonEmptyString = "/workspace"
     instructions: str = "当前执行环境为企业沙箱，工作根目录：{workdir}。"
     bootstrap_commands: list[str] = Field(
         default_factory=lambda: [
@@ -360,7 +359,7 @@ class SandboxWorkspaceConfig(ConfigModel):
             raise ValueError("沙箱续期间隔必须小于实例有效期")
         return self
 
-    @field_validator("workdir", "gateway_home", "gateway_tmp_dir")
+    @field_validator("gateway_home", "gateway_tmp_dir")
     @classmethod
     def validate_absolute_directory(cls, value):
         path = PurePosixPath(value)

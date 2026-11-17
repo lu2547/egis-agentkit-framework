@@ -56,10 +56,12 @@ async def test_workspace_initializes_user_mount_sources_without_creating_project
     workspace = EgisSandboxWorkspace(
         user_id="alice", agent_id="agent", project_id="project", session_id="session",
         files=ProjectFileStorage(tmp_path), client=TestSandboxClient(),
-        settings=SandboxWorkspaceConfig(workdir=str(tmp_path / "runtime")),
+        settings=SandboxWorkspaceConfig(),
     )
     try:
         await workspace.initialize()
+        assert workspace.workdir == str(tmp_path / "user/alice")
+        assert str(tmp_path / "user/alice") in await workspace.get_instructions()
         for mount in workspace.build_mounts():
             if mount.name.startswith("user-"):
                 assert Path(mount.source).is_dir()

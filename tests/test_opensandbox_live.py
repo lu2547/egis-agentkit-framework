@@ -60,6 +60,8 @@ async def test_user_standard_directories_persist_on_nas_across_sandbox_recreatio
     try:
         first = await initialize("writer", "one")
         runtime = Path(first.workdir)
+        assert runtime == root / "user" / user_id
+        assert not (files.user_root(user_id) / "sessions").exists()
         for name, target in (("data", "data"), ("skills", "skills"), ("session", "sessions"), ("mcp", "mcp")):
             await first.get_backend().write_file(str(runtime / target / "keep.txt"), name.encode())
             source = files.user_root(user_id) / name
@@ -202,7 +204,7 @@ async def test_real_docker_tools_gateway_skills_and_resume(monkeypatch):
                 agent_id="agent",
                 checksum="a" * 64,
             )
-            assert published.dir.startswith("/workspace/skills/agent/")
+            assert published.dir.startswith(str(root / "user/sandbox-test/skills/agent") + "/")
             assert (
                 await backend.read_file(published.dir + "/SKILL.md")
                 == b"# Selected skill"

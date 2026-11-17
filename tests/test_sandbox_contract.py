@@ -41,7 +41,6 @@ def build_manager(tmp_path, *, client_factory):
     from egis_agentkit.service.workspace._egis_sandbox_manager import EgisSandboxManager
 
     settings = SandboxWorkspaceConfig(
-        workdir=str(tmp_path / "runtime"),
         gateway_home=str(tmp_path / "gateway"),
     )
     from runtime_helpers import workspace_dependencies
@@ -165,7 +164,6 @@ async def test_pks_injected_client_needs_no_opensandbox_credentials(
                     "root": str(tmp_path),
                     "mode": "pks",
                     "sandbox": {
-                        "workdir": str(tmp_path / "runtime"),
                         "gatewayHome": str(tmp_path / "gateway"),
                     },
                 },

@@ -91,6 +91,8 @@ async def test_native_manager_reuses_workspace_and_rejects_cross_user_binding(
         )
         assert isolated is not first
         assert isolated.egis_user_id == "bob"
+        assert first.workdir == str(tmp_path / "app/user/alice")
+        assert isolated.workdir == str(tmp_path / "app/user/bob")
 
 
 @pytest.mark.asyncio
@@ -111,12 +113,13 @@ async def test_project_mounts_expose_only_current_project_and_protect_inputs(
             for mount in mounts
         }
         target = tmp_path / "app/user/alice/projects/project"
+        user_root = target.parents[1]
         binding = workspace.runtime_binding_id
         assert sources == {
-            "user-data": (str(target.parents[1] / "data"), "/workspace/data", False),
-            "user-skills": (str(target.parents[1] / "skills" / binding), "/workspace/skills", False),
-            "user-session": (str(target.parents[1] / "session" / binding), "/workspace/sessions", False),
-            "user-mcp": (str(target.parents[1] / "mcp" / binding), "/workspace/mcp", False),
+            "user-data": (str(user_root / "data"), str(user_root / "data"), False),
+            "user-skills": (str(user_root / "skills" / binding), str(user_root / "skills"), False),
+            "user-session": (str(user_root / "session" / binding), str(user_root / "sessions"), False),
+            "user-mcp": (str(user_root / "mcp" / binding), str(user_root / "mcp"), False),
             "project-inputs": (str(target), str(target), True),
             "project-work": (str(target / ".work"), str(target / ".work"), False),
             "project-artifacts": (
