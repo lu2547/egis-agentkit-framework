@@ -4,6 +4,7 @@
 - acquire_lock 在原生锁内调用会话准备 Service，失败交原生运行错误处理。
 - subscribe 传递订阅就绪通知，不缓存或重排 SSE 事件。
 - publish 观察原生失败终态，保持原消息及传输方式不变。
+- publish 记录用户引导的原生接收确认，供消息历史恢复状态。
 """
 
 from contextlib import AsyncExitStack, aclosing, asynccontextmanager, nullcontext
@@ -17,6 +18,7 @@ from egis_agentkit.core.session._context import (
     session_setup_error,
     stream_subscription_ready,
 )
+from egis_agentkit.core.session._steering import STEERING_SOURCE
 from egis_agentkit.errors import AgentKitError
 from egis_agentkit.service.session._preparation import SessionPreparationService
 
@@ -25,6 +27,7 @@ class SessionMessageBus(EgisMessageBus):
     """Delegate native bus primitives; add only the session-lock scope."""
 
     coordinator: SessionPreparationService | None = None
+    steering = None
 
     def __init__(self, *, tracing=None, **kwargs):
         """复用原生总线构造；Tracing 只观察锁及运行，不改变消息或租约协议。"""
@@ -33,6 +36,16 @@ class SessionMessageBus(EgisMessageBus):
 
     async def publish(self, key, payload):
         """观察原生失败终态；异常被 ChatService 捕获时，运行根仍保留错误状态。"""
+        if (
+            self.steering is not None
+            and key.startswith(MessageBusKeys.session_events(""))
+            and isinstance(payload, dict)
+            and payload.get("type") == EventType.HINT_BLOCK
+            and payload.get("source") == STEERING_SOURCE
+        ):
+            await self.steering.received(
+                key[len(MessageBusKeys.session_events("")) :], payload["block_id"]
+            )
         if (
             key.startswith(MessageBusKeys.session_events(""))
             and isinstance(payload, dict)

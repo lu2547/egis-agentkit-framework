@@ -50,6 +50,8 @@ from egis_agentkit.storage.model._definition import (
 )
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
+from ._steering import SessionSteeringService
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,6 +69,7 @@ class SessionService:
         personal=None,
     ):
         self.storage = storage
+        self.steering = SessionSteeringService(self, storage, config_provider)
         self.files = ProjectFileStorage(Path(workspace_root))
         self.models, self.config = models, config_provider
         self.personal = personal or PersonalManager(

@@ -157,6 +157,11 @@ class PostgresTransaction:
         """让存储对象复用已有事务连接，不重复借用或提交。"""
         yield self.connection()
 
+    @asynccontextmanager
+    async def begin(self):
+        """让组合存储复用外层事务；提交和回滚始终由最外层持有者负责。"""
+        yield self.connection()
+
 
 def transaction_connection(
     source: AsyncEngine | PostgresTransaction, connection: AsyncConnection | None

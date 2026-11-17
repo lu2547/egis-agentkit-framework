@@ -21,6 +21,10 @@ Phoenix 的运行主项目默认 `egis-agentkit`，以 `chat.run` 为根记录�
 
 App 通过具名 `AgentKitServices` 调用业务服务。聊天循环、团队通信、消息事件、HITL、SSE 和模型调用继续使用 AgentScope。
 
+运行中引导复用 `POST /chat/`：请求带 `delivery: "steer"`，`input` 接收一条原生用户 Msg 或有序的 Msg 数组。每条 Msg 使用稳定的 `id`，重试时复用同一 ID 和内容；冲突复用返回 409。普通聊天省略 delivery，审批事件沿用原协议。引导不取消当前模型或工具调用；原生 InboxMiddleware 在下一次 reasoning 前接收，等待审批时先保留，恢复后接收。SSE `HINT_BLOCK.block_id` 对应引导消息 ID，表示已加入模型上下文。
+
+集群模式使用现有 `messages` 和 PG Inbox，在同一事务内保存用户记录与队列内容；没有新增表或 Topic。`agentkit.session.steering` 配置 `maxBatchSize`、`maxMessageBytes`、`maxTextLength`、`wakeupRetrySeconds`，输入区通过 `/manager/runtime-options` 读取。standalone 继续使用原生内存总线，其队列不跨进程重启保留。
+
 长回复重放：企业消息总线保留尚未被消息检查点覆盖的完整事件，下一条回复开始时清理已落库的前缀。不能按固定 1000 条裁掉正在生成的回复开头。当前同时依赖仓库内 AgentScope 会话 SSE 路由的分页修复（`app/_router/_session.py`），重放读完所有页后才切到实时订阅；发布时需一并构建这份依赖，不能替换成未包含修复的同名发行包。通过 `tests/test_session_replay.py` 验证超过单页长度的重放与 PostgreSQL 保留规则。
 
 专家定义可以绑定已授权的 Skill、MCP 和平台工具。第三方专家通过 HTTP 或 WebSocket 执行。

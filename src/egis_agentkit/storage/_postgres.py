@@ -15,6 +15,7 @@ from ._resource import MCPCredentialStorage, ResourceAssetStorage
 from ._schema import init_schema
 from ._session import SessionStorage
 from ._session_feedback import SessionFeedbackStorage
+from ._session_steering import SessionSteeringStorage
 from ._skill_import import SkillImportStorage
 from ._user import UserStorage
 from .agent._resource import PersonalResourceStorage
@@ -80,6 +81,7 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
         self.projects = ProjectStorage(engine)
         self.sessions = SessionStorage(engine, self)
         self.session_feedback = SessionFeedbackStorage(engine)
+        self.session_steering = SessionSteeringStorage(engine)
         self.project_files = ProjectFileRecordStorage(engine)
         super().__init__(url, engine=engine, create_tables=False)
 

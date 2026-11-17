@@ -214,6 +214,13 @@ class SessionBranchConfig(ConfigModel):
     name_suffix: NonEmptyString = " · 分支"
 
 
+class SessionSteeringConfig(ConfigModel):
+    max_batch_size: PositiveInt = 20
+    max_message_bytes: PositiveInt = 1_048_576
+    max_text_length: PositiveInt = 32_000
+    wakeup_retry_seconds: Seconds = 60
+
+
 class SessionConfig(ConfigModel):
     permissions: SessionPermissionsConfig = Field(
         default_factory=SessionPermissionsConfig
@@ -223,6 +230,7 @@ class SessionConfig(ConfigModel):
     naming: SessionNamingConfig = Field(default_factory=SessionNamingConfig)
     feedback: SessionFeedbackConfig = Field(default_factory=SessionFeedbackConfig)
     branch: SessionBranchConfig = Field(default_factory=SessionBranchConfig)
+    steering: SessionSteeringConfig = Field(default_factory=SessionSteeringConfig)
 
 
 class SkillArchiveConfig(ConfigModel):

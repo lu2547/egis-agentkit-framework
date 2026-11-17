@@ -210,6 +210,7 @@ def init_agentkit(
     tasks = SessionService(
         storage, root, models, config, projects=projects, personal=personal
     )
+    bus.steering = tasks.steering
     bus.coordinator = SessionPreparationService(
         storage,
         root,

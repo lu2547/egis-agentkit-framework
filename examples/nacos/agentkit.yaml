@@ -59,6 +59,11 @@ agentkit:
       maxRetryDelaySeconds: 60.0
       listLimit: 100
   session:
+    steering:
+      maxBatchSize: 20
+      maxMessageBytes: 1048576
+      maxTextLength: 32000
+      wakeupRetrySeconds: 60
     permissions:
       defaultMode: bypass
       allowedModes:
