@@ -47,7 +47,7 @@ async def test_import_enqueue_is_durable_owner_only_and_registration_is_deferred
     assert "archive_location" not in job
     async with storage.engine.connect() as conn:
         location = await conn.scalar(select(t.skill_imports.c.archive_location))
-    assert resources.skill_archives.read_archive(location) == uploaded
+    assert queue.uploads.read(job["job_id"], location) == uploaded
     with pytest.raises(NotFound):
         await queue.get(bob, job["job_id"])
     assert await queue.list(bob) == []
@@ -101,7 +101,7 @@ async def test_import_claim_fencing_recovery_and_retry_without_duplicate_asset(
             t.skill_imports.update().values(
                 status="queued",
                 result=None,
-                archive_location=storage.skill_archives.write_archive(bundle()),
+                archive_location=first.uploads.write(job["job_id"], bundle()),
             )
         )
     await first.run_once()
@@ -336,3 +336,135 @@ async def test_skill_import_and_edit_yaml_processing_stays_off_event_loop(
         },
     )
     assert observed == {"parse"}
+
+
+@pytest.mark.asyncio
+async def test_failed_nas_upload_does_not_enqueue_job(storage, tmp_path, monkeypatch):
+    from egis_agentkit.service.resource._skill_import import SkillImportService
+
+    _, _, alice, _ = await identities(storage)
+    resources = ResourceService(storage, tmp_path)
+    queue = SkillImportService(storage, resources)
+
+    def fail(*args):
+        raise OSError("NAS unavailable")
+
+    monkeypatch.setattr(queue.uploads, "write", fail)
+    with pytest.raises(OSError, match="NAS unavailable"):
+        await queue.enqueue(alice, io.BytesIO(bundle()), filename="test.zip")
+    assert await queue.list(alice) == []
+
+
+@pytest.mark.asyncio
+async def test_virtual_user_bearer_import_review_and_publication(storage, tmp_path):
+    from types import SimpleNamespace
+
+    from egis_agentkit_app.controller.resource._resource import router
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from egis_agentkit.middleware.http._http_identity_middleware_impl import (
+        IdentityGuard,
+    )
+    from egis_agentkit.service.resource._skill_import import SkillImportService
+
+    _, admin, _, _ = await identities(storage)
+    resources = ResourceService(storage, tmp_path)
+    queue = SkillImportService(storage, resources)
+    account = await queue.virtual_users.create(admin, "external catalog")
+    app = FastAPI()
+    app.state.egis_services = SimpleNamespace(
+        virtual_users=queue.virtual_users, skill_imports=queue, resources=resources
+    )
+    app.include_router(router, prefix="/manager")
+    app.add_middleware(IdentityGuard, identity=None, services=app.state.egis_services)
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": "Bearer " + account["token"]},
+    ) as client:
+        assert (await client.get("/manager/skills/imports")).status_code == 200
+        assert (await client.get("/manager/skills")).status_code == 403
+        content = bundle()
+        uploaded = await client.post(
+            "/manager/skills/imports", files={"file": ("test.zip", content)}
+        )
+        assert uploaded.status_code == 202, uploaded.text
+        job = uploaded.json()
+        assert job["owner_type"] == "system" and job["uploader_type"] == "virtual"
+        assert await queue.run_once()
+        pending = await queue.list_reviews(admin)
+        assert [row["uploaded_by"] for row in pending] == [account["user_id"]]
+        assert await queue.download_review(admin, job["job_id"]) == (
+            "test.zip",
+            content,
+        )
+        assert not await storage.assets.list_versions("skill")
+        assert (
+            await queue.decide_batch(
+                admin, [job["job_id"], "0" * 32], approved=True, reason=""
+            )
+        ) == [
+            {"id": job["job_id"], "ok": True},
+            {"id": "0" * 32, "ok": False, "detail": "技能导入不在待审批状态"},
+        ]
+        assert await queue.run_once()
+        finished = (await client.get(f"/manager/skills/imports/{job['job_id']}")).json()
+        assert finished["status"] == "succeeded"
+        assert finished["reviewed_by"] == admin.user_id
+        (asset,) = await storage.assets.list_versions("skill")
+        assert asset["owner_type"] == "system" and asset["owner_id"] == "system"
+        assert asset["created_by"] == account["user_id"]
+        assert asset["payload"]["uploader_type"] == "virtual"
+        assert not (queue.uploads.incoming / (job["job_id"] + ".zip")).exists()
+        await queue.virtual_users.rotate(admin, account["user_id"])
+        assert (await client.get("/manager/skills/imports")).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_development_skill_reset_keeps_other_records(storage, tmp_path):
+    from test_domain import expert
+
+    from egis_agentkit.service.agent._agent_manager import AgentManager
+    from egis_agentkit.service.resource._skill_import import SkillImportService
+    from egis_agentkit.storage import tables as t
+    from egis_agentkit.storage._skill_reset import reset_skills
+
+    _, _, alice, _ = await identities(storage)
+    resources = ResourceService(storage, tmp_path)
+    queue = SkillImportService(storage, resources)
+    skill = await resources.upload_skill(alice, bundle())
+    definition = expert()
+    definition.payload["bindings"] = [
+        {
+            "resource_type": "skill",
+            "resource_id": skill["resource_id"],
+            "resource_version": skill["resource_version"],
+            "resource_view_type": "private",
+        }
+    ]
+    saved = await AgentManager(storage).add_definition(alice, definition)
+    await queue.enqueue(alice, io.BytesIO(bundle()), filename="queued.zip")
+    uploads = queue.uploads.root
+    (uploads / "old.zip").write_bytes(bundle())
+    project = tmp_path / "user" / alice.user_id / "projects" / "demo"
+    project.mkdir(parents=True)
+    (project / "source.md").write_text("keep")
+    database = storage.engine.url.database
+    preview = await reset_skills(storage.engine, tmp_path, uploads, database=database)
+    assert preview.tables["ak_resource_assets"] == "1 条"
+    assert preview.tables["ak_agent_definition_detail"] == "1 条"
+    assert (uploads / "old.zip").exists()
+    assert await storage.assets.get("skill", skill["resource_id"], "1.2.3")
+    await reset_skills(storage.engine, tmp_path, uploads, database=database, apply=True)
+    assert not await storage.assets.list_versions("skill")
+    remaining = await storage.get_definition(saved["id"])
+    assert remaining["payload"]["bindings"] == []
+    assert remaining["payload"]["system_prompt"] == "旧版"
+    assert await queue.list(alice) == []
+    assert await storage.get_user(alice.user_id)
+    assert (project / "source.md").read_text() == "keep"
+    assert not uploads.exists()
+    assert not (tmp_path / "user" / alice.user_id / "skills").exists()
+    async with storage.engine.connect() as conn:
+        assert await conn.scalar(select(t.skill_imports.c.owner_type)) is None

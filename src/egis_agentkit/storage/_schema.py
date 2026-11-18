@@ -13,6 +13,7 @@ from sqlalchemy import inspect, text
 from ._message_bus import rename_bus_tables
 from .migration._agent import RENAMES as AGENT_RENAMES
 from .migration._agent import agent_tables, migrate_agent_storage
+from .migration._connectors import CONNECTOR_ASSET_TABLE, migrate_connectors
 from .migration._personal_resources import migrate_personal_resources
 from .migration._project import (
     TABLE_SOURCES,
@@ -20,8 +21,6 @@ from .migration._project import (
     migrate_session_workspaces,
 )
 from .migration._sequences import repair_sequences
-from .migration._skill_archives import LEGACY_SKILL_ARCHIVES, migrate_skill_archives
-from .migration._skill_imports import migrate_skill_import_files
 from .migration._table_names import RENAMES as TABLE_RENAMES
 from .migration._table_names import migrate_table_names
 from .migration._team import RENAMES as TEAM_RENAMES
@@ -76,12 +75,10 @@ async def init_schema(engine):
         if schema is None:
             raise ValueError("连接未选择有效的 schema")
         existing = await _existing_tables(connection, schema)
-        if LEGACY_SKILL_ARCHIVES in existing:
-            raise ValueError("技能归档需要先通过 upgrade-db 迁移到 NAS")
         if "ak_skill_imports" in existing:
             columns = await _table_columns(connection, schema, "ak_skill_imports")
-            if "archive" in columns:
-                raise ValueError("技能导入文件需要先通过 upgrade-db 迁移到 NAS")
+            if "uploader_id" not in columns:
+                raise ValueError("开发库旧技能表请通过 reset-skills 重置")
         old_project_tables = {
             name for sources in TABLE_SOURCES.values() for name in sources
         }
@@ -177,8 +174,6 @@ async def upgrade_schema(
     *,
     database=None,
     apply=False,
-    skill_archives=None,
-    skill_archive_limits=None,
 ):
     """预览旧库改造。核对目标库后原子执行并保留旧项目关联供清理。"""
     from ._access_schema import check_access_upgrade, upgrade_access_tables
@@ -210,6 +205,8 @@ async def upgrade_schema(
             }
             if legacy:
                 locked.add(LEGACY_PROJECT_SESSIONS)
+            if CONNECTOR_ASSET_TABLE in existing:
+                locked.add(CONNECTOR_ASSET_TABLE)
             tables = ", ".join(
                 _qualified(connection, schema, name) for name in sorted(locked)
             )
@@ -239,13 +236,7 @@ async def upgrade_schema(
         states["Agent 类型"] = await _agent_upgrade_state(connection, schema)
         states["Session 绑定"] = await _session_upgrade_state(connection, schema)
         states["授权和共享版本"] = await check_access_upgrade(connection, schema)
-        states["技能文件存储"] = await migrate_skill_archives(
-            connection,
-            schema,
-            archive_store=skill_archives,
-            limits=skill_archive_limits,
-        )
-        states["技能导入文件"] = await migrate_skill_import_files(connection, schema)
+        states["MCP 历史配置"] = await migrate_connectors(connection, schema)
         states[LEGACY_PROJECT_SESSIONS] = (
             await _check_legacy_project_links(
                 connection,
@@ -296,15 +287,8 @@ async def upgrade_schema(
                 connection, schema, apply=True
             )
         if apply:
-            states["技能文件存储"] = await migrate_skill_archives(
-                connection,
-                schema,
-                archive_store=skill_archives,
-                limits=skill_archive_limits,
-                apply=True,
-            )
-            states["技能导入文件"] = await migrate_skill_import_files(
-                connection, schema, archive_store=skill_archives, apply=True
+            states["MCP 历史配置"] = await migrate_connectors(
+                connection, schema, apply=True
             )
         states.update(
             {

@@ -102,10 +102,9 @@ async def test_model_update_resolves_and_persists_native_config(
                 "workspace": {"runtime": sandbox_runtime(tmp_path)}, "project": {"upload": {"max_bytes": 20_971_520}},
                 "user": {
                     "identity": {
-                        "mode": "demo",
                         "issuer": "test",
                         "audience": "test",
-                        "algorithm": "HS256",
+                        "jwks_url": "https://identity.example.test/.well-known/jwks.json",
                     }
                 },
                 "model": {

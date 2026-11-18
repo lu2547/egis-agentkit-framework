@@ -9,22 +9,20 @@ from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.resource._catalog import ResourceService
 
 
-async def test_connector_dependency_permits_credentials_without_marketplace_access(
-    storage,
-    tmp_path,
-):
+async def test_agent_grant_does_not_authorize_managed_connector(storage, tmp_path):
     from cryptography.fernet import Fernet
 
     from egis_agentkit.service.access._grant import GrantService
+    from egis_agentkit.service.session._preparation import SessionPreparationService
+    from egis_agentkit.service.session._session import SessionService
     from egis_agentkit.storage.model import AgentDefinition, Grant
 
-    _, admin, _, bob = await identities(storage)
+    users, admin, _, bob = await identities(storage)
     resources = ResourceService(storage, tmp_path, credential_key=Fernet.generate_key())
     await resources.save_mcp(
         admin,
         {
             "resource_id": "scoped-connector",
-            "owner_type": "system",
             "config": {
                 "transport": "streamable_http",
                 "url": "https://mcp.example.com/",
@@ -32,14 +30,7 @@ async def test_connector_dependency_permits_credentials_without_marketplace_acce
             },
         },
     )
-    await resources.save_skill(
-        admin,
-        {
-            "resource_id": "scoped-skill",
-            "owner_type": "system",
-            "markdown": "# Scoped",
-        },
-    )
+    refs = [{"resource_type": "mcp", "resource_id": "scoped-connector"}]
     agent = await AgentManager(storage).add_definition(
         admin,
         AgentDefinition(
@@ -47,26 +38,10 @@ async def test_connector_dependency_permits_credentials_without_marketplace_acce
             owner_id="system",
             agent_name="scoped",
             agent_display_name="Scoped",
-            payload={
-                "bindings": [
-                    {
-                        "resource_type": "skill",
-                        "resource_id": "scoped-skill",
-                        "resource_version": "1.0.0",
-                        "resource_view_type": "system",
-                    },
-                    {
-                        "resource_type": "mcp",
-                        "resource_id": "scoped-connector",
-                        "resource_version": "1.0.0",
-                        "resource_view_type": "system",
-                    },
-                ]
-            },
+            payload={"bindings": refs},
         ),
     )
-    grants = GrantService(storage)
-    root = await grants.grant(
+    await GrantService(storage).grant(
         admin,
         Grant(
             principal_type="user",
@@ -78,31 +53,28 @@ async def test_connector_dependency_permits_credentials_without_marketplace_acce
             resource_owner_id="system",
         ),
     )
+    await resources.mcp_auth_action(
+        bob, "scoped-connector", "set_api_key", key="bob-only"
+    )
+    await users.update_user(admin, bob.model_copy(update={"group_ids": []}))
+    bob = await users.get(bob.user_id)
     assert await resources.list(bob, "mcp") == []
-    assert [
-        row["resource_id"] for row in await resources.mcp_dependency_authorizations(bob)
-    ] == [
-        "scoped-connector",
-    ]
-    assert (
+    with pytest.raises(Forbidden):
+        await resources.mcp_auth_action(bob, "scoped-connector", "status")
+    with pytest.raises(Forbidden):
         await resources.mcp_auth_action(
-            bob,
-            "scoped-connector",
-            "1.0.0",
-            "set_api_key",
-            key="bob-only",
+            bob, "scoped-connector", "set_api_key", key="other-key"
         )
-    )["authorized"]
     with pytest.raises(Forbidden):
         await resources.install(bob, "mcp", "scoped-connector")
-    await resources.set_asset_enabled(admin, "skill", "scoped-skill", "1.0.0", False)
-    assert await resources.mcp_dependency_authorizations(bob) == []
-    with pytest.raises(Forbidden):
-        await resources.mcp_auth_action(bob, "scoped-connector", "1.0.0", "status")
-    await grants.revoke(admin, root["id"])
-    assert await resources.mcp_dependency_authorizations(bob) == []
-    with pytest.raises(Forbidden):
-        await resources.mcp_auth_action(bob, "scoped-connector", "1.0.0", "status")
+    session = await SessionService(storage, tmp_path).add_session(
+        bob, agent["id"], "system"
+    )
+    async with SessionPreparationService(storage, tmp_path).bind(
+        session["session_id"]
+    ) as scope:
+        with pytest.raises(Forbidden):
+            await resources.mcps_for_refs(bob, refs, authorization_scope=scope)
 
 
 @pytest.mark.asyncio
@@ -139,10 +111,12 @@ async def test_local_skill_archive_is_durable_and_access_checked(storage, tmp_pa
 
 @pytest.mark.asyncio
 async def test_local_mcp_install_stores_no_credentials(storage, tmp_path):
-    _, _, alice, _ = await identities(storage)
-    resources = ResourceService(storage, tmp_path)
+    from cryptography.fernet import Fernet
+
+    _, admin, alice, _ = await identities(storage)
+    resources = ResourceService(storage, tmp_path, credential_key=Fernet.generate_key())
     await resources.save_mcp(
-        alice,
+        admin,
         {
             "resource_id": "connector",
             "config": {
@@ -152,38 +126,34 @@ async def test_local_mcp_install_stores_no_credentials(storage, tmp_path):
             },
         },
     )
-    await resources.install(alice, "mcp", "connector")
+    with pytest.raises(Forbidden):
+        await resources.install(alice, "mcp", "connector")
+    assert "connector" not in await resources.personal.list_resources(alice, "mcp")
+
+    await resources.mcp_auth_action(alice, "connector", "set_api_key", key="alice-key")
+    assert (await resources.install(alice, "mcp", "connector"))["is_installed"]
     state = (await resources.personal.list_resources(alice, "mcp"))["connector"]
     assert state["is_enabled"] and "credential" not in state and "payload" not in state
-    with pytest.raises(Forbidden):
-        await resources.mcps_for_refs(
-            alice,
-            [
-                {
-                    "resource_type": "mcp",
-                    "resource_id": "connector",
-                    "resource_version": "1.0.0",
-                }
-            ],
-        )
 
 
 @pytest.mark.asyncio
 async def test_oauth_state_credentials_refresh_and_revocation_are_isolated(
-    storage, tmp_path
+    storage, tmp_path, monkeypatch
 ):
     import asyncio
     import base64
     import hashlib
+    from datetime import timedelta
     from urllib.parse import parse_qs
 
     import httpx
     from cryptography.fernet import Fernet
 
-    from egis_agentkit.core.mcp import MCPAuthorization
-    from egis_agentkit.storage.model import Grant
+    from egis_agentkit.core.mcp import MCPAuthorization, _authorization
 
     _, admin, alice, bob = await identities(storage)
+    now = _authorization.utcnow()
+    monkeypatch.setattr(_authorization, "utcnow", lambda: now)
     refreshes = []
     exchanges = []
     revocations = []
@@ -227,9 +197,9 @@ async def test_oauth_state_credentials_refresh_and_revocation_are_isolated(
                 200,
                 json={
                     "token_type": "Bearer",
-                    "access_token": "expired-alice",
+                    "access_token": "initial-alice",
                     "refresh_token": "refresh-alice",
-                    "expires_in": 0,
+                    "expires_in": 3600,
                 },
             )
         refreshes.append(data["refresh_token"][0])
@@ -254,7 +224,6 @@ async def test_oauth_state_credentials_refresh_and_revocation_are_isolated(
         admin,
         {
             "resource_id": "protected",
-            "owner_type": "system",
             "config": {
                 "transport": "streamable_http",
                 "url": "https://mcp.example.com/mcp",
@@ -263,24 +232,16 @@ async def test_oauth_state_credentials_refresh_and_revocation_are_isolated(
             },
         },
     )
-    for user in (alice, bob):
-        await resources.grants.grant(
-            admin,
-            Grant(
-                principal_type="user",
-                principal_id=user.user_id,
-                resource_type="mcp",
-                resource_id="protected",
-                resource_view_type="system",
-                resource_owner_type="system",
-                resource_owner_id="system",
-            ),
-        )
+    (card,) = await resources.list(alice, "mcp")
+    assert card["resource_id"] == "protected"
+    assert card["resource_view_type"] == "system"
+    assert "resource_version" not in card
+    assert not card["is_authorized"] and not card["is_installed"]
+    with pytest.raises(Forbidden):
+        await resources.install(alice, "mcp", "protected")
 
     async def auth(user, action, **kwargs):
-        return await resources.mcp_auth_action(
-            user, "protected", "1.0.0", action, **kwargs
-        )
+        return await resources.mcp_auth_action(user, "protected", action, **kwargs)
 
     flow = await auth(alice, "start")
     query = httpx.URL(flow["authorization_url"]).params
@@ -289,7 +250,8 @@ async def test_oauth_state_credentials_refresh_and_revocation_are_isolated(
     )
     with pytest.raises(Forbidden):
         await auth(bob, "callback", state=flow["state"], code="code")
-    await auth(alice, "callback", state=flow["state"], code="code")
+    callback = await auth(alice, "callback", state=flow["state"], code="code")
+    assert callback["authorized"]
     with pytest.raises(Forbidden):
         await auth(alice, "callback", state=flow["state"], code="code")
     verifier = exchanges[0]["code_verifier"][0]
@@ -297,25 +259,27 @@ async def test_oauth_state_credentials_refresh_and_revocation_are_isolated(
         hashlib.sha256(verifier.encode()).digest()
     ).decode().rstrip("=")
 
-    ref = [
-        {
-            "resource_type": "mcp",
-            "resource_id": "protected",
-            "resource_version": "1.0.0",
-        }
-    ]
+    assert (await resources.install(alice, "mcp", "protected"))["is_installed"]
+    ref = [{"resource_type": "mcp", "resource_id": "protected"}]
     with pytest.raises(Forbidden):
         await resources.mcps_for_refs(bob, ref)
+    assert not refreshes
+    now += timedelta(hours=1)
     clients = await asyncio.gather(
         *(resources.mcps_for_refs(alice, ref) for _ in range(3))
     )
     assert refreshes == ["refresh-alice"]
     assert all(
-        row[0].mcp_config.headers == {"Authorization": "Bearer fresh-alice"}
+        row[0]._runtime_headers == {"Authorization": "Bearer fresh-alice"}
         for row in clients
     )
+    await resources.remove_installation(alice, "mcp", "protected")
+    (card,) = await resources.list(alice, "mcp")
+    assert card["is_authorized"] and not card["is_installed"]
+    assert (await resources.install(alice, "mcp", "protected"))["is_installed"]
     await auth(alice, "revoke")
     assert revocations == ["refresh-alice"]
+    assert not (await auth(alice, "status"))["authorized"]
     with pytest.raises(Forbidden):
         await resources.mcps_for_refs(alice, ref)
 
@@ -404,8 +368,6 @@ async def test_native_mcp_uses_each_users_encrypted_api_key(
     from mcp.server.mcpserver import MCPServer
     from starlette.responses import Response
 
-    from egis_agentkit.storage.model import Grant
-
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, "localhost")])
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -479,7 +441,6 @@ async def test_native_mcp_uses_each_users_encrypted_api_key(
             admin,
             {
                 "resource_id": "actual-mcp",
-                "owner_type": "system",
                 "config": {
                     "transport": "streamable_http",
                     "url": f"https://{address[0]}:{address[1]}/mcp",
@@ -489,35 +450,17 @@ async def test_native_mcp_uses_each_users_encrypted_api_key(
             },
         )
         for user in (alice, bob):
-            await resources.grants.grant(
-                admin,
-                Grant(
-                    principal_type="user",
-                    principal_id=user.user_id,
-                    resource_type="mcp",
-                    resource_id="actual-mcp",
-                    resource_view_type="system",
-                    resource_owner_type="system",
-                    resource_owner_id="system",
-                ),
+            await resources.mcp_auth_action(
+                user, "actual-mcp", "set_api_key", key=f"key-{user.user_id}"
             )
             await resources.install(user, "mcp", "actual-mcp")
-            await resources.mcp_auth_action(
-                user, "actual-mcp", "1.0.0", "set_api_key", key=f"key-{user.user_id}"
-            )
-            asset = await resources._asset("mcp", "actual-mcp", "1.0.0")
+            asset = await resources._asset("mcp", "actual-mcp", None)
             auth = resources.mcp_authorization
             persisted = await storage.mcp_credentials.read(
                 user.user_id, auth._connection(asset)
             )
             assert f"key-{user.user_id}".encode() not in persisted["credential"]
-            ref = [
-                {
-                    "resource_type": "mcp",
-                    "resource_id": "actual-mcp",
-                    "resource_version": "1.0.0",
-                }
-            ]
+            ref = [{"resource_type": "mcp", "resource_id": "actual-mcp"}]
             (client,) = await resources.mcps_for_refs(user, ref)
             before = len(calls)
             await client.connect()

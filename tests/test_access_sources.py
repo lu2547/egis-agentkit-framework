@@ -73,6 +73,7 @@ async def test_three_expert_paths_and_marketplace_grant_are_revoked_independentl
         resource_type="skill",
         resource_id="report",
         resource_version="1",
+        publication_revision=1,
         owner_type="system",
         owner_id="platform",
     )

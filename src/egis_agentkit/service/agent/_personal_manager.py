@@ -41,7 +41,7 @@ class PersonalManager:
         self.config = config
         self.definition = definition or PersonalDefinition()
         self.files = (
-            FileStorage(Path(workspace_root), config_provider=config)
+            FileStorage(workspace_root, config_provider=config)
             if workspace_root is not None
             else None
         )

@@ -12,6 +12,7 @@ from egis_agentkit.bootstrap._demo_tools import (
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.resource._catalog import ResourceService
+from egis_agentkit.storage.model._resource import MCP_STORAGE_VERSION
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
 
@@ -79,17 +80,20 @@ async def test_deployed_tool_requires_current_expert_and_exact_binding(
 
 
 async def test_demo_seed_uses_local_catalog_and_deployed_tool(storage, tmp_path):
+    _, admin, _, _ = await identities(storage)
+    existing_users = await storage.users.list_users()
     resources = ResourceService(storage, tmp_path)
     deploy_demo_report_tools(resources.tool_registry, ProjectFileStorage(tmp_path))
     await resources.seed_builtin_tools()
     provider = SimpleNamespace(snapshot=app_snapshot(tmp_path))
-    await seed_demo(storage, provider, resources)
-    await seed_demo(storage, provider, resources)
+    await seed_demo(storage, provider, resources, admin)
+    await seed_demo(storage, provider, resources, admin)
+    assert await storage.users.list_users() == existing_users
 
     skill = await storage.assets.get("skill", "egis-demo-report", "1.0.0")
     assert "original_markdown" not in skill["payload"]
     assert await resources.read_skill_markdown(skill)
-    connector = await storage.assets.get("mcp", "egis-demo-tools", "1.0.0")
+    connector = await storage.assets.get("mcp", "egis-demo-tools", MCP_STORAGE_VERSION)
     assert connector["payload"]["config"]["transport"] == "streamable_http"
     rows, _ = await storage.definitions.list_definitions_and_reviews("agent")
     experts = [row for row in rows if row["agent_type"] in {"expert", "remote"}]

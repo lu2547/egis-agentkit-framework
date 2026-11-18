@@ -33,6 +33,17 @@ class UploadNameConflict(Conflict):
         super().__init__("同名文件已存在。")
 
 
+class CollaborationSessionBusy(Conflict):
+    """会话正在执行或收尾，释放协作操作所需的锁后可重试。"""
+
+    code = "collaboration_session_busy"
+
+    def __init__(self, *, session_id: str, agent_id: str):
+        super().__init__("对话正在运行，请等待本轮完成后调整协作专家")
+        self.session_id = session_id
+        self.agent_id = agent_id
+
+
 class WorkspaceProbeError(AgentKitError):
     """标记实例、租约、网络、运行时或存储失败，供管理层决定重试和短路。"""
 

@@ -87,6 +87,7 @@ async def test_update_replaces_dependency_paths_without_changing_root_grants(sto
                     resource_type="skill",
                     resource_id=identifier,
                     resource_version="1.0.0",
+                    publication_revision=1,
                     owner_type="user",
                     owner_id=alice.user_id,
                 ),

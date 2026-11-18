@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
+from test_domain import identities
 
 from egis_agentkit.client.nacos._settings import ConnectorConfig, SkillArchiveConfig
 from egis_agentkit.core.skill._archive import read_archive_files
@@ -27,15 +28,11 @@ async def test_skill_21mb_passes_upload_archive(storage, tmp_path):
     archive = bundle(21 * 1024 * 1024)
     assert SkillArchiveConfig().max_bytes == CAP - 1
     assert len(read_archive_files(archive)["references/data.bin"]) == 21 * 1024 * 1024
+    _, _, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
-
-    async def save(user, kind, data, *, files, archive_limits):
-        return {"size": len(files["references/data.bin"])}
-
-    resources._save = save
-    assert (await resources.upload_skill(SimpleNamespace(), archive, "1.0.0"))[
-        "size"
-    ] == 21 * 1024 * 1024
+    await resources.upload_skill(alice, archive, "1.0.0", resource_id="large")
+    attachment = tmp_path / "user/alice/skills/large/1.0.0/references/data.bin"
+    assert attachment.stat().st_size == 21 * 1024 * 1024
 
 
 def test_skill_limit_rejects_exactly_50m_and_expansion_over_limit():

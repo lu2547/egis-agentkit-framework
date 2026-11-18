@@ -50,7 +50,7 @@ async def test_uploaded_pdf_is_named_by_its_readable_project_path(storage, tmp_p
     async with SessionPreparationService(storage, tmp_path).bind(second["session_id"]):
         scope = session_execution_context.get()
         policy = build_tool_access_middleware(alice, scope, PermissionService(storage))
-        prompt = await project_prompt(scope).on_system_prompt(None, "system")
+        prompt = await project_prompt(scope, tmp_path).on_system_prompt(None, "system")
         assert str(target) in prompt and "pages" in prompt
         assert (
             "上传资料直接位于根目录" in prompt

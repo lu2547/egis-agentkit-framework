@@ -48,6 +48,7 @@ async def test_unreviewed_binding_does_not_expand_shared_inherited_use(storage):
                 resource_type="skill",
                 resource_id=name,
                 resource_version="1.0.0",
+                publication_revision=1,
                 owner_type="system",
                 owner_id="sys",
             )
@@ -105,6 +106,7 @@ async def test_private_binding_does_not_keep_revoked_external_permission(storage
         resource_type="skill",
         resource_id="external",
         resource_version="1.0.0",
+        publication_revision=1,
         owner_type="system",
         owner_id="sys",
     )
@@ -152,11 +154,14 @@ async def test_team_capture_retains_both_versions_from_real_approved_experts(sto
     permissions = PermissionService(storage)
     agents, shares = AgentManager(storage), ShareService(storage)
     members = []
-    for name, version in [("first", "1.0.0"), ("second", "2.0.0")]:
+    for revision, (name, version) in enumerate(
+        [("first", "1.0.0"), ("second", "2.0.0")], start=1
+    ):
         asset = Asset(
             resource_type="skill",
             resource_id="report",
             resource_version=version,
+            publication_revision=revision,
             owner_type="system",
             owner_id="sys",
         )

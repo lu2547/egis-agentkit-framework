@@ -6,24 +6,28 @@
 - 按入口撤销授权，保留其他使用来源。
 """
 
-from packaging.version import Version
-
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
-from egis_agentkit.service._user import require_admin
+from egis_agentkit.service._user import UserService, require_admin
 from egis_agentkit.service.access._permission import (
     DEFINITION_KINDS,
     INTERNAL_AGENT_TYPES,
-    MANAGED_ASSET_KINDS,
 )
 from egis_agentkit.storage.model import Grant, ShareTarget, User, new_id
 from egis_agentkit.storage.model._base import publication_label, resource_available
+from egis_agentkit.storage.model._resource import (
+    MCP_STORAGE_VERSION,
+    asset_version_order,
+    is_managed_connector,
+    require_skill_publication_revision,
+)
 
 
 class GrantService:
     """维护资源授权记录和来源关系。"""
 
-    def __init__(self, storage):
+    def __init__(self, storage, policies=None):
         self.storage = storage
+        self.policies = policies
 
     async def require_recipient(self, target: ShareTarget, *, write):
         """确认指定接收用户或组织组仍有效。"""
@@ -53,49 +57,43 @@ class GrantService:
                         kind, row["id"], row, row[f"{kind}_display_name"]
                     )
                 )
-        for kind in MANAGED_ASSET_KINDS:
-            rows = await self.storage.assets.list_versions(kind)
-            selected = {}
-            for row in rows:
-                identifier = row["resource_id"]
-                previous = selected.get(identifier)
-                if previous is None or self._publication_order(
-                    row
-                ) > self._publication_order(previous):
-                    selected[identifier] = row
-            for identifier, row in sorted(selected.items()):
-                if row["is_enabled"]:
-                    resources.append(
-                        self._grantable_row(
-                            kind,
-                            identifier,
-                            row,
-                            row["payload"].get("display_name") or identifier,
-                        )
+        selected = {}
+        for row in await self.storage.assets.list_versions("skill"):
+            identifier = row["resource_id"]
+            previous = selected.get(identifier)
+            if previous is None or self._publication_order(
+                row
+            ) > self._publication_order(previous):
+                selected[identifier] = row
+        for identifier, row in sorted(selected.items()):
+            if row["is_enabled"]:
+                resources.append(
+                    self._grantable_row(
+                        "skill", identifier, row,
+                        row["payload"].get("display_name") or identifier,
                     )
+                )
         return resources
 
     @staticmethod
     def _publication_order(row):
         return (
             row["is_shared_current"],
-            row["publication_revision"] or 0,
-            Version(row["resource_version"]),
+            asset_version_order(row),
         )
 
     @staticmethod
     def _grantable_row(kind, identifier, row, name):
         revision = (
-            row.get("version")
-            or row.get("publication_revision")
+            require_skill_publication_revision(row["publication_revision"])
+            if kind == "skill"
+            else row["version"]
         )
         return {
             "resource_type": kind,
             "resource_id": identifier,
             "resource_version": row["resource_version"],
-            "version_label": publication_label(revision)
-            if revision
-            else row["resource_version"],
+            "version_label": publication_label(revision),
             "resource_view_type": "system"
             if row["owner_type"] == "system"
             else "shared",
@@ -110,9 +108,23 @@ class GrantService:
         if write is None:
             async with self.storage.definition_write() as transaction:
                 return await self.grant(admin, data, write=transaction)
-        resource = await self.grant_version(
-            data.resource_type, data.resource_id, write=write
-        )
+        if data.resource_type == "mcp":
+            company = UserService(self.storage, self.policies).company_group()
+            if (
+                data.principal_type != "group"
+                or data.principal_id != company.group_id
+                or data.grant_source_type != "manual"
+                or data.resource_view_type != "system"
+            ):
+                raise Forbidden("MCP 只开放给公司组")
+            await write.assets.lock_resource("mcp", data.resource_id)
+            resource = await write.assets.get("mcp", data.resource_id, MCP_STORAGE_VERSION)
+            if resource is None or not is_managed_connector(resource):
+                raise NotFound()
+        else:
+            resource = await self.grant_version(
+                data.resource_type, data.resource_id, write=write
+            )
         return await self.issue(admin, data, resource, write=write)
 
     async def issue(self, admin, data, resource, *, write):
@@ -126,15 +138,32 @@ class GrantService:
             and not await write.access.shared_version(kind, identifier)
         ):
             await write.access.set_shared_version(kind, identifier, version)
-        root = await write.access.upsert_grant(
-            {**data.model_dump(), "origin_key": data.grant_source_type},
-            actor=admin.user_id,
-        )
+        root = await self._record_direct(data, actor=admin.user_id, write=write)
         if kind in DEFINITION_KINDS:
             await self._grant_dependencies(
                 root, resource, actor=admin.user_id, write=write
             )
         return root
+
+    async def publish_connector(self, identifier, company, *, actor, write):
+        """为管理员维护的 MCP 登记公司组入口，由组与连接器状态决定可见性。"""
+        await write.users.ensure_group(company, actor=actor)
+        data = Grant(
+            principal_type="group",
+            principal_id=company.group_id,
+            resource_type="mcp",
+            resource_id=identifier,
+            resource_view_type="system",
+            resource_owner_type="system",
+            resource_owner_id="system",
+        )
+        return await self._record_direct(data, actor=actor, write=write)
+
+    @staticmethod
+    async def _record_direct(data, *, actor, write):
+        return await write.access.upsert_grant(
+            {**data.model_dump(), "origin_key": data.grant_source_type}, actor=actor
+        )
 
     async def grant_version(self, kind, identifier, *, write):
         """选择已共享版本，首次授权选择所有者最新版本。"""
@@ -199,7 +228,7 @@ class GrantService:
                 retained.add(parent_id)
             for binding in member["payload"].get("bindings", []):
                 kind = binding["resource_type"]
-                if kind == "tool":
+                if kind != "skill":
                     continue
                 identifier = binding["resource_id"]
                 asset = await write.assets.get(

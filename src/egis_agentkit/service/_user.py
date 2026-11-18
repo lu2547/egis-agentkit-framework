@@ -1,8 +1,11 @@
 """同步用户身份并管理角色与组织组。"""
 
+from egis_agentkit.client.nacos._settings import AccessConfig
 from egis_agentkit.errors import Forbidden, NotFound
 from egis_agentkit.storage import AgentKitStorage
 from egis_agentkit.storage.model import Group, User
+
+VIRTUAL_USER_PREFIX = "skill-system."
 
 
 def require_admin(user: User) -> None:
@@ -14,8 +17,15 @@ def require_admin(user: User) -> None:
 class UserService:
     """读取有效身份，管理用户角色、组织组和成员关系。"""
 
-    def __init__(self, storage: AgentKitStorage):
+    def __init__(self, storage: AgentKitStorage, policies=None):
         self.storage = storage
+        self.policies = policies if policies is not None else AccessConfig()
+
+    def company_group(self) -> Group:
+        return Group(
+            group_id=self.policies.company_group_id,
+            group_name=self.policies.company_group_name,
+        )
 
     async def get(self, user_id: str) -> User:
         """重新读取数据库身份，使角色和组成员变更立即生效。"""
@@ -28,8 +38,13 @@ class UserService:
         return user
 
     async def sync_identity(self, user_id: str, username: str) -> User:
-        identity = User(user_id=user_id, username=username)
+        if user_id.startswith(VIRTUAL_USER_PREFIX):
+            raise Forbidden("此身份标识保留给系统虚拟用户")
+        company = self.company_group()
+        identity = User(user_id=user_id, username=username, group_ids=[company.group_id])
         async with self.storage.users.write() as users:
+            if await users.get_user(user_id) is None:
+                await users.ensure_group(company, actor="identity")
             await users.upsert_identity(identity)
         return await self.get(user_id)
 

@@ -2,7 +2,6 @@
 
 from contextlib import asynccontextmanager
 
-from packaging.version import Version
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -10,6 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from egis_agentkit.client._postgres import PostgresTransaction, transaction_connection
 from egis_agentkit.storage import tables as t
 from egis_agentkit.storage.model import Asset, utcnow
+from egis_agentkit.storage.model._resource import (
+    MCP_STORAGE_VERSION,
+    asset_version_order,
+    is_managed_connector,
+    require_skill_publication_revision,
+)
 
 
 def _asset_identity(resource_type: str, resource_id: str):
@@ -17,6 +22,12 @@ def _asset_identity(resource_type: str, resource_id: str):
         t.assets.c.resource_type == resource_type,
         t.assets.c.resource_id == resource_id,
     )
+
+
+def _asset_record(row) -> dict:
+    if row["resource_type"] == "skill":
+        require_skill_publication_revision(row["publication_revision"])
+    return dict(row)
 
 
 class ResourceAssetStorage:
@@ -32,7 +43,7 @@ class ResourceAssetStorage:
             async with self.engine.connect() as connection:
                 return await self._first(statement, conn=connection)
         row = (await conn.execute(statement)).mappings().first()
-        return dict(row) if row is not None else None
+        return _asset_record(row) if row is not None else None
 
     async def find_asset(
         self,
@@ -42,16 +53,24 @@ class ResourceAssetStorage:
         enabled_only: bool = False,
         conn: AsyncConnection | None = None,
     ) -> dict | None:
-        """按语义版本读取资源的最新版。"""
+        """读取资源当前版本，连接器直接使用当前配置的存储键。"""
+        if resource_type == "mcp":
+            row = await self.get(
+                resource_type, resource_id, MCP_STORAGE_VERSION, conn=conn
+            )
+            if (
+                row
+                and is_managed_connector(row)
+                and (row["is_enabled"] or not enabled_only)
+            ):
+                return row
+            return None
         rows = await self.list_versions(
             resource_type, resource_ids=[resource_id], conn=conn
         )
         return max(
             (row for row in rows if not enabled_only or row["is_enabled"]),
-            key=lambda row: (
-                row["publication_revision"] or 0,
-                Version(row["resource_version"]),
-            ),
+            key=asset_version_order,
             default=None,
         )
 
@@ -87,7 +106,7 @@ class ResourceAssetStorage:
         if resource_ids is not None:
             statement = statement.where(t.assets.c.resource_id.in_(resource_ids))
         rows = await conn.execute(statement)
-        return [dict(row) for row in rows.mappings()]
+        return [_asset_record(row) for row in rows.mappings()]
 
     async def page_versions(
         self, resource_type: str, after: str, *, limit: int
@@ -112,7 +131,7 @@ class ResourceAssetStorage:
                 .where(kind, t.assets.c.resource_id.in_(identifiers))
                 .order_by(t.assets.c.resource_id, t.assets.c.resource_version)
             )
-            return identifiers, [dict(row) for row in rows.mappings()]
+            return identifiers, [_asset_record(row) for row in rows.mappings()]
 
     async def lock_resource(
         self,
@@ -148,6 +167,29 @@ class ResourceAssetStorage:
                 **asset.model_dump(), created_by=actor, updated_by=actor
             )
         )
+
+    async def update_connector(self, asset: Asset, *, actor: str) -> dict:
+        """Replace connection configuration, preserving status and creation audit."""
+        conn = transaction_connection(self.engine, None)
+        row = await conn.execute(
+            t.assets.update()
+            .where(
+                *_asset_identity(asset.resource_type, asset.resource_id),
+                t.assets.c.resource_version == asset.resource_version,
+            )
+            .values(
+                owner_type=asset.owner_type,
+                owner_id=asset.owner_id,
+                payload=asset.payload,
+                checksum_sha256=asset.checksum_sha256,
+                publication_revision=asset.publication_revision,
+                is_shared_current=False,
+                updated_by=actor,
+                updated_at=utcnow(),
+            )
+            .returning(t.assets)
+        )
+        return dict(row.mappings().one())
 
     async def locked_version(
         self,
@@ -188,7 +230,6 @@ class ResourceAssetStorage:
             .values(is_enabled=enabled, updated_by=actor, updated_at=utcnow())
         )
         return bool(result.rowcount)
-
 
 
 class MCPCredentialStorage:

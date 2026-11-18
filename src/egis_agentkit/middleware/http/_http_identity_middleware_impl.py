@@ -6,6 +6,7 @@ from urllib.parse import parse_qs
 
 from egis_agentkit.client.remote_agent._base import CALLBACK_RESULT_PATH
 from egis_agentkit.errors import AgentKitError, Forbidden
+from egis_agentkit.service._virtual_user import VIRTUAL_TOKEN_PREFIX, VirtualUserService
 
 
 class IdentityGuard:
@@ -21,7 +22,6 @@ class IdentityGuard:
         if method == "POST" and CALLBACK_RESULT_PATH.fullmatch(path):
             return await self.app(scope, receive, send)
         if path in (
-            "/auth/login",
             "/health",
             "/health/ready",
             "/openapi.json",
@@ -34,9 +34,21 @@ class IdentityGuard:
             authorization = headers.get("authorization", "")
             if not authorization.startswith("Bearer "):
                 return await self._error(send, 401, "请先登录")
+            token = authorization[7:]
+            if token.startswith(VIRTUAL_TOKEN_PREFIX):
+                try:
+                    user = await self.services.virtual_users.authenticate(token)
+                except Forbidden:
+                    return await self._error(send, 401, "虚拟用户凭证无效")
+                if not VirtualUserService.allows_request(method, path):
+                    raise Forbidden("虚拟用户只能使用技能导入接口")
+                state = scope.setdefault("state", {})
+                state["egis_user"] = user
+                state["egis_virtual_user"] = True
+                return await self.app(scope, receive, send)
             try:
                 claims = await asyncio.to_thread(
-                    self.identity.verify, authorization[7:]
+                    self.identity.verify, token
                 )
             except Forbidden:
                 return await self._error(send, 401, "认证无效或已过期")

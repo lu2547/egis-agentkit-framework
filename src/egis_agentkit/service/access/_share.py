@@ -11,7 +11,6 @@ from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._permission import (
     DEFINITION_KINDS,
     INTERNAL_AGENT_TYPES,
-    MANAGED_ASSET_KINDS,
     PermissionService,
 )
 from egis_agentkit.storage.model import Grant, ShareReview, ShareTarget, User, utcnow
@@ -56,7 +55,7 @@ class ShareService:
         self, user, resource_type, resource_id, *, target: ShareTarget | None = None
     ):
         """选择发布版本，记录新接收方或一次共享升级。"""
-        if resource_type not in (*DEFINITION_KINDS, *MANAGED_ASSET_KINDS):
+        if resource_type not in (*DEFINITION_KINDS, "skill"):
             raise Conflict("此资源类型不支持共享")
         if not user.is_enabled:
             raise Forbidden()
@@ -181,6 +180,8 @@ class ShareService:
             review["resource_id"],
             review["resource_version"],
         )
+        if kind == "mcp":
+            raise Conflict("连接器由管理员统一上架")
         resource = await self.grants.read_version(
             kind, identifier, version, write=write
         )

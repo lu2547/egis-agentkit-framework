@@ -38,7 +38,13 @@ logger = logging.getLogger(__name__)
 
 
 def build_tool_access_middleware(
-    user, scope, permissions, skills=None, *, authorize_tool=None
+    user,
+    scope,
+    permissions,
+    skills=None,
+    *,
+    authorize_tool=None,
+    resolve_sandbox_path=None,
 ):
     validate_access, may_send_team_message, prepare_collaboration = (
         tool_access_callbacks(user, scope, permissions)
@@ -50,6 +56,7 @@ def build_tool_access_middleware(
         prepare_collaboration=prepare_collaboration,
         skills=skills,
         authorize_tool=authorize_tool,
+        resolve_sandbox_path=resolve_sandbox_path,
     )
 
 
@@ -88,7 +95,6 @@ async def build_middlewares(
         with trace_phase("resources.prepare"):
             await resources.prepare_workspace(user, scope, workspace)
     policies = scope.policies
-    personal = scope.definition["agent_type"] == "personal"
     skills = (
         LiveSkillLoader(user, scope, resources, workspace=workspace)
         if resources is not None
@@ -103,6 +109,12 @@ async def build_middlewares(
         and getattr(resources, "tool_registry", None) is not None
         else None
     )
+    files = getattr(workspace, "egis_files", None)
+    remote_files = getattr(files, "uses_nas_api", False)
+
+    async def resolve_sandbox_path(path):
+        return await workspace.get_backend().resolve_path(path)
+
     reply = partial(file_changes.on_reply, scope)
     if workspace_manager is not None:
         reply = partial(
@@ -122,6 +134,7 @@ async def build_middlewares(
             PermissionService(sessions.storage, policies),
             skills,
             authorize_tool=tool_authorizer,
+            resolve_sandbox_path=resolve_sandbox_path if remote_files else None,
         ),
         SkillBindingMiddleware(
             skills, bind_state=skills.bind_state if skills is not None else None
@@ -146,8 +159,8 @@ async def build_middlewares(
                 runtime=remote_agents,
             )
         )
-    if personal and memory is not None:
-        result.append(await memory.for_user(user))
+    elif memory is not None:
+        result.append(await memory.for_project(user, scope.project_id))
     logger.info(
         "session.prepared",
         extra={

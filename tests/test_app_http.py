@@ -6,6 +6,7 @@ import httpx
 import pytest
 from config_helpers import sandbox_runtime
 from egis_agentkit_app.bootstrap import build_app
+from identity_helpers import TEST_IDENTITY, configure_test_issuer, signed_token
 from test_domain import identities
 
 from egis_agentkit.client.nacos import AgentKitConfig, NacosBootstrap, NacosClient
@@ -35,16 +36,7 @@ def app_snapshot(tmp_path, **domains):
                 "upload": {"max_bytes": 20_971_520},
                 "download": {"secret_env": "TEST_DOWNLOAD"},
             },
-            "user": {
-                "identity": {
-                    "mode": "demo",
-                    "issuer": "test",
-                    "audience": "test",
-                    "algorithm": "HS256",
-                    "signing_secret_env": "TEST_JWT",
-                    "demo_password_env": "TEST_LOGIN",
-                }
-            },
+            "user": {"identity": TEST_IDENTITY},
             "model": {
                 "selection": {"default_key": "test"},
                 "catalog": {
@@ -65,6 +57,40 @@ def app_snapshot(tmp_path, **domains):
 
 
 @pytest.mark.asyncio
+async def test_first_login_initializes_one_default_project(
+    storage, tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "TEST_DOWNLOAD", "download-secret-with-more-than-thirty-two-bytes"
+    )
+    monkeypatch.setenv("TEST_MODEL_KEY", "test-only-unused-model-key")
+    configure_test_issuer(monkeypatch)
+    config = Config(app_snapshot(tmp_path))
+    async with NacosClient(NacosBootstrap(server_url="http://unused.test")) as nacos:
+        app = await build_app(config, nacos, engine=storage.engine)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+                headers={"Authorization": "Bearer " + signed_token("new-user")},
+            ) as client:
+                assert await storage.get_user("new-user") is None
+                logins = await asyncio.gather(
+                    client.get("/manager/me"), client.get("/manager/me")
+                )
+                assert all(response.status_code == 200 for response in logins)
+                response = await client.get("/manager/projects")
+                assert response.status_code == 200
+                (project,) = response.json()["items"]
+                assert project["is_default"]
+                assert project["project_name"] == config.snapshot.project.defaults.name
+                project_root = app.state.egis_services.projects.files.project_root(
+                    "new-user", project["id"]
+                )
+                assert (project_root / "artifacts").is_dir()
+
+
+@pytest.mark.asyncio
 async def test_http_identity_native_write_seal_and_real_task_files(
     storage, tmp_path, monkeypatch
 ):
@@ -72,9 +98,8 @@ async def test_http_identity_native_write_seal_and_real_task_files(
     monkeypatch.setenv(
         "TEST_DOWNLOAD", "download-secret-with-more-than-thirty-two-bytes"
     )
-    monkeypatch.setenv("TEST_JWT", "jwt-secret-with-more-than-thirty-two-bytes")
-    monkeypatch.setenv("TEST_LOGIN", "a-test-password-with-enough-entropy")
     monkeypatch.setenv("TEST_MODEL_KEY", "test-only-unused-model-key")
+    configure_test_issuer(monkeypatch)
     config = Config(app_snapshot(tmp_path))
     nacos = NacosClient(
         NacosBootstrap(server_url="http://unused.test"),
@@ -115,15 +140,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
                     "/manager/me", headers={"Authorization": "Bearer invalid-token"}
                 )
             ).status_code == 401
-            login = await client.post(
-                "/auth/login",
-                json={
-                    "user_id": "alice",
-                    "password": "a-test-password-with-enough-entropy",
-                },
-            )
-            assert login.status_code == 200, login.text
-            client.headers["Authorization"] = "Bearer " + login.json()["access_token"]
+            client.headers["Authorization"] = "Bearer " + signed_token("alice")
             preferences = {"agent_md": "# 自定义规范", "soul_md": "", "user_md": "背景"}
             saved = await client.put("/manager/preferences", json=preferences)
             assert saved.status_code == 200, saved.text
@@ -177,16 +194,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             ).status_code == 403
             # A session setup failure can occur after HTTP accepted the turn.
             # The native setup handler must still publish a terminal reply.
-            admin_login = await client.post(
-                "/auth/login",
-                json={
-                    "user_id": "admin",
-                    "password": "a-test-password-with-enough-entropy",
-                },
-            )
-            client.headers["Authorization"] = (
-                "Bearer " + admin_login.json()["access_token"]
-            )
+            client.headers["Authorization"] = "Bearer " + signed_token("admin")
             controlled = await client.post(
                 "/manager/agents",
                 json={
@@ -311,7 +319,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             )
             assert notification and "controlled" in str(notification)
             assert wakeups, "native worker setup failure must wake its leader"
-            client.headers["Authorization"] = "Bearer " + login.json()["access_token"]
+            client.headers["Authorization"] = "Bearer " + signed_token("alice")
             assert (
                 await client.get("/hub/nacos-skills/cards/unaudited-latest")
             ).status_code == 403
@@ -500,14 +508,7 @@ async def test_http_identity_native_write_seal_and_real_task_files(
                     params={"area": "work", "path": "../../../../etc/passwd"},
                 )
             ).status_code == 403
-            other = await client.post(
-                "/auth/login",
-                json={
-                    "user_id": "bob",
-                    "password": "a-test-password-with-enough-entropy",
-                },
-            )
-            client.headers["Authorization"] = "Bearer " + other.json()["access_token"]
+            client.headers["Authorization"] = "Bearer " + signed_token("bob")
             assert (
                 await client.put(
                     file_url,

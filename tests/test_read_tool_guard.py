@@ -159,10 +159,17 @@ async def test_plain_text_pagination_and_pdf_and_image_remain_native(
 async def test_prompt_names_read_formats_without_upload_archive_instruction(tmp_path):
     from types import SimpleNamespace
 
-    work = tmp_path / ".work"
-    work.mkdir()
+    project = tmp_path / "user/alice/projects/project"
+    work = project / ".work"
+    work.mkdir(parents=True)
     prompt = await project_prompt(
-        SimpleNamespace(workdir=work, artifacts_dir=tmp_path / "artifacts")
+        SimpleNamespace(
+            user_id="alice",
+            project_id="project",
+            workdir=work,
+            artifacts_dir=project / "artifacts",
+        ),
+        tmp_path,
     ).on_system_prompt(None, "system")
     assert "uploads 归档路径" not in prompt
     assert "直接用原生 Read" not in prompt

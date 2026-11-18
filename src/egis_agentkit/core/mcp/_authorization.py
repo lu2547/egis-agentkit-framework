@@ -155,19 +155,18 @@ class MCPAuthorization:
         return config
 
     def _config(self, asset, expected=None):
-        """读取资源版本中的连接配置，并核对本次操作的认证方式。"""
+        """读取当前连接配置，并核对本次操作的认证方式。"""
         config = asset["payload"].get("config", {})
         if expected is not None and config.get("auth_type") != expected:
             raise ValueError("MCP connection authentication method does not match")
         return config
 
     def _connection(self, asset):
-        """将资源 ID、版本及端点摘要组合为独立的连接身份。"""
+        """使用资源 ID 和连接配置摘要定位用户凭据。"""
         return _digest(
             json.dumps(
                 [
                     asset["resource_id"],
-                    asset["resource_version"],
                     asset["checksum_sha256"],
                 ]
             )
@@ -209,7 +208,7 @@ class MCPAuthorization:
         return value
 
     async def set_api_key(self, user, asset, *, key):
-        """校验并加密保存当前用户对该连接版本的 API Key。"""
+        """校验并加密保存当前用户对该连接的 API Key。"""
         # 1. 核对认证方式并加密凭据。
         self._config(asset, "api_key")
         credential = self._encrypt({"key": self._header_value(key)})
@@ -222,15 +221,20 @@ class MCPAuthorization:
 
     async def status(self, user, asset):
         """读取当前用户的连接认证状态，仅返回状态而不暴露凭据。"""
-        settings = self.settings
         method = self._config(asset).get("auth_type", "none")
+        if method == "none":
+            return {"auth_type": method, "authorized": True}
         row = await self.credentials.read(user.user_id, self._connection(asset))
-        authorized = method == "none"
+        authorized = False
         if row and row["credential"]:
-            credential = self._decrypt(row["credential"])
-            authorized = method == "api_key" or bool(
-                credential.get("refresh_token") or self._fresh(credential, settings)
-            )
+            try:
+                credential = self._decrypt(row["credential"])
+            except AgentKitError:
+                pass
+            else:
+                authorized = method == "api_key" or bool(
+                    credential.get("refresh_token") or self._fresh(credential, self.settings)
+                )
         return {"auth_type": method, "authorized": authorized}
 
     async def _discover(self, http, config):
@@ -489,7 +493,7 @@ class MCPAuthorization:
 
     async def headers(self, user, asset):
         """取得认证请求头；令牌将过期时在凭据锁内完成一次刷新。"""
-        # 1. 无认证直接返回；其他方式读取当前用户、当前连接版本的凭据。
+        # 1. 无认证直接返回；其他方式按当前用户和连接配置读取凭据。
         settings = self.settings
         config = self._config(asset)
         method = config.get("auth_type", "none")

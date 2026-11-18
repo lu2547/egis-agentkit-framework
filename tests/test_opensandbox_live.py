@@ -63,14 +63,16 @@ async def test_user_standard_directories_persist_on_nas_across_sandbox_recreatio
         runtime = Path(first.workdir)
         assert runtime == root / "user" / user_id
         assert not (files.user_root(user_id) / "sessions").exists()
-        for name, target in (("data", "data"), ("skills", "skills"), ("session", "sessions"), ("mcp", "mcp")):
+        assert not (runtime / "data").exists()
+        assert not (runtime / "mcp").exists()
+        assert not await first.get_backend().file_exists(str(runtime / ".mcp"))
+        user_dirs = (("skills", "skills"), ("session", "sessions"))
+        for name, target in user_dirs:
             await first.get_backend().write_file(str(runtime / target / "keep.txt"), name.encode())
             source = files.user_root(user_id) / name
-            if name != "data":
-                source /= first.runtime_binding_id
+            source /= first.runtime_binding_id
             assert (source / "keep.txt").read_bytes() == name.encode()
         second = await initialize("reviewer", "two")
-        assert await second.get_backend().read_file(str(runtime / "data/keep.txt")) == b"data"
         assert not await second.get_backend().file_exists(str(runtime / "skills/keep.txt"))
         previous_id = first.sandbox_id
         await first.close_workspace()
@@ -78,7 +80,7 @@ async def test_user_standard_directories_persist_on_nas_across_sandbox_recreatio
         instances.remove(previous_id)
         restored = await initialize("writer", "one")
         assert restored.sandbox_id != previous_id
-        for name, target in (("data", "data"), ("skills", "skills"), ("session", "sessions"), ("mcp", "mcp")):
+        for name, target in user_dirs:
             assert await restored.get_backend().read_file(str(runtime / target / "keep.txt")) == name.encode()
     finally:
         for workspace in workspaces:

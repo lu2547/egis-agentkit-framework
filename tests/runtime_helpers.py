@@ -32,8 +32,7 @@ def file_middleware(changes, scope):
     )
 
 
-def project_prompt(scope):
-    root = scope.workdir.parent
+def project_prompt(scope, root):
     files = ProjectFileManager(None, root)
     projects = ProjectManager(None, root)
     return SessionCallbackMiddleware(

@@ -7,7 +7,6 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from agentscope.app.message_bus import MessageBusKeys
 
@@ -46,7 +45,9 @@ class ProjectManager:
         self.workspaces = workspaces
         self.project = Project(config=config_provider)
         self.files = (
-            files if files is not None else ProjectFileStorage(Path(workspace_root))
+            files
+            if files is not None
+            else ProjectFileStorage(workspace_root, config_provider=config_provider)
         )
 
     def _defaults(self):
@@ -181,7 +182,9 @@ class ProjectManager:
 
     async def on_system_prompt(self, scope, files, agent, current_prompt):
         """取得项目输入清单，再由 Core Project 组织本轮项目上下文。"""
-        paths = await asyncio.to_thread(files.context_inputs, scope.workdir)
+        paths = await asyncio.to_thread(
+            files.context_inputs, scope.user_id, scope.project_id
+        )
         return self.project.build_context(
             scope.workdir, scope.artifacts_dir, paths, current_prompt
         )

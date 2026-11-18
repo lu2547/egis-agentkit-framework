@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from ..service._model import ModelService
     from ..service._session_feedback import SessionFeedbackService
     from ..service._user import UserService
+    from ..service._virtual_user import VirtualUserService
     from ..service.access._grant import GrantService
     from ..service.access._share import ShareService
     from ..service.agent._agent_manager import AgentManager
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 @dataclass(slots=True)
 class AgentKitServices:
     users: "UserService"
+    virtual_users: "VirtualUserService"
     agents: "AgentManager"
     personal: "PersonalManager"
     teams: "TeamDefinition"

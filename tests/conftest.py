@@ -39,13 +39,8 @@ async def storage(tmp_path):
         hide_parameters=True,
         connect_args={"server_settings": {"search_path": schema}},
     )
-    from egis_agentkit.client.nacos._settings import SkillArchiveConfig
-    from egis_agentkit.storage.skill._archive import SkillArchiveStorage
-
-    archives = SkillArchiveStorage(
-        tmp_path / "nas", max_bytes=SkillArchiveConfig().max_bytes
-    )
-    result = AgentKitStorage(str(url), engine, skill_archives=archives)
+    result = AgentKitStorage(str(url), engine)
+    result.test_workspace_root = tmp_path
     await result.init_schema()
     async with result:
         yield result

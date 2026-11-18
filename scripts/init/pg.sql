@@ -2,7 +2,7 @@
 
 -- 执行前选定目标数据库及 search_path；本文件不创建角色、数据库或 schema。
 
--- 范围：AgentScope 原生 6 表、AgentKit 企业 18 表、cluster 消息总线 5 表。
+-- 范围：AgentScope 原生 6 表、AgentKit 企业 19 表、cluster 消息总线 5 表。
 
 -- 定义来源：storage/_schema.py、storage/model/_tables.py、storage/_remote_agent.py、storage/_message_bus.py。
 
@@ -354,8 +354,13 @@ CREATE UNIQUE INDEX uq_ak_resource_permission_origin ON ak_resource_permission (
 
 CREATE TABLE ak_skill_imports (
     job_id VARCHAR(64) NOT NULL,
-    owner_id VARCHAR(128) NOT NULL,
+    uploader_id VARCHAR(128) NOT NULL,
     filename VARCHAR(255) NOT NULL,
+    owner_type VARCHAR(16) DEFAULT 'user' NOT NULL,
+    uploader_type VARCHAR(16) DEFAULT 'user' NOT NULL,
+    reviewed_by VARCHAR(128),
+    reviewed_at TIMESTAMP WITH TIME ZONE,
+    review_reason TEXT,
     category VARCHAR(80) NOT NULL,
     avatar VARCHAR(64) NOT NULL,
     archive_location JSONB,
@@ -375,13 +380,15 @@ CREATE TABLE ak_skill_imports (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
     PRIMARY KEY (job_id),
-    CHECK (status IN ('queued','running','succeeded','failed')),
+    CHECK (status IN ('queued','running','pending_approval','rejected','succeeded','failed')),
+    CHECK (owner_type IN ('user','system')),
+    CHECK (uploader_type IN ('user','admin','virtual')),
     CHECK (progress BETWEEN 0 AND 100)
 );
 
 CREATE INDEX ix_ak_skill_import_claim ON ak_skill_imports (status, available_at);
 
-CREATE INDEX ix_ak_skill_import_owner ON ak_skill_imports (owner_id, created_at);
+CREATE INDEX ix_ak_skill_import_uploader ON ak_skill_imports (uploader_id, created_at);
 
 CREATE TABLE ak_users (
     user_id VARCHAR(128) NOT NULL,
@@ -399,6 +406,18 @@ CREATE TABLE ak_users (
 );
 
 CREATE INDEX ix_ak_user_groups ON ak_users USING gin (group_ids);
+
+CREATE TABLE ak_virtual_users (
+    user_id VARCHAR(128) NOT NULL,
+    username VARCHAR(128) NOT NULL,
+    credential_sha256 VARCHAR(64) NOT NULL,
+    is_enabled BOOLEAN DEFAULT true NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    updated_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
+    PRIMARY KEY (user_id)
+);
 
 CREATE TABLE ak_agent_definition_detail (
     definition_id VARCHAR(64) NOT NULL,

@@ -6,6 +6,7 @@ import sys
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from functools import partial
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +19,7 @@ from agentscope.permission import (
 )
 from agentscope.skill import Skill
 from agentscope.state import AgentState
-from agentscope.tool import Read, Toolkit
+from agentscope.tool import ExecResult, Read, Toolkit
 from agentscope.workspace import WorkspaceBase
 from runtime_helpers import (
     file_middleware,
@@ -36,6 +37,7 @@ from egis_agentkit.core.session._context import (
     SessionExecutionContext,
     session_execution_context,
 )
+from egis_agentkit.core.workspace._egis_sandbox_backend import EgisSandboxBackend
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.middleware import SessionCallbackMiddleware
 
@@ -167,8 +169,6 @@ class Resources:
         return {
             **ref,
             "source_checksum_sha256": "a" * 64,
-            "cache_checksum_sha256": "b" * 64,
-            "cache_dir": "skills/report",
             "skill_name": skill.name,
         }
 
@@ -437,6 +437,39 @@ async def test_unactivated_skills_and_parent_traversal_are_not_readable(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_http_tool_guard_uses_paths_and_symlinks_in_the_sandbox(tmp_path):
+    scope = scope_at(tmp_path)
+    scope.workdir.mkdir(parents=True)
+    outside = tmp_path / "foreign"
+    outside.mkdir()
+    (scope.workdir / "escape").symlink_to(outside, target_is_directory=True)
+
+    class SandboxClient:
+        async def exec_command(self, command, *, cwd, timeout):
+            assert command[:3] == ["realpath", "-m", "--"]
+            resolved = (Path(cwd) / command[3]).resolve()
+            return ExecResult(0, f"{resolved}\n".encode(), b"")
+
+    backend = EgisSandboxBackend(SandboxClient(), str(scope.workdir))
+    scope = replace(
+        scope,
+        workdir=PurePosixPath(scope.workdir),
+        artifacts_dir=PurePosixPath(scope.artifacts_dir),
+    )
+    access = build_tool_access_middleware(
+        object(), scope, Permissions([]), resolve_sandbox_path=backend.resolve_path
+    )
+    for data, expected in (
+        (call_input("Read", file_path=str(scope.workdir / "note.txt")), True),
+        (call_input("Glob"), True),
+        (call_input("Grep", path="escape"), False),
+        (call_input("Grep", path=str(outside), file_path=str(scope.workdir)), False),
+    ):
+        result = await access.on_check_permission(None, data, allow)
+        assert (result.behavior == PermissionBehavior.ALLOW) == expected
+
+
+@pytest.mark.asyncio
 async def test_personal_loader_refreshes_installed_enabled_skills(tmp_path):
     scope = scope_at(tmp_path, kind="personal")
     resources = Resources(tmp_path, [])
@@ -482,7 +515,7 @@ async def test_workspace_prompt_lists_project_inputs_without_following_links(tmp
     upload.write_text("pdf")
     (root / "linked-file").symlink_to(upload)
     (root / "linked-directory").symlink_to(tmp_path, target_is_directory=True)
-    workspace = project_prompt(scope)
+    workspace = project_prompt(scope, tmp_path)
     prompt = await workspace.on_system_prompt(None, "system")
     assert uploaded_paths(prompt) == [
         str(upload),
@@ -500,7 +533,7 @@ async def test_workspace_prompt_has_bounded_file_and_directory_scan(tmp_path):
     root.mkdir(parents=True)
     for index in range(55):
         (root / f"input-{index:02d}.txt").touch()
-    workspace = project_prompt(scope)
+    workspace = project_prompt(scope, tmp_path)
     assert len(uploaded_paths(await workspace.on_system_prompt(None, ""))) == 50
     for path in root.iterdir():
         path.unlink()
@@ -508,10 +541,11 @@ async def test_workspace_prompt_has_bounded_file_and_directory_scan(tmp_path):
         (root / f"dir-{index:03d}").mkdir()
     (root / "dir-204" / "too-late.txt").touch()
     assert uploaded_paths(await workspace.on_system_prompt(None, "")) == []
-    linked_scope = replace(scope, workdir=tmp_path / "linked" / ".work")
-    (tmp_path / "linked").symlink_to(root, target_is_directory=True)
-    linked = project_prompt(linked_scope)
-    assert uploaded_paths(await linked.on_system_prompt(None, "")) == []
+    outside = tmp_path / "outside"
+    root.rename(outside)
+    (outside / "hidden-input.txt").touch()
+    root.symlink_to(outside, target_is_directory=True)
+    assert uploaded_paths(await workspace.on_system_prompt(None, "")) == []
 
 
 @pytest.mark.asyncio

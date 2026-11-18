@@ -8,7 +8,7 @@
 
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import PurePosixPath
 
 from agentscope.app.storage import AgentRecord, SessionRecord
 
@@ -29,8 +29,8 @@ class SessionExecutionContext:
     root_definition: dict
     binding: dict
     session_record: SessionRecord
-    workdir: Path
-    artifacts_dir: Path
+    workdir: PurePosixPath
+    artifacts_dir: PurePosixPath
     project_id: str = ""
     policies: AccessConfig | None = None
     collaborator_definitions: dict = field(default_factory=dict)

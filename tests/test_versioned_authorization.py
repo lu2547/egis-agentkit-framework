@@ -75,6 +75,7 @@ async def test_expert_share_adds_independent_dependency_paths_for_group_and_user
             resource_type="skill",
             resource_id="skill1",
             resource_version=version,
+            publication_revision=int(version),
             owner_type="user",
             owner_id=alice.user_id,
         )

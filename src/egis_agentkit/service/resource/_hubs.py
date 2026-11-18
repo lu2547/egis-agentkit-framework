@@ -74,7 +74,7 @@ class LocalSkillHub(_LocalHub, SkillHubBase):
 
     async def download(self, user_id, card_id, version=None):
         asset = await self._asset(user_id, card_id, version)
-        content = await self.resources.skill_registry.archive(asset)
+        content = await self.resources.export_skill_archive(asset)
 
         async def stream():
             for start in range(0, len(content), 65536):

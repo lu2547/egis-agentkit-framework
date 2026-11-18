@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Awaitable, Callable, Mapping, Protocol
 
 from agentscope.middleware import MiddlewareBase
@@ -29,10 +29,10 @@ class ToolPaths(Protocol):
     """工具策略所需的工作与交付目录，由调用方提供。"""
 
     @property
-    def workdir(self) -> Path: ...
+    def workdir(self) -> Path | PurePosixPath: ...
 
     @property
-    def artifacts_dir(self) -> Path: ...
+    def artifacts_dir(self) -> Path | PurePosixPath: ...
 
 
 class SkillAccess(Protocol):
@@ -58,6 +58,7 @@ class ToolAccessMiddleware(MiddlewareBase):
         prepare_collaboration: Callable[[Agent, object], Awaitable[None]] | None = None,
         skills: SkillAccess | None = None,
         authorize_tool: Callable[..., Awaitable[None]] | None = None,
+        resolve_sandbox_path: Callable[[str], Awaitable[PurePosixPath]] | None = None,
     ):
         self.scope = scope
         self.validate_access = validate_access
@@ -65,6 +66,7 @@ class ToolAccessMiddleware(MiddlewareBase):
         self.prepare_collaboration = prepare_collaboration
         self.skills = skills
         self.authorize_tool = authorize_tool
+        self.resolve_sandbox_path = resolve_sandbox_path
 
     async def on_reply(self, agent, input_kwargs, next_handler):
         if self.prepare_collaboration is not None:
@@ -112,6 +114,40 @@ class ToolAccessMiddleware(MiddlewareBase):
             and not self.may_send_team_message()
         )
 
+    async def _check_file_path(self, name, data):
+        search = name in ("Glob", "Grep")
+        read_only = search or name == "Read"
+        if self.resolve_sandbox_path is None:
+            value = data.get("file_path") or data.get("path")
+        else:
+            value = data.get("path" if search else "file_path")
+        if search and not value:
+            value = "."
+        if not value:
+            return
+
+        roots = [self.scope.workdir, self.scope.artifacts_dir]
+        if read_only:
+            # Uploads belong to the project, not the session.
+            roots.append(self.scope.workdir.parent)
+        skills = self.skills.loaded.values() if read_only and self.skills else ()
+        if self.resolve_sandbox_path is None:
+            candidate = Path(value).resolve()
+            allowed = [root.resolve() for root in roots]
+            allowed.extend(
+                Path(skill.dir)
+                for skill in skills
+                if Path(skill.dir).resolve() == Path(skill.dir)
+            )
+        else:
+            candidate = await self.resolve_sandbox_path(value)
+            allowed = [PurePosixPath(root) for root in roots]
+            allowed.extend(PurePosixPath(skill.dir) for skill in skills)
+        if not any(candidate.is_relative_to(root) for root in allowed):
+            raise Forbidden(
+                "文件不在当前任务或已激活技能的范围内，请先通过 Skill 工具激活所需技能"
+            )
+
     async def on_check_permission(self, agent, input_kwargs, next_handler):
         tool = input_kwargs["tool"]
         try:
@@ -125,30 +161,7 @@ class ToolAccessMiddleware(MiddlewareBase):
             if self.authorize_tool is not None:
                 await self.authorize_tool(agent, tool, data)
             if tool.name in ("Read", "Write", "Edit", "Glob", "Grep"):
-                value = data.get("file_path") or data.get("path")
-                if tool.name in ("Glob", "Grep") and not value:
-                    # Native local search falls back to backend.getcwd(), which
-                    # is the service process cwd, not the project workdir.
-                    value = "."
-                if value:
-                    candidate = Path(value).resolve()
-                    allowed = [
-                        self.scope.workdir.resolve(),
-                        self.scope.artifacts_dir.resolve(),
-                    ]
-                    if tool.name in ("Read", "Glob", "Grep"):
-                        # Uploads belong to the project, not this session.
-                        allowed.append(self.scope.workdir.parent.resolve())
-                        if self.skills is not None:
-                            allowed.extend(
-                                Path(skill.dir)
-                                for skill in self.skills.loaded.values()
-                                if Path(skill.dir).resolve() == Path(skill.dir)
-                            )
-                    if not any(candidate.is_relative_to(root) for root in allowed):
-                        raise Forbidden(
-                            "文件不在当前任务或已激活技能的范围内，请先通过 Skill 工具激活所需技能"
-                        )
+                await self._check_file_path(tool.name, data)
             # Native ASK/DENY must not activate a skill. A confirmed retry also
             # traverses this middleware and activates only after native ALLOW.
             decision = await next_handler(**input_kwargs)

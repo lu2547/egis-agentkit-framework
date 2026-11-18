@@ -7,6 +7,7 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 import yaml
+from config_helpers import nacos_config_envelope
 
 from egis_agentkit.client.nacos import NacosBootstrap, NacosClient, NacosError
 
@@ -94,7 +95,7 @@ async def test_semantically_equal_existing_config_is_preserved():
 
     def handle(request):
         methods.append(request.method)
-        return httpx.Response(200, json={"code": 0, "data": stored})
+        return httpx.Response(200, json=nacos_config_envelope(stored))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
         client = NacosClient(NacosBootstrap(server_url="http://server"), http)
@@ -124,7 +125,7 @@ async def test_different_existing_config_is_rejected_without_overwriting(change)
         if request.method == "POST":
             stored = parse_qs(request.content.decode())["content"][0]
             return httpx.Response(200, json={"code": 0, "data": True})
-        return httpx.Response(200, json={"code": 0, "data": stored})
+        return httpx.Response(200, json=nacos_config_envelope(stored))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
         client = NacosClient(NacosBootstrap(server_url="http://server"), http)
@@ -193,7 +194,7 @@ async def test_publication_readback_mismatch_fails():
             return httpx.Response(200, json={"code": 20004})
         if request.method == "POST":
             return httpx.Response(200, json={"code": 0, "data": True})
-        return httpx.Response(200, json={"code": 0, "data": changed})
+        return httpx.Response(200, json=nacos_config_envelope(changed))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
         client = NacosClient(NacosBootstrap(server_url="http://server"), http)
@@ -229,7 +230,7 @@ async def test_cli_uses_prepared_file_and_environment_without_loading_dotenv(
         assert request.url.params["groupName"] == "EGIS_AGENTKIT"
         assert request.headers["test-identity"] == "private-identity"
         assert request.headers["accessToken"] == "private-token"
-        return httpx.Response(200, json={"code": 0, "data": content})
+        return httpx.Response(200, json=nacos_config_envelope(content))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
         monkeypatch.setattr(

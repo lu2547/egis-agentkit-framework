@@ -18,7 +18,7 @@ _STATUS_COLUMNS = tuple(
         "lease_until",
         "created_by",
         "updated_by",
-        "owner_id",
+        "uploader_id",
         "available_at",
     }
 )
@@ -35,31 +35,74 @@ class SkillImportStorage:
         async with self.engine.begin() as conn:
             return dict((await conn.execute(statement)).mappings().one())
 
-    async def get(self, owner_id, job_id):
+    async def get(self, uploader_id, job_id):
         statement = select(*_STATUS_COLUMNS).where(
-            _IMPORTS.c.job_id == job_id, _IMPORTS.c.owner_id == owner_id
+            _IMPORTS.c.job_id == job_id, _IMPORTS.c.uploader_id == uploader_id
         )
         async with self.engine.connect() as conn:
             row = (await conn.execute(statement)).mappings().first()
             return dict(row) if row is not None else None
 
-    async def list(self, owner_id, *, limit):
+    async def list(self, uploader_id, *, limit):
         statement = (
             select(*_STATUS_COLUMNS)
-            .where(_IMPORTS.c.owner_id == owner_id)
+            .where(_IMPORTS.c.uploader_id == uploader_id)
             .order_by(_IMPORTS.c.created_at.desc())
             .limit(limit)
         )
         async with self.engine.connect() as conn:
             return [dict(row) for row in (await conn.execute(statement)).mappings()]
 
-    async def retry(self, owner_id, job_id):
+    async def list_reviews(self, *, limit):
+        statement = (
+            select(*_STATUS_COLUMNS, _IMPORTS.c.uploader_id.label("uploaded_by"))
+            .where(_IMPORTS.c.status == "pending_approval")
+            .order_by(_IMPORTS.c.created_at, _IMPORTS.c.job_id)
+            .limit(limit)
+        )
+        async with self.engine.connect() as conn:
+            return [dict(row) for row in (await conn.execute(statement)).mappings()]
+
+    async def pending_review(self, job_id):
+        statement = select(_IMPORTS.c.filename, _IMPORTS.c.archive_location).where(
+            _IMPORTS.c.job_id == job_id, _IMPORTS.c.status == "pending_approval"
+        )
+        async with self.engine.connect() as conn:
+            row = (await conn.execute(statement)).mappings().one_or_none()
+            return dict(row) if row is not None else None
+
+    async def decide(self, job_id, *, approved, actor, reason):
+        now = func.now()
+        values = {
+            "status": "queued" if approved else "rejected",
+            "stage": "approved" if approved else "rejected",
+            "reviewed_by": actor,
+            "reviewed_at": now,
+            "review_reason": reason,
+            "updated_by": actor,
+            "updated_at": now,
+            "available_at": now,
+            "attempts": 0,
+        }
+        if not approved:
+            values["archive_location"] = None
+        statement = (
+            update(_IMPORTS)
+            .where(_IMPORTS.c.job_id == job_id, _IMPORTS.c.status == "pending_approval")
+            .values(**values)
+            .returning(*_STATUS_COLUMNS)
+        )
+        async with self.engine.begin() as conn:
+            row = (await conn.execute(statement)).mappings().one_or_none()
+            return dict(row) if row is not None else None
+
+    async def retry(self, uploader_id, job_id):
         now = func.now()
         statement = (
             update(_IMPORTS)
             .where(
                 _IMPORTS.c.job_id == job_id,
-                _IMPORTS.c.owner_id == owner_id,
+                _IMPORTS.c.uploader_id == uploader_id,
                 _IMPORTS.c.status == "failed",
             )
             .values(

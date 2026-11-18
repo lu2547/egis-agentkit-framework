@@ -15,9 +15,6 @@ agentkit:
           soul: soul.md
           user: user.md
         maxBytes: 64000
-      memory:
-        isEnabled: false
-        topK: 5
     remote:
       request:
         maxBytes: 1048576
@@ -47,7 +44,7 @@ agentkit:
       maxMembers: 20
   skill:
     storage:
-      root: /mnt/company-nas/agentkit/skill-archives
+      root: /mnt/company-nas/agentkit/skill-uploads
     archive:
       maxBytes: 52428799
       maxExpandedBytes: null
@@ -58,6 +55,7 @@ agentkit:
       retryBackoffSeconds: 5.0
       maxRetryDelaySeconds: 60.0
       listLimit: 100
+      approvalBatchLimit: 50
   session:
     steering:
       maxBatchSize: 20
@@ -105,6 +103,8 @@ agentkit:
     defaults:
       registeredIds: null
   access:
+    companyGroupId: company
+    companyGroupName: 公司组
     allowPrivateSelfUse: true
     allowPersonalSelfUse: true
   user:
@@ -114,16 +114,14 @@ agentkit:
       audience: egis-agentkit
       algorithm: RS256
       jwksUrl: https://identity.example.com/.well-known/jwks.json
-      signingSecretEnv: AGENTKIT_JWT_SECRET
-      demoPasswordEnv: AGENTKIT_DEMO_PASSWORD
-      jwtLifetimeSeconds: 3600
       jwtClockSkewSeconds: 10.0
       jwtMaxTokenLength: 16384
-      jwtMinSigningSecretLength: 32
       jwksCacheSeconds: 300
       jwksTimeoutSeconds: 10.0
-      demoMinPasswordLength: 16
   project:
+    memory:
+      isEnabled: false
+      topK: 5
     defaults:
       name: 默认项目
       maxNameLength: 128
@@ -135,7 +133,7 @@ agentkit:
       maxPageSize: 100
       writingTools: [Write, Edit, Bash, PowerShell, CreateDemoReport]
     upload:
-      maxBytes: 20971520
+      maxBytes: 52428800
     scan:
       maxDepth: 32
       maxEntries: 10000
@@ -216,6 +214,12 @@ agentkit:
     lock:
       leaseSeconds: 90.0
       waitTimeoutSeconds: 30.0
+    files:
+      win: false
+      # Windows Agent 设置 win: true，填写挂载同一 NAS 的 Linux 文件服务地址。
+      # endpoint: http://nas-files.internal:38093
+      tokenEnv: AGENTKIT_NAS_FILE_TOKEN
+      timeoutSeconds: 60.0
     readGuard:
       sampleBytes: 4096
       controlByteRatioThreshold: 0.3

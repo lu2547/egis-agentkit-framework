@@ -10,3 +10,7 @@ def sandbox_runtime(root):
             "apiKeyEnv": "TEST_SANDBOX_KEY",
         },
     }
+
+
+def nacos_config_envelope(content):
+    return {"code": 0, "data": {"success": True, "content": content, "errorCode": 0}}

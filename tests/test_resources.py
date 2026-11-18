@@ -1,12 +1,14 @@
 import asyncio
 import io
 import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
 from test_domain import identities
 
+from egis_agentkit.client.nacos._settings import SkillArchiveConfig
 from egis_agentkit.core.skill._archive import (
     calculate_archive_digest,
     read_archive_files,
@@ -37,17 +39,18 @@ async def put_asset(
     owner_type="system",
     owner_id="demo",
     checksum=None,
+    revision=1,
 ):
     content = archive()
     files = read_archive_files(content)
-    checksum = calculate_archive_digest(content) if checksum is None else checksum
     asset = Asset(
         resource_type="skill",
         resource_id=rid,
         resource_version=version,
+        publication_revision=revision,
         owner_type=owner_type,
         owner_id=owner_id,
-        checksum_sha256=checksum,
+        checksum_sha256=calculate_archive_digest(content),
         payload={
             "files": [
                 {"path": name, "size": len(value)}
@@ -55,10 +58,15 @@ async def put_asset(
             ],
             "display_name": "Report",
             "description": "Demo",
-            "is_skill_market_visible": True,
         },
     )
-    asset.payload.update(storage.skill_archives.write_archive(content))
+    from egis_agentkit.storage.skill._version import SkillVersionStorage
+
+    SkillVersionStorage(storage.test_workspace_root).publish(
+        asset.model_dump(), files, max_bytes=SkillArchiveConfig().expanded_bytes_limit
+    )
+    if checksum is not None:
+        asset = asset.model_copy(update={"checksum_sha256": checksum})
     async with storage.transaction() as conn:
         await conn.execute(
             t.assets.insert().values(
@@ -94,7 +102,9 @@ async def test_system_skill_catalog_and_install_require_exact_version_grant(
             resource_owner_id="demo",
         ),
     )
-    assert (await resources.list(alice, "skill"))[0]["is_usable"]
+    (system_skill,) = await resources.list(alice, "skill")
+    assert system_skill["is_usable"]
+    assert system_skill["owner_display_name"] == "系统"
     installed = await resources.install(alice, "skill", "report")
     assert installed["is_installed"] and installed["is_enabled"]
     assert (await resources.personal.list_resources(alice, "skill"))["report"][
@@ -102,9 +112,9 @@ async def test_system_skill_catalog_and_install_require_exact_version_grant(
     ]
     assert len(await GrantService(storage).list_grants(admin)) == 1
     await resources.update_installation(alice, "skill", "report", False)
-    assert (await resources.detail(alice, "skill", "report", "1.0.0"))[
-        "is_enabled"
-    ] is False
+    detail = await resources.detail(alice, "skill", "report", "1.0.0")
+    assert detail["is_enabled"] is False
+    assert detail["owner_display_name"] == "系统"
     await GrantService(storage).revoke(admin, grant["id"])
     assert await resources.list(alice, "skill") == []
     assert await resources.list_asset_versions(alice, "skill", "report") == []
@@ -122,7 +132,6 @@ async def test_own_private_publish_immutable_concurrent_save_and_other_owner_den
         "display_name": "Own",
         "description": "Private",
         "markdown": "# Facts",
-        "is_skill_market_visible": False,
     }
     results = await asyncio.gather(
         resources.save_skill(alice, data),
@@ -199,13 +208,13 @@ async def test_materialization_preserves_files_checks_checksum_and_exact_inherit
         alice, "report", "1.0.0", authorization_scope=scope
     )
     assert (
-        __import__("pathlib").Path(materialized.dir) / "references/checklist.md"
+        Path(materialized.dir) / "references/checklist.md"
     ).read_text() == "Actual attached content"
     with pytest.raises(Forbidden):
         await resources.materialize_skill(
             bob, "report", "1.0.0", authorization_scope=scope
         )
-    await put_asset(storage, version="1.1.0")
+    await put_asset(storage, version="1.1.0", revision=2)
     with pytest.raises(Forbidden):
         await resources.materialize_skill(
             alice, "report", "1.1.0", authorization_scope=scope
@@ -219,25 +228,23 @@ async def test_materialization_preserves_files_checks_checksum_and_exact_inherit
 
 @pytest.mark.asyncio
 async def test_hostile_skill_archives_and_command_mcp_rejected(storage, tmp_path):
-    _, _, alice, _ = await identities(storage)
+    _, admin, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
     with pytest.raises(ValueError):
         await resources.upload_skill(alice, archive(extra="../../outside.txt"), "1.0.0")
     with pytest.raises(ValueError):
         await resources.save_mcp(
-            alice,
+            admin,
             {
                 "resource_id": "bad",
-                "resource_version": "1.0.0",
                 "config": {"transport": "stdio", "command": "sh"},
             },
         )
     with pytest.raises(ValueError):
         await resources.save_mcp(
-            alice,
+            admin,
             {
                 "resource_id": "bad",
-                "resource_version": "1.0.0",
                 "config": {
                     "transport": "streamable_http",
                     "url": "http://user:password@host/mcp",
@@ -258,6 +265,18 @@ async def test_shared_resource_uses_only_approved_asset_version(storage, tmp_pat
             "markdown": "# Approved",
         },
     )
+    # An existing version with the former display flag remains governed by grants.
+    async with storage.engine.begin() as conn:
+        asset = await storage.assets.get("skill", "shared-report", "1.0.0", conn=conn)
+        await conn.execute(
+            t.assets.update()
+            .where(t.assets.c.resource_id == "shared-report")
+            .values(payload={**asset["payload"], "is_skill_market_visible": False})
+        )
+    (owned,) = await resources.list(alice, "skill")
+    assert owned["resource_id"] == "shared-report"
+    assert not owned["is_installed"]
+    assert await resources.list(bob, "skill") == []
     from egis_agentkit.service.access._share import ShareService
     from egis_agentkit.storage.model import ShareTarget
 
@@ -278,7 +297,8 @@ async def test_shared_resource_uses_only_approved_asset_version(storage, tmp_pat
             "markdown": "# Private newer",
         },
     )
-    assert (await resources.list(bob, "skill"))[0]["resource_version"] == "1.0.0"
+    (shared,) = await resources.list(bob, "skill")
+    assert shared["resource_version"] == "1.0.0"
     assert (await resources.detail(bob, "skill", "shared-report", "1.0.0"))["is_usable"]
     with pytest.raises(Forbidden):
         await resources.detail(bob, "skill", "shared-report", "1.1.0")
@@ -289,49 +309,26 @@ async def test_shared_resource_uses_only_approved_asset_version(storage, tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_materialize_failure_never_exposes_partial_cache(storage, tmp_path):
+async def test_materialize_refuses_corrupt_version(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
     await put_asset(storage, owner_type="user", owner_id="alice", checksum="0" * 64)
     with pytest.raises(Conflict):
         await resources.materialize_skill(alice, "report", "1.0.0")
-    assert not (tmp_path / "common/skills/report").exists()
-    source = await storage.assets.get("skill", "report", "1.0.0")
-    location = storage.skill_archives.write_archive(archive(extra="../../outside.txt"))
-    async with storage.transaction() as conn:
-        await conn.execute(
-            t.assets.update()
-            .where(t.assets.c.resource_type == "skill")
-            .values(payload={**source["payload"], **location})
-        )
-    with pytest.raises(ValueError):
-        await resources.materialize_skill(alice, "report", "1.0.0")
-    assert not (tmp_path / "outside.txt").exists()
 
 
 @pytest.mark.asyncio
-async def test_oversized_download_closes_upstream_stream(storage, tmp_path):
-    from agentscope.app.hub._skill._base import SkillArchive
-
+async def test_skill_download_enforces_zip_limit(storage, tmp_path):
     _, _, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
     await put_asset(storage, owner_type="user", owner_id="alice")
-    resources.policies = SimpleNamespace(max_skill_archive_bytes=4)
-    closed = []
-
-    async def stream():
-        try:
-            yield b"oversized"
-        finally:
-            closed.append(True)
-
-    async def download(*args):
-        return SkillArchive("zip", stream())
-
-    resources.skill_hub.download = download
     with pytest.raises(ValueError):
-        await resources.materialize_skill(alice, "report", "1.0.0")
-    assert closed == [True]
+        await resources.download_skill(
+            alice,
+            "report",
+            "1.0.0",
+            archive_limits=SkillArchiveConfig(max_bytes=128, max_expanded_bytes=1024),
+        )
 
 
 @pytest.mark.asyncio
@@ -345,24 +342,21 @@ async def test_oversized_download_closes_upstream_stream(storage, tmp_path):
 async def test_mcp_fails_closed_if_stored_endpoint_changes_or_checksum_missing(
     storage, tmp_path, endpoint, changed_endpoint
 ):
-    _, _, alice, _ = await identities(storage)
+    _, admin, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
     await resources.save_mcp(
-        alice,
+        admin,
         {
             "resource_id": "pinned",
-            "resource_version": "1.0.0",
             "config": {
                 "transport": "streamable_http",
                 "url": endpoint,
             },
         },
     )
-    ref = ResourceRef(
-        resource_type="mcp", resource_id="pinned", resource_version="1.0.0"
-    )
+    ref = ResourceRef(resource_type="mcp", resource_id="pinned")
     assert (await resources.mcps_for_refs(alice, [ref]))[0].mcp_config.url == endpoint
-    asset = await resources._asset("mcp", "pinned", "1.0.0")
+    asset = await resources._asset("mcp", "pinned", None)
     payload = asset["payload"]
     changed = {
         **payload,
@@ -378,6 +372,8 @@ async def test_mcp_fails_closed_if_stored_endpoint_changes_or_checksum_missing(
         await resources.mcps_for_refs(alice, [ref])
     with pytest.raises(Conflict):
         await resources.install(alice, "mcp", "pinned")
+    with pytest.raises(Conflict):
+        await resources.mcp_auth_action(alice, "pinned", "start")
     async with storage.transaction() as conn:
         await conn.execute(
             t.assets.update()
@@ -435,13 +431,8 @@ async def test_download_skill_authorizes_exact_version_and_checks_archive(
         .read("report/SKILL.md")
         .endswith(b"# Report")
     )
-    source = await storage.assets.get("skill", "report", "1.0.0")
-    location = storage.skill_archives.write_archive(archive(extra="changed.md"))
-    async with storage.transaction() as conn:
-        await conn.execute(
-            t.assets.update()
-            .where(t.assets.c.resource_type == "skill")
-            .values(payload={**source["payload"], **location})
-        )
+    (tmp_path / "common/skills/report/1.0.0/references/checklist.md").write_bytes(
+        b"tampered"
+    )
     with pytest.raises(Conflict):
         await resources.download_skill(alice, "report", "1.0.0")

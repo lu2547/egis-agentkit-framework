@@ -1,4 +1,4 @@
-"""管理技能版本登记与 NAS 归档读取，内容规则复用 Core。"""
+"""管理技能版本登记与文件读取，内容规则复用 Core。"""
 
 import asyncio
 import re
@@ -9,23 +9,19 @@ from ._registry import _LocalRegistry
 
 
 class LocalSkillRegistry(_LocalRegistry):
-    """先把版本包完整保存到共享文件目录，再登记包含定位元数据的版本。"""
+    """Use the asset registration and the shared version directory together."""
 
-    def __init__(self, assets, archives):
+    def __init__(self, assets, versions):
         super().__init__(assets, "skill")
-        self.archives = archives
+        self.versions = versions
 
-    async def register(self, asset, *, actor, archive=None):
-        """NAS 写入失败时不写版本；数据库失败时不发布未登记的文件。"""
-        if archive is None:
-            raise ValueError("Skill archive is required")
-        location = await asyncio.to_thread(self.archives.write_archive, archive)
-        saved = asset.model_copy(update={"payload": {**asset.payload, **location}})
-        return await super().register(saved, actor=actor)
+    async def publish_files(self, asset, files, *, max_bytes):
+        await asyncio.to_thread(
+            self.versions.publish, asset, files, max_bytes=max_bytes
+        )
 
-    async def archive(self, asset):
-        """读取当前版本定位的共享包，不提供数据库二进制回退。"""
-        return await asyncio.to_thread(self.archives.read_archive, asset["payload"])
+    async def read(self, asset, *, max_bytes):
+        return await asyncio.to_thread(self.versions.read, asset, max_bytes=max_bytes)
 
 
 def _skill_front(markdown: str) -> dict:

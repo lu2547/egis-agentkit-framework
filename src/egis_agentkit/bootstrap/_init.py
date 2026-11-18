@@ -6,13 +6,13 @@ from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
 
 from agentscope.app.workspace_manager import WorkspaceManagerBase
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from egis_agentkit.bootstrap._demo_tools import deploy_demo_report_tools
 from egis_agentkit.bootstrap._middlewares import build_middlewares
+from egis_agentkit.bootstrap._skill_tools import deploy_skill_tools
 from egis_agentkit.client._logging import LoggingClient
 from egis_agentkit.client._postgres import (
     check_postgres,
@@ -25,8 +25,8 @@ from egis_agentkit.client.nacos._config import LivePolicies
 from egis_agentkit.client.sandbox import SandboxClient
 from egis_agentkit.core.agent._expert_definition import ExpertDefinition
 from egis_agentkit.core.agent._remote_definition import RemoteDefinition
-from egis_agentkit.middleware.agent._personal_memory_middleware_override import (
-    PersonalMemoryMiddlewareOverride,
+from egis_agentkit.middleware.agent._project_memory_middleware_override import (
+    ProjectMemoryMiddlewareOverride,
 )
 from egis_agentkit.middleware.workspace._workspace_read_guard_middleware_impl import (
     ReadToolGuardMiddleware,
@@ -35,15 +35,16 @@ from egis_agentkit.service._composer import ComposerService
 from egis_agentkit.service._model import ModelService
 from egis_agentkit.service._session_feedback import SessionFeedbackService
 from egis_agentkit.service._user import UserService
+from egis_agentkit.service._virtual_user import VirtualUserService
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.service.agent._agent_manager import AgentManager
-from egis_agentkit.service.agent._personal_memory import PersonalMemoryService
 from egis_agentkit.service.agent._remote_agent import (
     RemoteAgentService,
 )
 from egis_agentkit.service.project._document_preview import DocumentPreviewService
 from egis_agentkit.service.project._file_manager import ProjectFileManager
+from egis_agentkit.service.project._memory import ProjectMemoryService
 from egis_agentkit.service.project._presentation_manager import (
     ProjectPresentationManager,
 )
@@ -86,7 +87,7 @@ class AgentKit:
     _config: NacosConfigProvider
     _owned_client: NacosClient | None
     _skill_imports: SkillImportService
-    _memory: PersonalMemoryService | None
+    _memory: ProjectMemoryService | None
     _owns_engine: bool
     _logging: LoggingClient
     _tracing: TracingClient
@@ -143,6 +144,10 @@ def init_agentkit(
     snapshot = config.snapshot
     postgres = snapshot.client.postgres
     workspace = snapshot.workspace
+    root = workspace.runtime.root
+    files = ProjectFileStorage(root, config_provider=config)
+    if files.uses_nas_api and snapshot.project.memory.is_enabled:
+        raise ValueError("HTTP 文件模式下，ReMe 项目记忆需要关闭 project.memory.isEnabled")
     # 具体沙箱通信只在装配点选择；公司实现可直接注入中立 Client 工厂。
     runtime = workspace.runtime
     sandbox_settings = runtime.sandbox
@@ -166,9 +171,8 @@ def init_agentkit(
     tracing = TracingClient(snapshot.client.tracing)
     bus = SessionMessageBus(engine=engine, kafka=snapshot.client.kafka, tracing=tracing)
     remote_agents = RemoteAgentService(storage.remote_runs, bus, config=config)
-    root = Path(workspace.runtime.root)
     policies = LivePolicies(config)
-    users = UserService(storage)
+    users = UserService(storage, policies)
     experts = ExpertDefinition()
     remote_definition = RemoteDefinition()
     agents = AgentManager(
@@ -180,13 +184,12 @@ def init_agentkit(
     )
     models = ModelService(storage, config)
     memory = (
-        PersonalMemoryService(
-            storage, root, config, middleware_factory=PersonalMemoryMiddlewareOverride
+        ProjectMemoryService(
+            storage, root, config, middleware_factory=ProjectMemoryMiddlewareOverride
         )
-        if snapshot.agent.personal.memory.is_enabled
+        if snapshot.project.memory.is_enabled
         else None
     )
-    files = ProjectFileStorage(root, config_provider=config)
     resources = ResourceService(storage, root, policies=policies, config=config)
     workspace_manager = EgisSandboxManager(
         root,
@@ -195,6 +198,7 @@ def init_agentkit(
         bus=bus,
         probe=workspace.probe,
         lock=workspace.lock,
+        files=files,
         read_guard_factory=partial(
             ReadToolGuardMiddleware, settings=workspace.read_guard
         ),
@@ -233,13 +237,16 @@ def init_agentkit(
         ),
         config_provider=config,
     )
-    skill_imports = SkillImportService(storage, resources)
+    virtual_users = VirtualUserService(storage.virtual_users)
+    skill_imports = SkillImportService(storage, resources, virtual_users=virtual_users)
+    deploy_skill_tools(resources.tool_registry, skill_imports)
     services = AgentKitServices(
         users=users,
+        virtual_users=virtual_users,
         agents=agents,
         personal=personal,
         teams=TeamDefinition(storage, policies, config_provider=config),
-        grants=GrantService(storage),
+        grants=GrantService(storage, policies),
         sharing=ShareService(storage),
         models=models,
         projects=projects,

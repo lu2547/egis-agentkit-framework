@@ -16,6 +16,7 @@ from agentscope.formatter import OpenAIChatFormatter
 from agentscope.message import TextBlock, ToolCallBlock
 from agentscope.model import ChatModelBase, ChatResponse
 from egis_agentkit_app.bootstrap import build_app
+from identity_helpers import configure_test_issuer, signed_token
 from runtime_helpers import stub_sandbox_provider
 from sqlalchemy import select
 from test_app_http import Config, app_snapshot
@@ -71,10 +72,9 @@ async def test_finance_through_native_chat_invite_and_teamsay(
     protocol, storage, tmp_path, monkeypatch
 ):
     stub_sandbox_provider(monkeypatch)
+    configure_test_issuer(monkeypatch)
     _, admin, _, _ = await identities(storage)
     monkeypatch.setenv("TEST_DOWNLOAD", "download-secret-with-more-than-thirty-two-bytes")
-    monkeypatch.setenv("TEST_JWT", "jwt-secret-with-more-than-thirty-two-bytes")
-    monkeypatch.setenv("TEST_LOGIN", "a-test-password-with-enough-entropy")
     monkeypatch.setenv("TEST_MODEL_KEY", "test-only-unused-model-key")
     monkeypatch.setenv("EGIS_REMOTE_AGENT_FINANCE_TOKEN", "finance-token")
     monkeypatch.setenv("EGIS_REMOTE_AGENT_FINANCE_CALLBACK_SECRET", "finance-callback-secret-32-characters")
@@ -132,12 +132,7 @@ async def test_finance_through_native_chat_invite_and_teamsay(
                 serve(provider.app, demo_socket),
                 httpx.AsyncClient(base_url=egis_url) as client,
             ):
-                login = await client.post(
-                    "/auth/login",
-                    json={"user_id": "admin", "password": "a-test-password-with-enough-entropy"},
-                )
-                assert login.status_code == 200, login.text
-                client.headers["Authorization"] = "Bearer " + login.json()["access_token"]
+                client.headers["Authorization"] = "Bearer " + signed_token("admin")
 
                 registration = json.loads((FINANCE / f"{protocol}.json").read_text())
                 for field in ("endpoint", "cancel_endpoint"):

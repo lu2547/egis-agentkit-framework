@@ -1,115 +1,95 @@
-"""技能版本包写受管共享文件目录，数据库只保存包定位与摘要。"""
+"""发布、读取及下载受管的技能版本目录。"""
 
 import asyncio
-import hashlib
 from pathlib import Path
 
 import pytest
-from sqlalchemy import inspect, select
 from test_domain import identities
 from test_resources import archive
 
-from egis_agentkit.errors import Conflict, Forbidden
+from egis_agentkit.core.skill._archive import read_archive_files
+from egis_agentkit.errors import Conflict
+from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.resource._catalog import ResourceService
-from egis_agentkit.storage import tables as t
-
-
-def archive_storage(root):
-    from egis_agentkit.storage.skill._archive import SkillArchiveStorage
-
-    return SkillArchiveStorage(root, max_bytes=1024 * 1024)
-
-
-def test_archive_is_atomically_written_and_verified(tmp_path):
-    store = archive_storage(tmp_path / "nas")
-    content = archive()
-    location = store.write_archive(content)
-    assert location["archive_sha256"] == hashlib.sha256(content).hexdigest()
-    assert location["archive_size_bytes"] == len(content)
-    assert store.read_archive(location) == content
-    (store.root / location["archive_path"]).write_bytes(b"corrupt")
-    with pytest.raises(Conflict):
-        store.read_archive(location)
+from egis_agentkit.storage.model import Grant
 
 
 @pytest.mark.asyncio
-async def test_same_package_has_one_complete_file_under_concurrent_writes(tmp_path):
-    store = archive_storage(tmp_path / "nas")
-    content = archive()
-    locations = await asyncio.gather(
-        *(asyncio.to_thread(store.write_archive, content) for _ in range(5))
-    )
-    assert all(location == locations[0] for location in locations)
-    assert len(list(store.root.glob("*.zip"))) == 1
-    assert not list(store.root.glob(".upload-*"))
-
-
-def test_symlink_archive_cannot_be_read_or_overwritten(tmp_path):
-    store = archive_storage(tmp_path / "nas")
-    content = archive()
-    digest = hashlib.sha256(content).hexdigest()
-    store.root.mkdir()
-    outside = tmp_path / "outside.zip"
-    outside.write_bytes(content)
-    (store.root / (digest + ".zip")).symlink_to(outside)
-    with pytest.raises((Conflict, Forbidden)):
-        store.write_archive(content)
-    assert outside.read_bytes() == content
-
-
-def test_failed_publish_does_not_leave_a_partial_package(tmp_path, monkeypatch):
-    import os
-
-    store = archive_storage(tmp_path / "nas")
-
-    def fail(*args, **kwargs):
-        raise OSError("NAS unavailable")
-
-    monkeypatch.setattr(os, "replace", fail)
-    with pytest.raises(OSError):
-        store.write_archive(archive())
-    assert not list(store.root.glob("*.zip"))
-    assert not list(store.root.glob(".upload-*"))
-
-
-@pytest.mark.asyncio
-async def test_upload_download_and_cold_materialization_use_nas_metadata(
-    storage, tmp_path
+@pytest.mark.parametrize(
+    "owner_type, location",
+    [
+        ("system", "common/skills/report/1.0.0"),
+        ("user", "user/alice/skills/report/1.0.0"),
+    ],
+)
+async def test_published_files_are_canonical_for_download_and_runtime(
+    storage, tmp_path, owner_type, location
 ):
-    _, _, alice, _ = await identities(storage)
-    resources = ResourceService(storage, tmp_path)
-    saved = await resources.upload_skill(alice, archive(), "1.0.0")
-    asset = await storage.assets.get("skill", saved["resource_id"], "1.0.0")
-    payload = asset["payload"]
-    assert {"archive_path", "archive_size_bytes", "archive_sha256"} <= payload.keys()
-    assert storage.skill_archives.read_archive(payload)
-    async with storage.engine.connect() as conn:
-        assert "ak_skill_archives" not in await conn.run_sync(
-            lambda sync: inspect(sync).get_table_names()
+    _, admin, alice, _ = await identities(storage)
+    user = admin if owner_type == "system" else alice
+    root = tmp_path / "workspace"
+    resources = ResourceService(storage, root)
+    uploaded = archive()
+    await resources.upload_skill(
+        user, uploaded, "1.0.0", resource_id="report", owner_type=owner_type
+    )
+    destination = root / location
+    assert destination.is_dir()
+    assert (
+        destination / "references/checklist.md"
+    ).read_text() == "Actual attached content"
+    assert not list(root.rglob("*.zip"))
+    asset = await storage.assets.get("skill", "report", "1.0.0")
+    assert not any(key.startswith("archive_") for key in asset["payload"])
+    if owner_type == "system":
+        await GrantService(storage).grant(
+            admin,
+            Grant(
+                principal_type="user",
+                principal_id=alice.user_id,
+                resource_type="skill",
+                resource_id="report",
+                resource_view_type="system",
+                resource_owner_type="system",
+                resource_owner_id="system",
+            ),
         )
-    cold = ResourceService(storage, tmp_path / "another-node-cache")
-    skill = await cold.materialize_skill(alice, saved["resource_id"], "1.0.0")
-    assert (Path(skill.dir) / "SKILL.md").is_file()
-    (storage.skill_archives.root / payload["archive_path"]).write_bytes(b"corrupt")
+    user = alice
+    other_worker = ResourceService(storage, root)
+    result = await other_worker.materialize_skill(user, "report", "1.0.0")
+    assert Path(result.dir) == destination
+    assert read_archive_files(
+        await other_worker.download_skill(user, "report", "1.0.0")
+    ) == read_archive_files(uploaded)
+    (destination / "references/checklist.md").write_text("corrupt")
     with pytest.raises(Conflict):
-        await cold.download_skill(alice, saved["resource_id"], "1.0.0")
+        await other_worker.download_skill(user, "report", "1.0.0")
+    with pytest.raises(Conflict):
+        await other_worker.materialize_skill(user, "report", "1.0.0")
 
 
 @pytest.mark.asyncio
-async def test_nas_failure_rolls_back_published_version_and_owner_grant(
+async def test_failed_filesystem_publish_leaves_no_version_or_owner_grant(
     storage, tmp_path, monkeypatch
 ):
+    import os
+
+    from sqlalchemy import select
+
+    from egis_agentkit.storage import tables as t
+
     _, _, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
 
     def fail(*args, **kwargs):
         raise OSError("NAS unavailable")
 
-    monkeypatch.setattr(storage.skill_archives, "write_archive", fail)
-    with pytest.raises(OSError):
+    monkeypatch.setattr(os, "rename", fail)
+    with pytest.raises(OSError, match="NAS unavailable"):
         await resources.upload_skill(
             alice, archive(), "1.0.0", resource_id="failed-skill"
         )
+    assert not list((tmp_path / "user/alice/skills/failed-skill").iterdir())
     assert await storage.assets.get("skill", "failed-skill", "1.0.0") is None
     async with storage.engine.connect() as conn:
         assert (
@@ -121,13 +101,27 @@ async def test_nas_failure_rolls_back_published_version_and_owner_grant(
         ).first() is None
 
 
-def test_skill_storage_requires_an_explicit_absolute_nas_root():
-    from pydantic import ValidationError
+@pytest.mark.asyncio
+async def test_competing_publications_leave_one_complete_skill_version(storage, tmp_path):
+    _, _, alice, _ = await identities(storage)
 
-    from egis_agentkit.client.nacos._settings import SkillConfig, SkillStorageConfig
-    from egis_agentkit.storage.skill._archive import SkillArchiveStorage
+    async def publish(name):
+        resources = ResourceService(storage, tmp_path)
+        return await resources.upload_skill(
+            alice, archive(name=name), "1.0.0", resource_id="report"
+        )
 
-    with pytest.raises(ValueError, match="NAS"):
-        SkillArchiveStorage.from_settings(SkillConfig())
-    with pytest.raises(ValidationError):
-        SkillStorageConfig(root="relative/skills")
+    results = await asyncio.gather(
+        publish("first"), publish("second"), return_exceptions=True
+    )
+    [saved] = [result for result in results if isinstance(result, dict)]
+    [failure] = [result for result in results if isinstance(result, BaseException)]
+    assert isinstance(failure, Conflict)
+    version = tmp_path / "user/alice/skills/report/1.0.0"
+    contents = await ResourceService(storage, tmp_path).download_skill(
+        alice, "report", "1.0.0"
+    )
+    assert read_archive_files(contents) == read_archive_files(
+        archive(name=saved["payload"]["display_name"])
+    )
+    assert list(version.parent.iterdir()) == [version]

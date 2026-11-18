@@ -114,11 +114,14 @@ async def test_project_context_is_built_by_core_from_managed_inputs(
     from egis_agentkit.service.project._project_manager import ProjectManager
 
     scope = SimpleNamespace(
-        workdir=tmp_path / ".work", artifacts_dir=tmp_path / "artifacts"
+        user_id="alice",
+        project_id="project",
+        workdir=tmp_path / ".work",
+        artifacts_dir=tmp_path / "artifacts",
     )
     files = ProjectFileManager(None, tmp_path)
     monkeypatch.setattr(
-        files, "context_inputs", lambda workdir: [str(tmp_path / "input.pdf")]
+        files, "context_inputs", lambda user_id, project_id: [str(tmp_path / "input.pdf")]
     )
     seen = []
 

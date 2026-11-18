@@ -92,6 +92,7 @@ class InvitationStorage:
             "egis_agentkit"
         ]
         kwargs["state"].session_id = assembled.session_id
+        kwargs["state"].permission_context.mode = self.state.permission_context.mode
         session = await self.storage.upsert_session(user_id, agent_id, config, **kwargs)
         self.created_sessions.append(session.id)
         return session

@@ -146,15 +146,16 @@ class NacosClient:
                 "dataId": data_id,
             },
         )
-        content = self.data(response)
-        if isinstance(content, dict):
-            if content.get("success") is not True or content.get("errorCode", 0) != 0:
-                code = content.get("errorCode")
-                raise NacosError(
-                    "Nacos configuration query failed",
-                    operation_code=code if type(code) is int else None,
-                )
-            content = content.get("content")
+        result = self.data(response)
+        if not isinstance(result, dict):
+            raise NacosError("Invalid Nacos configuration response envelope")
+        if result.get("success") is not True or result.get("errorCode", 0) != 0:
+            code = result.get("errorCode")
+            raise NacosError(
+                "Nacos configuration query failed",
+                operation_code=code if type(code) is int else None,
+            )
+        content = result.get("content")
         if not isinstance(content, str):
             raise NacosError("Nacos configuration content is not text")
         return content

@@ -2,7 +2,7 @@
 
 核心能力
 - 维护资源目录、发布版本和个人安装开关。
-- 读取技能内容及缓存，解析连接器配置和认证凭据。
+- 读取技能版本文件，解析连接器配置和认证凭据。
 - prepare_workspace 在工具集收集前装载授权结果，工具执行前再次刷新。
 - 资源归属和授权仍由权限服务校验，Workspace 只接收装载结果。
 """
@@ -10,22 +10,15 @@
 from __future__ import annotations
 
 import asyncio
-import errno
 import hashlib
-import os
 import re
-import shutil
-import tempfile
-from contextlib import contextmanager
-from contextvars import ContextVar
-from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 from agentscope.app._service._mcp_render import render_mcp
 from agentscope.skill import Skill
-from packaging.version import Version
 
-from egis_agentkit.client._mcp_config import _verify_mcp_card, mcp_config_checksum
+from egis_agentkit.client._mcp_config import _verify_mcp_card
+from egis_agentkit.client.mcp._gateway_mcp_client_override import credential_fingerprint
 from egis_agentkit.client.nacos._settings import (
     DEFAULT_SKILL_ARCHIVE_MAX_BYTES,
     SkillArchiveConfig,
@@ -36,7 +29,13 @@ from egis_agentkit.core.skill._archive import (
     calculate_files_digest,
     read_archive_files,
 )
-from egis_agentkit.errors import AgentKitError, Conflict, Forbidden, NotFound
+from egis_agentkit.errors import (
+    AgentKitError,
+    Conflict,
+    Forbidden,
+    InvalidRequest,
+    NotFound,
+)
 from egis_agentkit.service._user import UserService, require_admin
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._permission import (
@@ -51,9 +50,17 @@ from egis_agentkit.storage.model import (
     User,
 )
 from egis_agentkit.storage.model._base import publication_label, resource_available
-from egis_agentkit.storage.skill._archive import SkillArchiveStorage
+from egis_agentkit.storage.model._resource import (
+    MCP_STORAGE_VERSION,
+    asset_version_order,
+    is_managed_connector,
+    require_skill_publication_revision,
+    validate_resource_id,
+)
+from egis_agentkit.storage.skill._version import SkillVersionStorage
 
 from ._connector import AuthorizedMCPClient, LocalMCPRegistry
+from ._connector_manager import ConnectorManager
 from ._skill import LocalSkillRegistry, _skill_front
 from ._tool import FunctionToolRegistry
 
@@ -111,11 +118,6 @@ def catalog_icon_id(value, *, default="book"):
     return value
 
 
-_hub_access: ContextVar[tuple | None] = ContextVar(
-    "agentkit_resource_hub_access", default=None
-)
-
-
 class ResourceService:
     """管理 Skill 和 MCP 的版本、使用权限和安装，以及工具目录。"""
 
@@ -134,21 +136,15 @@ class ResourceService:
         )
 
         self.storage = storage
-        self.workspace_root = Path(workspace_root).resolve()
         self.policies = policies
         self.config = config
         self.permissions = PermissionService(storage, policies)
-        self.grants = GrantService(storage)
-        self._cache_locks = {}
-        self.skill_archives = storage.skill_archives
-        if self.skill_archives is None:
-            if config is None:
-                raise ValueError("技能 NAS 文件存储未配置")
-            self.skill_archives = SkillArchiveStorage.from_settings(
-                config.snapshot.skill, config_provider=config
-            )
-        self.skill_registry = LocalSkillRegistry(storage.assets, self.skill_archives)
+        self.grants = GrantService(storage, policies)
+        self.skill_versions = SkillVersionStorage(workspace_root, config_provider=config)
+        self.workspace_root = self.skill_versions.root
+        self.skill_registry = LocalSkillRegistry(storage.assets, self.skill_versions)
         self.mcp_registry = LocalMCPRegistry(storage.assets)
+        self.connectors = ConnectorManager(storage, policies)
         self.skill_hub = LocalSkillHub(self)
         self.mcp_hub = LocalMCPHub(self)
         self.mcp_authorization = MCPAuthorization(
@@ -183,7 +179,7 @@ class ResourceService:
             refs = [
                 {
                     key: row[key]
-                    for key in ("resource_type", "resource_id", "resource_version")
+                    for key in ("resource_type", "resource_id")
                 }
                 for row in selected.values()
             ]
@@ -244,7 +240,8 @@ class ResourceService:
         """安装由资源管理协调，只保存个人启用开关，不复制原生安装记录。"""
         asset = await self._personal_asset(user, kind, identifier)
         if kind == "mcp":
-            _verify_mcp_card(asset, self.mcp_hub.card(asset))
+            self._verified_mcp_card(asset)
+            await self.mcp_authorization.headers(user, asset)
         await self.personal.add_resource(user, kind, identifier)
         return await self._view(user, asset)
 
@@ -254,6 +251,9 @@ class ResourceService:
         existing = await self.personal.list_resources(user, kind)
         if identifier not in existing:
             raise NotFound("资源尚未安装")
+        if kind == "mcp" and enabled:
+            self._verified_mcp_card(asset)
+            await self.mcp_authorization.headers(user, asset)
         await self.personal.update_resource_enabled(user, kind, identifier, enabled)
         return await self._view(user, asset)
 
@@ -272,7 +272,8 @@ class ResourceService:
         return self.tool_registry
 
     async def _versions(self, kind, **kwargs):
-        return await self._registry(kind).list(**kwargs)
+        rows = await self._registry(kind).list(**kwargs)
+        return [row for row in rows if is_managed_connector(row)] if kind == "mcp" else rows
 
     async def hub_list(self, user_id, kind):
         user = await UserService(self.storage).get(user_id)
@@ -289,15 +290,14 @@ class ResourceService:
             raise NotFound()
         user = await UserService(self.storage).get(user_id)
         asset = await self._asset(kind, rid, version)
-        if _hub_access.get() != (user_id, kind, rid, version):
-            await self._require(user, asset)
+        await self._require(user, asset)
         return asset
 
     async def set_asset_enabled(
         self, user, kind, rid, version, enabled, *, admin=False
     ):
         """同步更新版本状态和对应授权，保留其他资源版本。"""
-        if admin:
+        if admin or kind == "mcp":
             require_admin(user)
         async with self.storage.definition_write() as write:
             await write.assets.lock_resource(kind, rid)
@@ -307,9 +307,14 @@ class ResourceService:
             if not enabled and is_system_default_tool(asset):
                 raise Conflict("系统默认工具不能停用")
             await write.assets.set_enabled(
-                kind, rid, version, enabled, actor=user.user_id
+                kind, rid, asset["resource_version"], enabled, actor=user.user_id
             )
-            if kind != "tool":
+            if kind == "mcp" and enabled:
+                company = UserService(self.storage, self.policies).company_group()
+                await GrantService(write).publish_connector(
+                    rid, company, actor=user.user_id, write=write
+                )
+            if kind == "skill":
                 if enabled:
                     await GrantService(write).record_owner(
                         kind, rid, asset, actor=user.user_id
@@ -326,7 +331,7 @@ class ResourceService:
         )
 
     async def _admin_view(self, user, asset, *, bindings=None, grants=None):
-        view = await self._view(user, asset, admin=True)
+        view = await self._view(user, asset, admin=True, source=asset["resource_type"] == "mcp")
         return {
             **view,
             "entrypoint": asset["entrypoint"],
@@ -349,12 +354,7 @@ class ResourceService:
                     for agent in agents
                     if resource_available(agent)
                     and any(
-                        (
-                            ref["resource_type"],
-                            ref["resource_id"],
-                            ref["resource_version"],
-                        )
-                        == (kind, row["resource_id"], row["resource_version"])
+                        self._binding_matches(ref, row)
                         for ref in agent["payload"].get("bindings", [])
                     )
                 ],
@@ -367,29 +367,27 @@ class ResourceService:
                 ],
             )
             for row in sorted(
-                rows, key=lambda row: (row["resource_id"], row["resource_version"])
+                rows, key=lambda row: (row["resource_id"], asset_version_order(row))
             )
         ]
 
     async def list_asset_versions(self, user, kind, rid):
         """列出此用户可访问的确切资源版本。"""
         self._kind(kind)
-        rows = await self._versions(kind, resource_ids=[rid])
+        rows = sorted(
+            await self._versions(kind, resource_ids=[rid]),
+            key=asset_version_order,
+            reverse=True,
+        )
         if kind == "tool":
             return [
                 await self._view(user, asset)
-                for asset in sorted(
-                    rows,
-                    key=lambda asset: Version(asset["resource_version"]),
-                    reverse=True,
-                )
+                for asset in rows
                 if self._tool_card_visible(user, asset)
             ]
         return [
             await self._view(user, asset)
-            for asset in sorted(
-                rows, key=lambda asset: Version(asset["resource_version"]), reverse=True
-            )
+            for asset in rows
             if self._editable(user, asset) or await self._usable(user, asset)
         ]
 
@@ -417,10 +415,7 @@ class ResourceService:
 
     @staticmethod
     def _identity(rid, version):
-        if not isinstance(rid, str) or not re.fullmatch(
-            r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}", rid
-        ):
-            raise ValueError("Invalid resource identifier")
+        validate_resource_id(rid)
         if not isinstance(version, str) or not re.fullmatch(
             r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?", version
         ):
@@ -428,9 +423,10 @@ class ResourceService:
 
     @staticmethod
     def _runtime_id(user, kind, rid, version):
-        return hashlib.sha256(
-            f"{user.user_id}\0{kind}\0{rid}\0{version}".encode()
-        ).hexdigest()
+        identity = f"{user.user_id}\0{kind}\0{rid}"
+        if kind != "mcp":
+            identity += f"\0{version}"
+        return hashlib.sha256(identity.encode()).hexdigest()
 
     def _runtime_name(self, user, kind, rid, version):
         return (
@@ -442,9 +438,13 @@ class ResourceService:
     async def _asset(self, kind, rid, version, *, assets=None):
         """从资产存储读取确切版本。"""
         self._kind(kind)
+        if kind == "mcp":
+            if version is not None:
+                raise InvalidRequest("MCP 按 ID 查询，无须指定版本")
+            version = MCP_STORAGE_VERSION
         self._identity(rid, version)
         row = await (assets or self.storage.assets).get(kind, rid, version)
-        if row is None:
+        if row is None or (kind == "mcp" and not is_managed_connector(row)):
             raise NotFound()
         return row
 
@@ -459,6 +459,21 @@ class ResourceService:
         return decision.is_allowed
 
     @staticmethod
+    def _binding_matches(ref, asset):
+        return (
+            ref["resource_type"] == asset["resource_type"]
+            and ref["resource_id"] == asset["resource_id"]
+            and (
+                (
+                    ref.get("resource_version") is None
+                    and ref.get("resource_view_type") == "system"
+                )
+                if asset["resource_type"] == "mcp"
+                else ref.get("resource_version") == asset["resource_version"]
+            )
+        )
+
+    @staticmethod
     def _scope_allows(user, asset, scope):
         """当前 Agent 的定义明确绑定该资源版本时才允许继续校验。"""
         if scope is None or scope.user_id != user.user_id:
@@ -470,15 +485,9 @@ class ResourceService:
             if root["definition_type"] == "agent"
             else scope.member_definitions.get(current["id"])
         )
-        identity = (
-            asset["resource_type"],
-            asset["resource_id"],
-            asset["resource_version"],
-        )
         return pinned is not None and all(
             any(
-                (ref["resource_type"], ref["resource_id"], ref["resource_version"])
-                == identity
+                ResourceService._binding_matches(ref, asset)
                 for ref in definition["payload"].get("bindings", [])
             )
             for definition in (pinned, current)
@@ -520,21 +529,19 @@ class ResourceService:
                 await self.permissions.require_execution(
                     user, scope.root_definition, allow_pinned=True
                 )
-                return True
-            installed = await self.selected_for_personal(
-                user,
-                asset["resource_type"],
-                enabled_only=True,
-                resource_ids=[asset["resource_id"]],
-            )
-            selected = installed.get(asset["resource_id"])
-            if not selected:
-                return False
-            if (
-                asset["resource_type"] != "skill"
-                and selected["resource_version"] != asset["resource_version"]
-            ):
-                return False
+                if asset["resource_type"] != "mcp":
+                    return True
+            else:
+                installed = await self.selected_for_personal(
+                    user,
+                    asset["resource_type"],
+                    enabled_only=True,
+                    resource_ids=[asset["resource_id"]],
+                )
+                if asset["resource_id"] not in installed:
+                    return False
+        if asset["resource_type"] == "mcp" and not is_managed_connector(asset):
+            return False
         own = asset["owner_type"] == "user" and asset["owner_id"] == user.user_id
         view = (
             "private"
@@ -566,21 +573,6 @@ class ResourceService:
             or (asset["owner_type"] == "system" and user.role_type == "admin")
         )
 
-    @contextmanager
-    def _access(self, user, asset):
-        token = _hub_access.set(
-            (
-                user.user_id,
-                asset["resource_type"],
-                asset["resource_id"],
-                asset["resource_version"],
-            )
-        )
-        try:
-            yield
-        finally:
-            _hub_access.reset(token)
-
     async def _view(self, user, asset, *, source=False, admin=False):
         """组装资源目录或详情的字段与权限标记。"""
         own = asset["owner_type"] == "user" and asset["owner_id"] == user.user_id
@@ -609,7 +601,6 @@ class ResourceService:
             in {
                 "display_name",
                 "description",
-                "is_skill_market_visible",
                 "avatar",
                 "category",
                 "input_schema",
@@ -630,6 +621,15 @@ class ResourceService:
             elif asset["resource_type"] == "mcp":
                 payload["config"] = self.mcp_registry.config(asset)
         revision = asset.get("publication_revision")
+        is_connector = asset["resource_type"] == "mcp"
+        authorized = (
+            (await self.mcp_authorization.status(user, asset))["authorized"]
+            if is_connector and usable and not admin
+            else False
+        )
+        connector_attributes = (
+            {"publication_revision": revision} if admin else {"is_authorized": authorized}
+        )
         share = (
             await self.permissions.share_availability(
                 user,
@@ -638,18 +638,36 @@ class ResourceService:
                 version=asset["resource_version"],
                 view=view,
             )
-            if editable and asset["resource_type"] != "tool"
+            if editable and asset["resource_type"] == "skill"
             else {}
         )
+        owner = {"owner_type": asset["owner_type"], "owner_id": asset["owner_id"]}
+        if asset["resource_type"] == "skill":
+            if asset["owner_type"] == "system":
+                owner["owner_display_name"] = "系统"
+            elif own:
+                owner["owner_display_name"] = user.username
+            else:
+                profile = await self.storage.get_user(asset["owner_id"])
+                owner["owner_display_name"] = (
+                    profile["username"] if profile is not None else asset["owner_id"]
+                )
         return {
             "resource_id": asset["resource_id"],
-            "resource_version": asset["resource_version"],
-            "version_label": publication_label(revision)
-            if revision
-            else asset["resource_version"],
+            **(
+                connector_attributes
+                if is_connector
+                else {
+                    "resource_version": asset["resource_version"],
+                    "version_label": publication_label(
+                        require_skill_publication_revision(revision)
+                    )
+                    if asset["resource_type"] == "skill"
+                    else asset["resource_version"],
+                }
+            ),
             **share,
-            "owner_type": asset["owner_type"],
-            "owner_id": asset["owner_id"],
+            **owner,
             "display_name": payload.get("display_name", asset["resource_id"]),
             "description": payload.get("description", ""),
             "resource_view_type": view,
@@ -666,11 +684,6 @@ class ResourceService:
             "is_enabled": asset["is_enabled"]
             if asset["resource_type"] == "tool"
             else bool(installation and installation["is_enabled"]),
-            "is_skill_market_visible": bool(
-                payload.get("is_skill_market_visible", False)
-            )
-            if asset["resource_type"] == "skill"
-            else None,
             "payload": payload,
         }
 
@@ -691,37 +704,30 @@ class ResourceService:
         selected = {}
         ranks = {}
         for asset in rows:
-            own = asset["owner_type"] == "user" and asset["owner_id"] == user.user_id
             usable = False
             if resource_type == "tool":
                 if not self._tool_card_visible(user, asset):
                     continue
             else:
                 usable = await self._usable(user, asset)
-                if not self._marketplace_visible(user, asset, own=own, usable=usable):
+                if not self._marketplace_visible(user, asset, usable=usable):
                     continue
             # 在可见版本中优先选择可用版本，再按发布版本排序。
             rid = asset["resource_id"]
             rank = (
                 usable,
                 asset["is_enabled"],
-                asset.get("publication_revision") or 0,
-                Version(asset["resource_version"]),
+                asset_version_order(asset),
             )
             if rid not in ranks or rank > ranks[rid]:
                 selected[rid], ranks[rid] = asset, rank
         return selected
 
-    def _marketplace_visible(self, user, asset, *, own, usable):
+    def _marketplace_visible(self, user, asset, *, usable):
         """目录只展示可独立使用或有维护权的资源版本。"""
-        if not usable and not self._editable(user, asset):
-            return False
-        return (
-            asset["resource_type"] != "skill"
-            or own
-            or user.role_type == "admin"
-            or asset["payload"].get("is_skill_market_visible", False)
-        )
+        if asset["resource_type"] == "mcp":
+            return usable
+        return usable or self._editable(user, asset)
 
     def _tool_card_visible(self, user, asset):
         """只展示已启用的平台默认工具或专家绑定候选。"""
@@ -734,12 +740,15 @@ class ResourceService:
             )
         )
 
-    async def detail(self, user, resource_type, resource_id, version):
-        return await self._view(
-            user, await self._asset(resource_type, resource_id, version), source=True
-        )
+    async def detail(self, user, resource_type, resource_id, version=None):
+        asset = await self._asset(resource_type, resource_id, version)
+        if resource_type == "mcp":
+            await self._require(user, asset)
+        return await self._view(user, asset, source=True)
 
-    async def _owner_for_save(self, user, registry, rid, version, data):
+    async def _owner_for_save(
+        self, user, registry, rid, version, data, *, virtual_uploader=None
+    ):
         """发布前核对资源归属以及版本是否已存在。"""
         if not user.is_enabled:
             raise Forbidden()
@@ -751,6 +760,10 @@ class ResourceService:
             for row in rows
         ):
             raise Forbidden()
+        if rows and data.get("owner_type", rows[0]["owner_type"]) != rows[0]["owner_type"]:
+            raise Forbidden("发布新版本时不能改变技能归属")
+        if rows and virtual_uploader is not None:
+            self._require_virtual_skill_owner(rows, virtual_uploader)
         if any(row["resource_version"] == version for row in rows):
             raise Conflict("资源版本不可变，请发布新版本")
         if rows:
@@ -762,6 +775,24 @@ class ResourceService:
             raise Forbidden()
         return "user", user.user_id
 
+    @staticmethod
+    def _require_virtual_skill_owner(rows, virtual_user_id):
+        original = min(rows, key=asset_version_order)
+        if original["owner_type"] != "system" or original["created_by"] != virtual_user_id:
+            raise Forbidden("虚拟用户只能更新自己提交的系统技能")
+
+    async def require_skill_upload_target(self, user, resource_id, *, owner_type, virtual):
+        rows = await self.skill_registry.list(resource_ids=[resource_id])
+        if not rows:
+            raise NotFound("待更新的技能不存在")
+        original = min(rows, key=asset_version_order)
+        if original["owner_type"] != owner_type:
+            raise Forbidden("发布新版本时不能改变技能归属")
+        if virtual:
+            self._require_virtual_skill_owner(rows, user.user_id)
+        elif not self._editable(user, original):
+            raise Forbidden()
+
     async def _save(
         self,
         user,
@@ -769,10 +800,11 @@ class ResourceService:
         data,
         *,
         files=None,
-        config=None,
         import_job_id=None,
         progress=None,
         archive_limits=None,
+        uploader_id=None,
+        uploader_type=None,
     ):
         """原子发布资源版本、附件和归属授权。"""
         rid = data.get("resource_id") or kind + "-" + uuid4().hex
@@ -786,56 +818,43 @@ class ResourceService:
             "display_name": str(data.get("display_name") or rid)[:200],
             "description": str(data.get("description") or "")[:2000],
         }
-        archive = None
-        if kind == "skill":
-            if progress:
-                await progress("preparing", 35, resource_version=version)
-            metadata.update(
-                category=str(data.get("category") or "other")[:80],
-                files=[
-                    {"path": name, "size": len(value)}
-                    for name, value in sorted(files.items())
-                ],
-                is_skill_market_visible=bool(data.get("is_skill_market_visible", True)),
-            )
-            if import_job_id:
-                metadata["import_job_id"] = import_job_id
-            limits = archive_limits or self.archive_limits
-            if sum(map(len, files.values())) > limits.expanded_bytes_limit:
-                raise ValueError("Skill exceeds upload limit")
-            archive, digest = await asyncio.to_thread(
-                lambda: (build_skill_archive(files, rid), calculate_files_digest(files))
-            )
-            if len(archive) > limits.max_bytes:
-                raise ValueError("Skill archive exceeds upload limit")
-        else:
-            metadata["config"] = config
-            digest = mcp_config_checksum(config)
         if progress:
-            await progress("registering", 65)
+            await progress("preparing", 35, resource_version=version)
+        metadata.update(
+            category=str(data.get("category") or "other")[:80],
+            files=[
+                {"path": name, "size": len(value)}
+                for name, value in sorted(files.items())
+            ],
+        )
+        if import_job_id:
+            metadata["import_job_id"] = import_job_id
+        uploader_id = uploader_id or user.user_id
+        metadata["uploader_type"] = uploader_type or (
+            "admin" if user.role_type == "admin" else "user"
+        )
+        limits = archive_limits or self.archive_limits
+        if sum(map(len, files.values())) > limits.expanded_bytes_limit:
+            raise ValueError("Skill exceeds upload limit")
+        digest = await asyncio.to_thread(calculate_files_digest, files)
         async with self.storage.definition_write() as write:
-            registry = (
-                LocalSkillRegistry(write.assets, self.skill_archives)
-                if kind == "skill"
-                else LocalMCPRegistry(write.assets)
-            )
+            registry = LocalSkillRegistry(write.assets, self.skill_versions)
             await write.assets.lock_resource(kind, rid)
             existing = (
                 await registry.get_version(rid, version) if import_job_id else None
             )
             if existing:
                 if (
-                    existing["owner_id"] != user.user_id
+                    existing["created_by"] != uploader_id
                     or existing["payload"].get("import_job_id") != import_job_id
                 ):
                     raise Conflict("Import identity already exists")
                 asset = existing
             else:
                 revision = await write.assets.next_publication_revision(kind, rid)
-                if kind == "mcp" and not data.get("resource_version"):
-                    version = publication_label(revision) + ".0"
                 owner_type, owner_id = await self._owner_for_save(
-                    user, registry, rid, version, data
+                    user, registry, rid, version, data,
+                    virtual_uploader=uploader_id if uploader_type == "virtual" else None,
                 )
                 model = Asset(
                     resource_type=kind,
@@ -847,12 +866,13 @@ class ResourceService:
                     payload=metadata,
                     checksum_sha256=digest,
                 )
-                model = await registry.register(
-                    model, actor=user.user_id, archive=archive
-                )
+                model = await registry.register(model, actor=uploader_id)
                 asset = model.model_dump()
                 await GrantService(write).record_owner(
                     kind, rid, asset, actor=user.user_id
+                )
+                await registry.publish_files(
+                    asset, files, max_bytes=limits.expanded_bytes_limit
                 )
         return await self._view(user, asset)
 
@@ -913,11 +933,10 @@ class ResourceService:
             base = await self._asset("skill", rid, base_version)
             if not self._editable(user, base):
                 raise Forbidden()
-            content = await self.download_skill(
-                user, rid, base_version, for_edit=True, archive_limits=limits
+            _, files, _ = await self.skill_registry.read(
+                base, max_bytes=limits.expanded_bytes_limit
             )
-            files = await asyncio.to_thread(read_archive_files, content, limits)
-            for key in ("avatar", "category", "is_skill_market_visible"):
+            for key in ("avatar", "category"):
                 data.setdefault(key, base["payload"].get(key))
         files["SKILL.md"] = markdown.encode()
         return await self._save(user, "skill", data, files=files, archive_limits=limits)
@@ -927,7 +946,6 @@ class ResourceService:
         user,
         archive,
         version=None,
-        is_skill_market_visible=True,
         *,
         category="other",
         avatar="book",
@@ -936,6 +954,9 @@ class ResourceService:
         progress=None,
         owner_type=None,
         owner_id=None,
+        uploader_id=None,
+        uploader_type=None,
+        allow_unversioned=False,
     ):
         limits = self.archive_limits
         files = await asyncio.to_thread(read_archive_files, archive, limits)
@@ -947,14 +968,18 @@ class ResourceService:
                 "resource_version": version,
                 "category": category,
                 "avatar": avatar,
-                "is_skill_market_visible": is_skill_market_visible,
                 **({"resource_id": resource_id} if resource_id else {}),
                 **({"owner_type": owner_type} if owner_type else {}),
                 **({"owner_id": owner_id} if owner_id else {}),
             },
-            require_version=version is None,
+            require_version=version is None and not allow_unversioned,
         )
-        kwargs = {"files": files, "archive_limits": limits}
+        kwargs = {
+            "files": files,
+            "archive_limits": limits,
+            "uploader_id": uploader_id,
+            "uploader_type": uploader_type,
+        }
         if import_job_id:
             kwargs.update(
                 import_job_id=import_job_id,
@@ -963,8 +988,8 @@ class ResourceService:
         return await self._save(user, "skill", data, **kwargs)
 
     async def save_mcp(self, user, data):
-        config = MCPAuthorization.validate_config(data.get("config"))
-        return await self._save(user, "mcp", data, config=config)
+        asset = await self.connectors.save(user, data)
+        return await self._admin_view(user, asset)
 
     async def skill_descriptors(self, user, refs, authorization_scope=None):
         result = []
@@ -990,17 +1015,24 @@ class ResourceService:
         return result
 
     async def read_skill_markdown(self, asset):
-        """在调用方完成版本授权后，从 NAS 归档读取并校验编辑/详情所需的正文。"""
-        content = await self.skill_registry.archive(asset)
-        files = await asyncio.to_thread(
-            read_archive_files, content, self.archive_limits
+        """Read canonical Markdown for a version already authorized by the caller."""
+        _, files, _ = await self.skill_registry.read(
+            asset, max_bytes=self.archive_limits.expanded_bytes_limit
         )
-        if (
-            await asyncio.to_thread(calculate_files_digest, files)
-            != asset["checksum_sha256"]
-        ):
-            raise Conflict("技能内容摘要与版本记录不一致")
         return files["SKILL.md"].decode("utf-8")
+
+    async def export_skill_archive(self, asset, *, archive_limits=None):
+        """Package the verified files of an already authorized version."""
+        limits = archive_limits or self.archive_limits
+        _, files, _ = await self.skill_registry.read(
+            asset, max_bytes=limits.expanded_bytes_limit
+        )
+        content = await asyncio.to_thread(
+            build_skill_archive, files, asset["resource_id"]
+        )
+        if len(content) > limits.max_bytes:
+            raise ValueError("Skill download exceeds configured limit")
+        return content
 
     async def download_skill(
         self,
@@ -1012,174 +1044,42 @@ class ResourceService:
         for_edit=False,
         archive_limits=None,
     ):
-        limits = archive_limits or self.archive_limits
         asset = await self._asset("skill", resource_id, version)
         if not (for_edit and self._editable(user, asset)):
             await self._require(user, asset, authorization_scope)
-        with self._access(user, asset):
-            archive = await self.skill_hub.download(
-                user.user_id, asset["resource_id"], version
-            )
-        content = await self._read_skill_archive(archive, limits.max_bytes)
-        files = await asyncio.to_thread(read_archive_files, content, limits)
-        checksum = await asyncio.to_thread(calculate_files_digest, files)
-        if checksum != asset["checksum_sha256"]:
-            raise Conflict("Skill source checksum changed")
-        return await asyncio.to_thread(build_skill_archive, files, resource_id)
+        return await self.export_skill_archive(asset, archive_limits=archive_limits)
 
-    @staticmethod
-    async def _read_skill_archive(archive, maximum):
-        if archive.format != "zip":
-            raise ValueError("Skill source must be ZIP")
-        chunks = []
-        size = 0
-        try:
-            async for chunk in archive.stream:
-                size += len(chunk)
-                if size > maximum:
-                    raise ValueError("Skill download exceeds configured limit")
-                chunks.append(chunk)
-        finally:
-            close = getattr(archive.stream, "aclose", None)
-            if close is not None:
-                await close()
-        return b"".join(chunks)
-
-    @staticmethod
-    def _skill_cache_parts(user, asset, scope):
-        def segment(value):
-            if (
-                not isinstance(value, str)
-                or value in (".", "..")
-                or not re.fullmatch(r"[\w.@+-]{1,128}", value)
-            ):
-                raise Forbidden("Skill cache path contains an invalid segment")
-            return value
-
-        definition = getattr(scope, "definition", None) if scope is not None else None
-        if definition and definition.get("agent_type") != "personal":
-            identifier = segment(definition.get("id"))
-            number = definition.get("version")
-            if type(number) is not int or number < 1:
-                raise Forbidden("Skill cache definition version is invalid")
-            version = f"config-{number}"
-            return (
-                "common",
-                identifier,
-                version,
-                "skills",
-                segment(asset["resource_id"]),
-            )
-        if asset["owner_type"] == "user" and asset["owner_id"] == user.user_id:
-            return (
-                "user",
-                segment(user.user_id),
-                "skills",
-                segment(asset["resource_id"]),
-            )
-        return ("common", "skills", segment(asset["resource_id"]))
-
-    @staticmethod
-    def _validate_skill_cache(destination, checksum):
-        if destination.is_symlink():
-            raise Forbidden("Skill cache cannot use symlinks")
-        if not destination.is_dir():
-            raise Conflict("Skill cache destination is not a directory")
-        cached = {}
-        for path in destination.rglob("*"):
-            if path.is_symlink():
-                raise Forbidden("Skill cache contains a symlink")
-            if path.is_file():
-                cached[path.relative_to(destination).as_posix()] = path.read_bytes()
-            elif not path.is_dir():
-                raise Forbidden("Skill cache contains a special file")
-        if calculate_files_digest(cached) != checksum:
-            raise Conflict("Skill cache integrity check failed")
+    async def _runtime_skill(self, user, asset):
+        path, files, updated_at = await self.skill_registry.read(
+            asset, max_bytes=self.archive_limits.expanded_bytes_limit
+        )
+        return Skill(
+            name=self._runtime_name(
+                user, "skill", asset["resource_id"], asset["resource_version"]
+            ),
+            description=asset["payload"].get("description", ""),
+            dir=str(path),
+            markdown=files["SKILL.md"].decode("utf-8"),
+            updated_at=updated_at,
+        )
 
     async def materialize_skill(
         self, user, resource_id, version, *, authorization_scope=None
     ):
-        limits = self.archive_limits
         asset = await self._asset("skill", resource_id, version)
         await self._require(user, asset, authorization_scope)
-        parts = self._skill_cache_parts(user, asset, authorization_scope)
-        lock = self._cache_locks.setdefault((resource_id, version), asyncio.Lock())
-        async with lock:
-            # Materialize the verified bytes shown in the editor and export.
-            # The digest selects a new cache only when the content changes.
-            content = await self.download_skill(
-                user,
-                resource_id,
-                version,
-                authorization_scope=authorization_scope,
-                archive_limits=limits,
-            )
-            files = read_archive_files(content, limits)
-            checksum = calculate_files_digest(files)
-            base = self.workspace_root
-            for part in parts:
-                base = base / part
-                if base.is_symlink():
-                    raise Forbidden("Skill cache cannot use symlink directories")
-                base.mkdir(parents=True, exist_ok=True)
-            destination = base / (version + "-" + checksum[:20])
-            if destination.is_symlink():
-                raise Forbidden("Skill cache cannot use symlinks")
-            if destination.exists():
-                self._validate_skill_cache(destination, checksum)
-            else:
-                staging = Path(tempfile.mkdtemp(prefix=".skill-", dir=base))
-                try:
-                    for name, content in files.items():
-                        path = staging / name
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_bytes(content)
-                    try:
-                        os.rename(staging, destination)
-                    except OSError as exc:
-                        if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
-                            raise
-                    # A competing process may have installed the winner; never
-                    # trust that directory until it is checked in full.
-                    self._validate_skill_cache(destination, checksum)
-                finally:
-                    if staging.exists():
-                        shutil.rmtree(staging)
-            return Skill(
-                name=self._runtime_name(user, "skill", resource_id, version),
-                description=asset["payload"].get("description", ""),
-                dir=str(destination),
-                markdown=files["SKILL.md"].decode("utf-8"),
-                updated_at=destination.stat().st_mtime,
-            )
+        return await self._runtime_skill(user, asset)
 
     async def skill_pin(self, user, ref, skill):
         asset = await self._asset("skill", ref["resource_id"], ref["resource_version"])
-        if not asset["checksum_sha256"]:
-            raise Conflict("技能缺少注册内容校验值，无法固定会话版本")
-        destination = Path(skill.dir)
-
-        def digest():
-            files = {
-                p.relative_to(destination).as_posix(): p.read_bytes()
-                for p in destination.rglob("*")
-                if p.is_file()
-            }
-            checksum = calculate_files_digest(files)
-            self._validate_skill_cache(destination, checksum)
-            return checksum
-
-        checksum = await asyncio.to_thread(digest)
         return {
             **ref,
             "source_checksum_sha256": asset["checksum_sha256"],
-            "cache_checksum_sha256": checksum,
-            "cache_dir": destination.relative_to(self.workspace_root).as_posix(),
             "skill_name": skill.name,
         }
 
     async def restore_skill(self, user, pin, *, authorization_scope):
-        """Restore only the exact server-pinned content, never a newer version."""
+        """Restore the pinned version after rechecking access and source integrity."""
         pin = SkillActivation.model_validate(pin).model_dump()
         rid, version = pin["resource_id"], pin["resource_version"]
         if pin["skill_name"] != self._runtime_name(user, "skill", rid, version):
@@ -1188,35 +1088,7 @@ class ResourceService:
         await self._require(user, asset, authorization_scope)
         if asset["checksum_sha256"] != pin["source_checksum_sha256"]:
             raise Conflict("已激活技能的注册内容已变化，不能自动替换会话版本")
-        relative = PurePosixPath(pin["cache_dir"])
-        if relative.is_absolute() or ".." in relative.parts:
-            raise Forbidden("已激活技能目录无效")
-        destination = self.workspace_root / relative
-        checksum = pin["cache_checksum_sha256"]
-        if (
-            destination.name != version + "-" + checksum[:20]
-            or destination.parent.name != rid
-            or destination.parent.parent.name != "skills"
-            or destination.resolve() != destination
-            or not destination.is_relative_to(self.workspace_root)
-        ):
-            raise Forbidden("已激活技能目录无效")
-        if not destination.exists():
-            skill = await self.materialize_skill(
-                user, rid, version, authorization_scope=authorization_scope
-            )
-            recovered = await self.skill_pin(user, pin, skill)
-            if recovered["cache_checksum_sha256"] != checksum:
-                raise Conflict("已激活技能的缓存内容已变化，不能自动替换会话版本")
-            return skill
-        await asyncio.to_thread(self._validate_skill_cache, destination, checksum)
-        return Skill(
-            name=self._runtime_name(user, "skill", rid, version),
-            description=asset["payload"].get("description", ""),
-            dir=str(destination),
-            markdown=(destination / "SKILL.md").read_text("utf-8"),
-            updated_at=destination.stat().st_mtime,
-        )
+        return await self._runtime_skill(user, asset)
 
     async def mcps_for_refs(
         self, user, refs, authorization_scope=None, *, skip_unavailable=False
@@ -1229,7 +1101,7 @@ class ResourceService:
             if ref.resource_type != "mcp":
                 continue
             try:
-                asset = await self._asset("mcp", ref.resource_id, ref.resource_version)
+                asset = await self._asset("mcp", ref.resource_id, None)
                 await self._require(user, asset, authorization_scope)
                 client = await self._mcp_client(user, asset)
             except AgentKitError:
@@ -1239,18 +1111,22 @@ class ResourceService:
             result.append(client)
         return result
 
-    async def _mcp_client(self, user, asset):
-        version = asset["resource_version"]
+    def _verified_mcp_card(self, asset):
         card = self.mcp_hub.card(asset)
         _verify_mcp_card(asset, card)
-        client = render_mcp(
-            card,
+        return card
+
+    async def _mcp_client(self, user, asset):
+        rendered = render_mcp(
+            self._verified_mcp_card(asset),
             {},
-            name=self._runtime_name(user, "mcp", asset["resource_id"], version),
+            name=self._runtime_name(user, "mcp", asset["resource_id"], None),
         )
+        client = AuthorizedMCPClient.model_validate(rendered.model_dump())
         headers = await self.mcp_authorization.headers(user, asset)
-        client.mcp_config.headers = headers or None
-        return AuthorizedMCPClient(**client.model_dump())
+        if headers:
+            await client.set_runtime_headers(headers)
+        return client
 
     async def authorize_session_tool(
         self, user_id, scope, workspace, agent, tool, parameters=None, *, users
@@ -1281,53 +1157,25 @@ class ResourceService:
                 continue
             await self._require(user, row, scope)
             current = await self._mcp_client(user, row)
-            if client.mcp_config != current.mcp_config:
+            if (
+                client.mcp_config != current.mcp_config
+                or credential_fingerprint(client) != credential_fingerprint(current)
+            ):
                 raise Forbidden("连接凭证已变化，请重新发起对话")
             return True
         raise Forbidden("当前会话没有此 MCP 连接")
 
-    async def mcp_dependency_authorizations(self, user):
-        """给有 Agent 依赖的用户提供凭据入口，广场安装权限保持独立。"""
-        result = []
-        for rid, version in await self.permissions.granted_dependency_versions(
-            user, "mcp"
-        ):
-            asset = await self._asset("mcp", rid, version)
-            if await self._usable(user, asset):
-                continue
-            auth_type = self.mcp_registry.config(asset).get("auth_type", "none")
-            if auth_type != "none":
-                result.append(
-                    {
-                        "resource_id": rid,
-                        "resource_version": version,
-                        "display_name": asset["payload"].get("display_name") or rid,
-                        "auth_type": auth_type,
-                    }
-                )
-        return result
-
-    async def mcp_auth_action(self, user, rid, version, action, **kwargs):
-        asset = await self._asset("mcp", rid, version)
-        if action != "revoke" and not await self._usable(user, asset):
-            if not await self.permissions.granted_dependency_versions(
-                user, "mcp", resource_id=rid, version=version
-            ):
-                raise Forbidden("未获得此资源版本的使用权限")
+    async def mcp_auth_action(self, user, rid, action, **kwargs):
+        asset = await self._asset("mcp", rid, None)
+        await self._require(user, asset)
+        self._verified_mcp_card(asset)
         return await getattr(self.mcp_authorization, action)(user, asset, **kwargs)
 
-    async def test_mcp(self, user, resource_id, version):
-        clients = await self.mcps_for_refs(
-            user,
-            [
-                ResourceRef(
-                    resource_type="mcp",
-                    resource_id=resource_id,
-                    resource_version=version,
-                )
-            ],
-        )
-        client = clients[0]
+    async def test_mcp(self, user, resource_id):
+        require_admin(user)
+        asset = await self._asset("mcp", resource_id, None)
+        await self._require(user, asset)
+        client = await self._mcp_client(user, asset)
         try:
             await client.connect()
             tools = await client.list_tools()

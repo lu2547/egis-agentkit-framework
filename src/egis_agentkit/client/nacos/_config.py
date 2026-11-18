@@ -24,6 +24,14 @@ class LivePolicies:
         self.provider = provider
 
     @property
+    def company_group_id(self) -> str:
+        return self.provider.snapshot.access.company_group_id
+
+    @property
+    def company_group_name(self) -> str:
+        return self.provider.snapshot.access.company_group_name
+
+    @property
     def allow_private_self_use(self) -> bool:
         return self.provider.snapshot.access.allow_private_self_use
 
@@ -80,19 +88,6 @@ def load_agentkit_config(content: str) -> AgentKitConfig:
             problems.append(f"{path} ({error_type})")
         raise NacosError(f"{AGENTKIT_DATA_ID}: " + ", ".join(problems)) from None
 
-    identity = settings.user.identity
-    if identity.mode == "jwt":
-        if identity.algorithm != "RS256":
-            raise NacosError(
-                "agentkit.user.identity.algorithm: JWT mode requires RS256"
-            )
-        if not identity.jwks_url:
-            raise NacosError(
-                "agentkit.user.identity.jwksUrl: JWT mode requires a JWKS URL"
-            )
-    elif identity.algorithm != "HS256":
-        raise NacosError("agentkit.user.identity.algorithm: demo mode requires HS256")
-
     models = settings.model.catalog.models
     keys = {model.key for model in models}
     selection = settings.model.selection
@@ -129,7 +124,7 @@ def load_agentkit_config(content: str) -> AgentKitConfig:
 
 def _fixed_components(snapshot: AgentKitConfig) -> dict:
     return {
-        "agentkit.agent.personal.memory": snapshot.agent.personal.memory,
+        "agentkit.project.memory": snapshot.project.memory,
         "agentkit.connector.oauth.credentialKeyEnv": snapshot.connector.oauth.credential_key_env,
         "agentkit.client.postgres": snapshot.client.postgres,
         "agentkit.client.kafka": snapshot.client.kafka,
@@ -139,6 +134,7 @@ def _fixed_components(snapshot: AgentKitConfig) -> dict:
         "agentkit.workspace.runtime": snapshot.workspace.runtime,
         "agentkit.workspace.probe": snapshot.workspace.probe,
         "agentkit.workspace.lock": snapshot.workspace.lock,
+        "agentkit.workspace.files": snapshot.workspace.files,
         "agentkit.workspace.readGuard": snapshot.workspace.read_guard,
         "agentkit.skill.storage": snapshot.skill.storage,
         "agentkit.project.download": snapshot.project.download,

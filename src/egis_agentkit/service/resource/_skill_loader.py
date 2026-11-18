@@ -2,7 +2,6 @@
 
 import asyncio
 from copy import deepcopy
-from pathlib import Path
 from typing import Protocol
 
 from agentscope.skill import Skill, SkillLoaderBase
@@ -22,9 +21,6 @@ class SkillStateStorage(Protocol):
 class SkillResources(Protocol):
     @property
     def storage(self) -> SkillStateStorage: ...
-
-    @property
-    def workspace_root(self) -> Path: ...
 
     async def selected_for_personal(
         self, user: User, resource_type: str, *, enabled_only: bool
@@ -48,7 +44,7 @@ class SkillResources(Protocol):
 class LiveSkillLoader(SkillLoaderBase):
     """Personal installs are dynamic; expert candidates come only from bindings.
 
-    Candidate summaries do not download archives. Only Skill activation pins
+    Candidate summaries do not load version files. Only Skill activation pins
     content. Native Session state owns those pins across turns and workers.
     """
 
@@ -81,45 +77,34 @@ class LiveSkillLoader(SkillLoaderBase):
         self.pins = pins
         # Resource authorization sees the same server-persisted activation pins.
         self.scope.binding["activated_skills"] = pins
-        relocated = False
         for rid, pin in list(pins.items()):
             try:
                 await self._eligible_pin(pin)
                 skill = await self.resources.restore_skill(
                     self.user, pin, authorization_scope=self.scope
                 )
-                restored_dir = str(self.resources.workspace_root / pin["cache_dir"])
-                if str(Path(skill.dir)) != restored_dir:
-                    pins[rid] = await self.resources.skill_pin(
-                        self.user,
-                        SkillActivation.model_validate(pin).reference(),
-                        skill,
-                    )
-                    relocated = True
-                self.loaded[skill.name] = await self._runtime_skill(skill, pins[rid])
+                self.loaded[skill.name] = await self._runtime_skill(skill, pin)
             except AgentKitError as exc:
                 # Revoked/disabled pins must not break unrelated conversation,
                 # reappear as a new version, or retain a readable directory.
                 self.unavailable[pin["skill_name"]] = str(exc)
                 await self._unpublish_skill(pin)
-        if relocated:
-            await self._persist()
 
     async def _runtime_skill(self, skill, pin):
-        """保留宿主缓存校验记录，只把激活内容发布到当前执行环境。"""
+        """把经校验的版本文件发布到当前执行环境。"""
         publish = getattr(self.workspace, "publish_skill", None)
         if publish is None:
             return skill
         return await publish(
-            skill, agent_id=self.scope.agent_id, checksum=pin["cache_checksum_sha256"]
+            skill, agent_id=self.scope.agent_id, checksum=pin["source_checksum_sha256"]
         )
 
     async def _unpublish_skill(self, pin):
-        """撤销时清理沙箱副本，Local 继续保留受管资源缓存。"""
+        """授权撤销时清理沙箱中的运行副本。"""
         remove = getattr(self.workspace, "unpublish_skill", None)
         if remove is not None:
             await remove(
-                agent_id=self.scope.agent_id, checksum=pin["cache_checksum_sha256"]
+                agent_id=self.scope.agent_id, checksum=pin["source_checksum_sha256"]
             )
 
     async def _persist(self):

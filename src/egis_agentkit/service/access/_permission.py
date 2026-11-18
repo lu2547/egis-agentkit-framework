@@ -12,9 +12,12 @@ from egis_agentkit.errors import Forbidden, NotFound
 from egis_agentkit.service._user import UserService, require_admin
 from egis_agentkit.storage.model import AgentDefinition, User
 from egis_agentkit.storage.model._base import resource_available
+from egis_agentkit.storage.model._resource import (
+    MCP_STORAGE_VERSION,
+    is_managed_connector,
+)
 
 DEFINITION_KINDS = ("agent", "team")
-MANAGED_ASSET_KINDS = ("skill", "mcp")
 INTERNAL_AGENT_TYPES = ("personal", "orchestrator")
 
 
@@ -82,13 +85,18 @@ class PermissionService:
         """校验绑定资源的归属和使用权，返回通过校验的资源。"""
         assets = []
         for ref in data.payload.get("bindings", []):
-            asset = await self.storage.assets.get(
-                ref["resource_type"],
-                ref["resource_id"],
-                ref["resource_version"],
-            )
+            kind, identifier = ref["resource_type"], ref["resource_id"]
+            version = MCP_STORAGE_VERSION if kind == "mcp" else ref["resource_version"]
+            asset = await self.storage.assets.get(kind, identifier, version)
             if asset is None or not asset["is_enabled"]:
                 raise NotFound("绑定资源或指定版本不存在")
+            if kind == "mcp":
+                if not is_managed_connector(asset):
+                    raise NotFound("连接器未在管理控制台登记")
+                if user.role_type != "admin":
+                    await self.require(user, kind, identifier, "system")
+                assets.append(asset)
+                continue
             view = ref["resource_view_type"]
             if (view == "system") != (asset["owner_type"] == "system"):
                 raise Forbidden("绑定资源视图与归属不匹配")
@@ -173,7 +181,7 @@ class PermissionService:
         if (
             not user.is_enabled
             or view != "private"
-            or kind not in (*DEFINITION_KINDS, *MANAGED_ASSET_KINDS)
+            or kind not in (*DEFINITION_KINDS, "skill")
         ):
             return result
         target = await self._resource(kind, identifier, None)
@@ -224,6 +232,8 @@ class PermissionService:
         _parent_grant_id=None,
     ) -> PermissionDecision:
         """返回可用的授权路径，并选择此次使用的确切版本。"""
+        if resource_type == "mcp":
+            return await self._connector_access(user, resource_id, view)
         resolve_dependency = root_grant_id is not None and version is None
         try:
             user = await UserService(self.storage).get(user.user_id)
@@ -321,6 +331,33 @@ class PermissionService:
             resource_version=target["resource_version"],
         )
 
+    async def _connector_access(self, user, identifier, view):
+        users = UserService(self.storage, self.policies)
+        try:
+            user = await users.get(user.user_id)
+        except (Forbidden, NotFound):
+            return PermissionDecision(False)
+        group_id = users.company_group().group_id
+        if view != "system" or group_id not in user.group_ids:
+            return PermissionDecision(False)
+        asset = await self.storage.assets.get("mcp", identifier, MCP_STORAGE_VERSION)
+        if asset is None or not is_managed_connector(asset) or not asset["is_enabled"]:
+            return PermissionDecision(False)
+        grants = await self.storage.access.active_grants(
+            user.user_id, [group_id], kind="mcp", resource_id=identifier
+        )
+        allowed = any(
+            row["grant_source_type"] == "manual"
+            and row["principal_type"] == "group"
+            and row["principal_id"] == group_id
+            and row["resource_view_type"] == "system"
+            and row["resource_owner_type"] == "system"
+            and row["resource_owner_id"] == "system"
+            and row["root_grant_id"] is None
+            for row in grants
+        )
+        return PermissionDecision(allowed)
+
     @staticmethod
     def _valid_view(target, view):
         return (
@@ -376,38 +413,6 @@ class PermissionService:
         if not decision.is_allowed:
             raise Forbidden("未获得此资源的使用权限")
         return decision
-
-    async def granted_dependency_versions(
-        self, user, kind, *, resource_id=None, version=None
-    ):
-        """列出可为专家内部连接配置凭据的依赖版本。"""
-        user = await UserService(self.storage).get(user.user_id)
-        rows = await self.storage.access.active_grants(
-            user.user_id, user.group_ids, kind=kind, resource_id=resource_id
-        )
-        # 凭据只为当前可执行的依赖提供入口；同一授权根只验证一次。
-        allowed = set()
-        executable = {}
-        for row in rows:
-            root_id = row["root_grant_id"]
-            if root_id is None:
-                continue
-            if root_id not in executable:
-                root = await self._dependency_root(row)
-                if root is not None:
-                    try:
-                        await self.require_execution(user, root)
-                    except (Forbidden, NotFound):
-                        root = None
-                executable[root_id] = root
-            allowed.update(
-                (row["resource_id"], selected)
-                for selected in await self._dependency_versions(
-                    executable[root_id], row
-                )
-                if version is None or selected == version
-            )
-        return sorted(allowed)
 
     async def _dependency_root(self, dependency):
         root_id = dependency["root_grant_id"]
@@ -504,7 +509,7 @@ class PermissionService:
     ):
         parent_id = grant.paths[0][0]["grant_id"] if grant.root_grant_id else None
         for binding in agent["payload"].get("bindings", []):
-            if binding["resource_type"] != "tool":
+            if binding["resource_type"] == "skill":
                 await self.require(
                     user,
                     binding["resource_type"],

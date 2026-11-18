@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import time
-from pathlib import Path
 
 from agentscope.app.message_bus import MessageBusKeys
 from agentscope.app.storage import (
@@ -70,7 +69,7 @@ class SessionService:
     ):
         self.storage = storage
         self.steering = SessionSteeringService(self, storage, config_provider)
-        self.files = ProjectFileStorage(Path(workspace_root))
+        self.files = ProjectFileStorage(workspace_root, config_provider=config_provider)
         self.models, self.config = models, config_provider
         self.personal = personal or PersonalManager(
             storage, workspace_root=workspace_root, config=config_provider
@@ -472,14 +471,17 @@ class SessionService:
             "pending_collaboration_request_id": pending_request_id(binding),
             "collaborators": [
                 {
-                    k: member[k]
-                    for k in (
-                        "definition_id",
-                        "resource_view_type",
-                        "resource_version",
-                        "display_name",
-                        "status",
-                    )
+                    "definition_id": member["definition_id"],
+                    "resource_view_type": member["resource_view_type"],
+                    "resource_version": member["resource_version"],
+                    "display_name": member["display_name"],
+                    "status": member["status"],
+                    "avatar": member.get("avatar"),
+                    **(
+                        {"worker_session_id": member["worker_session_id"]}
+                        if member.get("worker_session_id")
+                        else {}
+                    ),
                 }
                 for member in collaborators(binding)
             ],
@@ -548,21 +550,25 @@ class SessionService:
         try:
             session = await self.get_session_record(user, session_id, require_use=False)
             member_ids = set()
+            binding = session.state.middle_context["egis_agentkit"]
+            all_members = collaborators(binding, include_removed=True)
             if session.team_id:
                 team = await self.storage.get_team(user.user_id, session.team_id)
                 if team:
                     member_ids = {member.session_id for member in team.data.members}
                     member_ids.discard(session_id)
+            member_ids.update(
+                member["worker_session_id"]
+                for member in all_members
+                if member.get("worker_session_id")
+            )
             for sid in sorted(member_ids):
                 key = MessageBusKeys.session_lock(sid)
                 if not await bus.try_lock(key):
                     raise Conflict("对话正在运行，请先停止生成后再删除")
                 held.append(key)
             session_ids = [session_id, *sorted(member_ids)]
-            binding = session.state.middle_context["egis_agentkit"]
-            projections = [
-                member["native_agent_id"] for member in collaborators(binding)
-            ]
+            projections = [member["native_agent_id"] for member in all_members]
             async with self.storage.session_cleanup() as (sessions, workspace):
                 await sessions.delete_sessions(
                     user.user_id, [(session.id, session.agent_id)], projections

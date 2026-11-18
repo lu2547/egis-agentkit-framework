@@ -9,7 +9,6 @@
 import asyncio
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from pathlib import Path
 
 from egis_agentkit.client._tracing import annotate_runtime, trace_phase
 from egis_agentkit.core.session._context import (
@@ -21,7 +20,10 @@ from egis_agentkit.service._user import UserService
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.agent._personal_manager import PersonalManager
 from egis_agentkit.service.project._project_manager import ProjectManager
-from egis_agentkit.service.team._collaboration import validate_collaborators
+from egis_agentkit.service.team._collaboration import (
+    collaborators,
+    validate_collaborators,
+)
 from egis_agentkit.service.team._members import team_member_definitions
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
@@ -41,7 +43,7 @@ class SessionPreparationService:
         personal=None,
     ):
         self.storage = storage
-        self.files = ProjectFileStorage(Path(workspace_root))
+        self.files = ProjectFileStorage(workspace_root, config_provider=config_provider)
         self.config_provider = config_provider
         self.models = models
         self.personal = personal or PersonalManager(
@@ -51,7 +53,7 @@ class SessionPreparationService:
         self.projects = (
             projects
             if projects is not None
-            else ProjectManager(storage, workspace_root)
+            else ProjectManager(storage, workspace_root, config_provider=config_provider)
         )
 
     async def _prepare(self, session_id):
@@ -81,6 +83,7 @@ class SessionPreparationService:
         if definition is None:
             raise Forbidden("会话绑定的智能体不在固定版本中")
         await permissions.require_execution(user, root, allow_pinned=True)
+        await self._inherit_collaboration_mode(session, binding, user_id)
         invited = await validate_collaborators(permissions, user, binding)
         parked = session.state.has_awaiting_tool_calls(definition["agent_name"])
         if parked and binding.get("chat_model_config"):
@@ -124,6 +127,30 @@ class SessionPreparationService:
             else None,
         )
         return scope, user
+
+    async def _inherit_collaboration_mode(self, session, binding, user_id):
+        """Derive the worker's approval mode from its current parent session."""
+        parent_id = binding.get("collaboration_parent_session_id")
+        if parent_id is None:
+            return
+        locator = await self.storage.locate_session(parent_id)
+        if locator is None or locator[0] != user_id or session.origin.type != "team":
+            raise Forbidden("专家协作关系已失效")
+        parent = await self.storage.read_session_unscoped(user_id, locator[1], parent_id)
+        if (
+            parent is None
+            or parent.origin.type != "user"
+            or parent.team_id != session.team_id
+            or not session.team_id
+        ):
+            raise Forbidden("专家协作关系已失效")
+        host = parent.state.middle_context["egis_agentkit"]
+        if host["project_id"] != binding["project_id"] or not any(
+            member["native_agent_id"] == session.agent_id
+            for member in collaborators(host)
+        ):
+            raise Forbidden("专家协作关系已失效")
+        session.state.permission_context.mode = parent.state.permission_context.mode
 
     @asynccontextmanager
     async def bind(self, session_id):

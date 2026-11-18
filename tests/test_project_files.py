@@ -1,8 +1,75 @@
+import hashlib
+from pathlib import PurePosixPath
+
 import pytest
 
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.service.project._file_manager import ProjectFileManager
 from egis_agentkit.storage.project._files import ProjectFileStorage
+
+
+def test_remote_project_files_use_nas_for_data_and_metadata(tmp_path):
+    local = ProjectFileStorage(tmp_path / "nas")
+    remote = ProjectFileStorage(tmp_path / "agent")
+
+    class Nas:
+        def call(self, scope, operation, **params):
+            assert scope == "project"
+            return getattr(local, operation)(**params)
+
+    remote._nas = Nas()
+    remote.root = PurePosixPath(local.root.as_posix())
+    remote.initialize_project("alice", "project")
+    metadata = remote.write(
+        "alice",
+        "project",
+        "nested/input.txt",
+        b"notes",
+        area="uploads",
+        return_metadata=True,
+    )
+    assert metadata == {
+        "name": "input.txt",
+        "path": "nested/input.txt",
+        "size": 5,
+        "is_directory": False,
+        "modified_at": metadata["modified_at"],
+    }
+    assert isinstance(metadata["modified_at"], float)
+    assert remote.context_inputs("alice", "project") == [
+        str(local.project_root("alice", "project") / "nested/input.txt")
+    ]
+    assert remote.scan("alice", "project") == {
+        ("uploads", "nested/input.txt"): (hashlib.sha256(b"notes").hexdigest(), 5)
+    }
+    assert remote.read("alice", "project", "uploads", "nested/input.txt")[0] == b"notes"
+    assert not (tmp_path / "agent").exists()
+
+
+def test_project_scan_and_context_exclude_project_memory_and_symlinks(tmp_path):
+    files = ProjectFileStorage(tmp_path / "nas")
+    upload = files.write("alice", "project", "input.txt", b"notes", area="uploads")
+    root = files.project_root("alice", "project")
+    memory = root / ".memory"
+    memory.mkdir()
+    (memory / "private.md").write_text("memory")
+    (root / "link.txt").symlink_to(upload)
+    assert files.context_inputs("alice", "project") == [str(upload)]
+    assert set(files.scan("alice", "project")) == {("uploads", "input.txt")}
+
+
+def test_project_probes_cannot_be_listed_or_delivered(tmp_path):
+    files = ProjectFileStorage(tmp_path)
+    path = f"{files.PROBE_DIRECTORY}/canary.md"
+    files.write_probe_file("alice", "project", "work", "canary.md", b"probe")
+    nested = files.area_root("alice", "project", "work") / "nested" / path
+    nested.parent.mkdir(parents=True)
+    nested.write_bytes(b"probe")
+
+    assert files.list("alice", "project", "work", "nested") == []
+    assert files.list("alice", "project", "work", recursive=True) == []
+    with pytest.raises(Forbidden):
+        files.deliver("alice", "project", path)
 
 
 def test_project_layout_keeps_uploads_flat_and_reserved_areas_separate(tmp_path):

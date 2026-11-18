@@ -46,20 +46,22 @@ class AccessStorage:
             )
             return [dict(row) for row in rows.mappings()]
 
-    async def direct_grants(self, kind, identifier, *, conn=None):
+    async def direct_grants(self, kind, identifier, *, include_revoked=False, conn=None):
         """查询同一资源当前有效的所有直接授权。"""
         if conn is None:
             async with self.engine.connect() as connection:
-                return await self.direct_grants(kind, identifier, conn=connection)
-        rows = await conn.execute(
-            select(t.resource_permission).where(
-                t.resource_permission.c.resource_type == kind,
-                t.resource_permission.c.resource_id == identifier,
-                t.resource_permission.c.grant_source_type.in_(("manual", "share")),
-                t.resource_permission.c.revoked_at.is_(None),
-            )
+                return await self.direct_grants(
+                    kind, identifier, include_revoked=include_revoked, conn=connection
+                )
+        grants = t.resource_permission
+        statement = select(grants).where(
+            grants.c.resource_type == kind,
+            grants.c.resource_id == identifier,
+            grants.c.grant_source_type.in_(("manual", "share")),
         )
-        return [dict(row) for row in rows.mappings()]
+        if not include_revoked:
+            statement = statement.where(grants.c.revoked_at.is_(None))
+        return [dict(row) for row in (await conn.execute(statement)).mappings()]
 
     async def shared_version(self, kind, identifier, *, conn=None):
         """定位资源的唯一共享版，独立于所有者最新配置。"""

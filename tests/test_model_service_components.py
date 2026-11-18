@@ -35,10 +35,9 @@ def snapshot(*, version=1, default_key="a", specs=None, **policies):
             "workspace": {"runtime": sandbox_runtime("/tmp/model-components")}, "project": {"upload": {"max_bytes": 20_971_520}},
             "user": {
                 "identity": {
-                    "mode": "demo",
                     "issuer": "test",
                     "audience": "test",
-                    "algorithm": "HS256",
+                    "jwks_url": "https://identity.example.test/.well-known/jwks.json",
                 },
             },
             "model": {

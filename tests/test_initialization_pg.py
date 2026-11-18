@@ -14,7 +14,7 @@ CLUSTER_TABLES = {
     "ak_agent_definition_detail", "ak_agent_personal_resources",
     "ak_agent_remote_runs", "ak_team_definition_summary",
     "ak_team_definition_detail", "ak_resource_assets", "ak_resource_permission",
-    "ak_approve", "ak_skill_imports", "ak_mcp_credentials", "ak_projects",
+    "ak_approve", "ak_skill_imports", "ak_virtual_users", "ak_mcp_credentials", "ak_projects",
     "ak_project_file_changes", "ak_project_file_fingerprints",
     "ak_project_reply_artifacts", "ak_feedback", "ak_bus_keys", "ak_bus_entries",
     "ak_bus_registry", "ak_bus_leases", "ak_bus_broadcast_payloads",

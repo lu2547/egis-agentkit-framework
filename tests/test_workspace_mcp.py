@@ -1,5 +1,6 @@
 """沙箱 MCP 的会话隔离、声明替换和撤销沿用原生网关生命周期。"""
 
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -39,6 +40,7 @@ async def test_sandbox_gateway_reuses_per_session_and_reconciles_revoked_resourc
             assert len(clients) == 1
             assert isinstance(clients[0], AuthorizedGatewayMCPClient)
             assert clients[0].is_connected
+            assert not (Path(workspace.workdir) / ".mcp").exists()
             if first is None:
                 first = clients[0]
                 workspaces.append(workspace)
@@ -53,6 +55,7 @@ async def test_sandbox_gateway_reuses_per_session_and_reconciles_revoked_resourc
         one.configure_workspace_resources(tools=[], mcps=[])
         assert await one.list_mcps() == []
         assert not first.is_connected
+        assert not (Path(one.workdir) / ".mcp").exists()
         assert (await two.list_mcps())[0].is_connected
         with pytest.raises(Forbidden, match="绑定"):
             await one.list_mcps(agent_id="agent", session_id="s2")

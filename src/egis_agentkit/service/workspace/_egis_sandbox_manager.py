@@ -51,9 +51,10 @@ class EgisSandboxManager(WorkspaceManagerBase):
         bus: MessageBus,
         probe: WorkspaceProbeConfig,
         lock: WorkspaceLockConfig,
+        files: ProjectFileStorage | None = None,
     ):
         super().__init__(isolation=IsolationPolicy.PER_USER)
-        self.files = ProjectFileStorage(Path(workspace_root))
+        self.files = files if files is not None else ProjectFileStorage(workspace_root)
         self.settings = settings
         self.bus = bus
         self.probe_settings = probe

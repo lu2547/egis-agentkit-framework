@@ -43,26 +43,31 @@ Agent 当前实现见 [Agent 管理与定义](./docs/Agent管理与定义.md)，
 
 审批流程记录使用 `ak_approve`，已生效的资源授权使用 `ak_resource_permission`，两者分别记录审批过程和最终使用权限。
 
-技能包和异步导入的上传文件统一保存在 NAS 挂载目录。所有 API、导入 Worker 和运行装载节点需访问同一份存储；数据库中的资源版本和导入任务只保存相对文件路径、原始包 SHA256、字节大小等元数据，不保存 ZIP 或 `SKILL.md` 正文。资源原有的内容摘要继续用于版本内容校验。上传先完成文件写入和读回校验，再提交数据库记录；NAS 不可用时不发布版本、不创建导入任务。
+系统技能正式文件保存在 `{workspaceRoot}/common/skills/{skill_id}/{version}/`，个人技能保存在 `{workspaceRoot}/user/{owner_id}/skills/{skill_id}/{version}/`。私人技能获准共享后仍从原作者目录加载。数据库记录资源版本、内容摘要、实际上传人和使用授权。运行时按获准使用的版本加载，下载时从正式文件生成 ZIP。
 
-技能包统一使用工作区持久根目录下的 `skill-archives/`，与用户项目目录分开。启动前在 Nacos 显式配置 `agentkit.skill.storage.root` 为该子目录的绝对路径（示例：`/srv/agentkit/workspace/skill-archives`，对应工作区根目录 `/srv/agentkit/workspace`）。没有默认本地路径；修改根目录需重启 API。服务端进程必须能够读写该目录。
+普通用户、管理员和经授权的外部系统使用 `POST /manager/skills/imports` 提交 ZIP。管理员在用户管理签发虚拟用户 Bearer 凭证，外部系统可先用 `GET /manager/skills/imports` 验证凭证。系统技能通过导入审核后发布，实际上传人和审核人分别记录。上传 ZIP 暂存在 Nacos 的 `agentkit.skill.storage.root` 下，任务成功或审核拒绝后删除。
 
-已有数据库使用 App 的显式升级命令，先停止 API 和导入 Worker，再执行应用迁移。预览不修改数据库或 NAS，也允许尚未配置 NAS 路径；实际执行必须先配置挂载目录，并填写预览返回的目标库名：
+已有开发库可使用 App 的显式重置命令。先停止 API 和导入 Worker，预览目标库及目录，再确认库名执行：
 
 ```bash
-python -m egis_agentkit_app upgrade-db
-python -m egis_agentkit_app upgrade-db --database agentscope --apply
+python -m egis_agentkit_app reset-skills --database egis_agentkit_clean_dev
+python -m egis_agentkit_app reset-skills --database egis_agentkit_clean_dev --apply
 ```
 
-升级会把既有技能归档和待处理上传文件逐包写入 NAS，核对全部版本和任务引用后，才删除 `ak_skill_archives` 及 `ak_skill_imports.archive` 二进制列。失败时数据库事务回滚、原数据保留；重试复用已完整写入的文件，不改变资源版本、任务状态和既有授权。升级完成后再启动服务。
+重置清理技能记录、授权、导入文件和 Agent 定义中的技能绑定，重建导入表。新部署直接执行 `init-db`。
 
 启动和真实联调见 [App](../egis-agentkit-app/README.md) 与 [实施记录](../egis-agentkit-app/docs/实施记录.md)。当前实际验收使用本地 AgentScope 2.0.11 源码；依赖范围为 `>=2.0.10,<2.1`，未单独声称已通过 2.0.10 的另一套完整验收。
 
 项目共享工作空间与删除规则见 [文件生命周期](docs/session-files.md)。
 
-OpenSandbox Docker 工作区通过 `EgisSandboxManager` 接入。Manager 实现原生 `WorkspaceManagerBase`，负责执行绑定、缓存、并发、续期和回收；Core 继承原生 `SandboxedWorkspaceBase`，复用初始化模板并实现项目挂载、Backend 和单实例生命周期；OpenSandbox SDK 通信位于 Client。授权资源由 SessionService 调用 ResourceService.prepare_workspace 装载。运行容器按用户、项目、Agent、会话隔离，同一绑定复用环境；项目上传资料默认只读，`.work/`、`artifacts/` 可写，用户标准目录位于 NAS 的 `user/{uid}/{data,skills,session,mcp,projects}`。`data` 按用户共享；`skills/session/mcp` 下按执行绑定分区并挂入对应沙箱，避免运行资源串用；NAS 的 `session` 映射到 SDK 的 `sessions`。项目目录由创建项目时初始化，创建会话时安全补齐缺失目录，Workspace 初始化只负责用户标准目录和挂载。项目数据由文件存储共享和持久化，不新增工作区表。
+启用 `agentkit.project.memory.isEnabled` 后，同一用户项目内的本地 Agent 共享 ReMe 记忆。首次执行记忆作业时，ReMe 在 NAS 的 `user/{uid}/projects/{pid}/.memory/` 初始化存储。第三方专家不装配本地记忆中间件。
 
-沙箱配置统一使用 `agentkit.workspace.runtime.mode: pks` 和同级 `sandbox` 节点。`root` 是唯一的 NAS 持久根目录，API 节点与沙箱执行宿主机必须将同一份 NAS 挂载到相同绝对路径。Workspace 的 `workdir` 固定派生为 `{root}/user/{uid}`，不再单独配置 `/workspace`；Workspace Backend 默认目录、提示词和用户目录挂载目标均使用这个用户路径。沙箱直接挂载该根目录下的当前用户项目，文件无需复制。当前开发通信仍由 `OpenSandboxClient` 对接已有 SDK；开发环境需安装 OpenSandbox extra，服务端的 `storage.allowed_host_paths` 必须包含 `root`。`apiKeyEnv` 引用部署环境变量，不把密钥写进 Nacos。公司 PKS 接入通过 `init_agentkit(..., sandbox_client_factory=...)` 注入实际 Client，配置命名调整不代表已经实现公司通信协议。修改镜像和挂载后需要重启 API；已有沙箱的挂载不会自动改变，需在停止其执行后重建实例，NAS 文件保留。Manager、Workspace 直接实现原生通用基类，Backend 在 Core，提供方 SDK 仅位于 Client。
+OpenSandbox Docker 工作区通过 `EgisSandboxManager` 接入。Manager 实现原生 `WorkspaceManagerBase`，负责执行绑定、缓存、并发、续期和回收；Core 继承原生 `SandboxedWorkspaceBase`，复用初始化模板并实现项目挂载、Backend 和单实例生命周期；OpenSandbox SDK 通信位于 Client。授权资源由 SessionService 调用 ResourceService.prepare_workspace 装载。运行容器按用户、项目、Agent、会话隔离，同一绑定复用环境；项目上传资料默认只读，`.work/`、`artifacts/` 可写，用户标准目录位于 NAS 的 `user/{uid}/{skills,session,projects}`。多模态卸载文件放在当前项目的 `.work/data/`；`skills/session` 下按执行绑定分区并挂入对应沙箱，避免运行资源串用；NAS 的 `session` 映射到 SDK 的 `sessions`。项目目录由创建项目时初始化，创建会话时安全补齐缺失目录，Workspace 初始化只负责用户标准目录和挂载。项目数据由文件存储共享和持久化，不新增工作区表。
+
+沙箱配置统一使用 `agentkit.workspace.runtime.mode: pks` 和同级 `sandbox` 节点。`root` 是唯一的 NAS 持久根目录，沙箱执行宿主机与实际处理文件的 Linux 服务或 Agent 节点须通过同一绝对路径访问同一份 NAS。Workspace 的 `workdir` 固定派生为 `{root}/user/{uid}`，不再单独配置 `/workspace`；Workspace Backend 默认目录、提示词和用户目录挂载目标均使用这个用户路径。沙箱直接挂载该根目录下的当前用户项目，文件无需复制。当前开发通信仍由 `OpenSandboxClient` 对接已有 SDK；开发环境需安装 OpenSandbox extra，服务端的 `storage.allowed_host_paths` 必须包含 `root`。`apiKeyEnv` 引用部署环境变量，不把密钥写进 Nacos。公司 PKS 接入通过 `init_agentkit(..., sandbox_client_factory=...)` 注入实际 Client，配置命名调整不代表已经实现公司通信协议。修改镜像和挂载后需要重启 API；已有沙箱的挂载不会自动改变，需在停止其执行后重建实例，NAS 文件保留。Manager、Workspace 直接实现原生通用基类，Backend 在 Core，提供方 SDK 仅位于 Client。
+
+
+`agentkit.workspace.files.win` 默认是 `false`，用于已挂载 NAS 的 Agent 节点。原生 Windows Agent 将 `win` 设为 `true`，并配置 `endpoint` 指向 Linux 文件服务。个人偏好、项目文件和 Skill 由该服务操作同一份 NAS，`runtime.root` 仍填写 Linux 上的 NAS 根目录。文件服务通过 `tokenEnv` 从部署环境读取两端共享的服务凭据。HTTP 模式下将 `agentkit.project.memory.isEnabled` 设为 `false`，因为原生 ReMe 直接访问 Agent 宿主的目录。启动方式见 [App 部署说明](../egis-agentkit-app/README.md)。
 
 工具通过 EgisSandboxBackend 调用注入的沙箱 Client 执行；MCP 通过容器内原生网关连接，连接配置不写入 `.mcp`，网关临时内容只允许经过启动时验证为 tmpfs 的 `gatewayTmpDir`；技能在激活后暂存完整再安装，完成的同一内容直接复用，授权失效会移除运行副本。持久激活记录继续校验原资源内容。MCP 中的 `localhost` 指沙箱自身；访问宿主开发服务应使用沙箱可达地址。
 

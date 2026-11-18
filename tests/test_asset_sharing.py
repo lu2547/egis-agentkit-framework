@@ -9,40 +9,35 @@ from egis_agentkit.storage import tables as t
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["skill", "mcp"])
-async def test_private_asset_requires_review_and_approval_grants_exact_version(
-    storage, tmp_path, kind
+async def test_private_skill_requires_review_and_approval_grants_exact_version(
+    storage, tmp_path
 ):
-    _, admin, alice, bob = await identities(storage)
+    users, admin, alice, bob = await identities(storage)
+    alice = await users.sync_identity(alice.user_id, "技能作者")
     resources = ResourceService(storage, tmp_path)
     shares = ShareService(storage)
-    data = {"resource_id": "private-asset", "resource_version": "1.0.0"}
-    data.update(
-        {"markdown": "# Private"}
-        if kind == "skill"
-        else {
-            "config": {"transport": "streamable_http", "url": "http://example.com/mcp"}
-        }
-    )
-    own = await (
-        resources.save_skill(alice, data)
-        if kind == "skill"
-        else resources.save_mcp(alice, data)
-    )
+    data = {
+        "resource_id": "private-asset",
+        "resource_version": "1.0.0",
+        "markdown": "# Private",
+    }
+    own = await resources.save_skill(alice, data)
     assert own["is_usable"]
-    assert await resources.list(bob, kind) == []
+    assert await resources.list(bob, "skill") == []
     with pytest.raises(Forbidden):
-        await shares.submit(bob, kind, data["resource_id"], target=COMPANY)
-    review = await shares.submit(alice, kind, data["resource_id"], target=COMPANY)
+        await shares.submit(bob, "skill", data["resource_id"], target=COMPANY)
+    review = await shares.submit(alice, "skill", data["resource_id"], target=COMPANY)
     assert review["resource_version"] == "1.0.0"
     assert "snapshot" not in review
-    assert await resources.list(bob, kind) == []
+    assert await resources.list(bob, "skill") == []
     approved = await shares.decide(admin, review["review_id"], True, "")
     assert approved["is_current"] and approved["resource_version"] == "1.0.0"
     assert await shares.decide(admin, review["review_id"], True, "") == approved
-    assert (await resources.detail(bob, kind, data["resource_id"], "1.0.0"))[
-        "is_usable"
-    ]
+    (shared_skill,) = await resources.list(bob, "skill")
+    assert shared_skill["owner_display_name"] == "技能作者"
+    detail = await resources.detail(bob, "skill", data["resource_id"], "1.0.0")
+    assert detail["is_usable"]
+    assert detail["owner_display_name"] == "技能作者"
     async with storage.engine.connect() as conn:
         grants = (await conn.execute(select(t.resource_permission))).mappings().all()
     assert {(row["grant_source_type"], row["principal_type"]) for row in grants} == {
@@ -53,13 +48,31 @@ async def test_private_asset_requires_review_and_approval_grants_exact_version(
     assert shared["source_review_id"] == review["review_id"]
     assert "resource_version" not in shared
     newer = {**data, "resource_version": "1.1.0", "base_version": "1.0.0"}
-    await (
-        resources.save_skill(alice, newer)
-        if kind == "skill"
-        else resources.save_mcp(alice, newer)
-    )
+    await resources.save_skill(alice, newer)
     with pytest.raises(Forbidden):
-        await resources.detail(bob, kind, data["resource_id"], "1.1.0")
+        await resources.detail(bob, "skill", data["resource_id"], "1.1.0")
+
+
+@pytest.mark.asyncio
+async def test_managed_connector_rejects_share_requests(storage, tmp_path):
+    _, admin, alice, _ = await identities(storage)
+    resources = ResourceService(storage, tmp_path)
+    await resources.save_mcp(
+        admin,
+        {
+            "resource_id": "managed-connector",
+            "config": {
+                "transport": "streamable_http",
+                "url": "https://example.com/mcp",
+            },
+        },
+    )
+    shares = ShareService(storage)
+    with pytest.raises(Conflict, match="不支持共享"):
+        await shares.submit(alice, "mcp", "managed-connector", target=COMPANY)
+    with pytest.raises(Conflict, match="不支持共享"):
+        await shares.submit(admin, "mcp", "managed-connector")
+    assert await shares.list(admin, admin=True) == []
 
 
 @pytest.mark.asyncio

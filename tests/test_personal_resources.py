@@ -125,7 +125,9 @@ async def test_personal_switches_are_independent_and_follow_current_shared_versi
     assert (await resources.personal.list_resources(bob, "skill"))["report"][
         "is_enabled"
     ] is True
-    await put_asset(storage, version="2.0.0", owner_type="user", owner_id="admin")
+    await put_asset(
+        storage, version="2.0.0", owner_type="user", owner_id="admin", revision=2
+    )
     update = await shares.submit(admin, "skill", "report")
     await shares.decide(admin, update["review_id"], True, "通过新版")
     assert (

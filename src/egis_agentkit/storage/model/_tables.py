@@ -96,6 +96,15 @@ users = Table(
     CheckConstraint("jsonb_typeof(group_ids)='array'"),
 )
 Index("ix_ak_user_groups", users.c.group_ids, postgresql_using="gin")
+virtual_users = Table(
+    "ak_virtual_users",
+    metadata,
+    Column("user_id", String(128), primary_key=True),
+    Column("username", String(128), nullable=False),
+    Column("credential_sha256", String(64), nullable=False),
+    Column("is_enabled", Boolean, nullable=False, server_default=text("true")),
+    *audit_columns(),
+)
 groups = Table(
     "ak_groups",
     metadata,
@@ -471,8 +480,13 @@ skill_imports = Table(
     "ak_skill_imports",
     metadata,
     Column("job_id", String(64), primary_key=True),
-    Column("owner_id", String(128), nullable=False),
+    Column("uploader_id", String(128), nullable=False),
     Column("filename", String(255), nullable=False),
+    Column("owner_type", String(16), nullable=False, server_default="user"),
+    Column("uploader_type", String(16), nullable=False, server_default="user"),
+    Column("reviewed_by", String(128)),
+    Column("reviewed_at", DateTime(timezone=True)),
+    Column("review_reason", Text),
     Column("category", String(80), nullable=False),
     Column("avatar", String(64), nullable=False),
     Column("archive_location", JSONB(none_as_null=True)),
@@ -493,11 +507,15 @@ skill_imports = Table(
     Column("error", Text),
     Column("result", JSONB),
     *audit_columns(),
-    CheckConstraint("status IN ('queued','running','succeeded','failed')"),
+    CheckConstraint(
+        "status IN ('queued','running','pending_approval','rejected','succeeded','failed')"
+    ),
+    CheckConstraint("owner_type IN ('user','system')"),
+    CheckConstraint("uploader_type IN ('user','admin','virtual')"),
     CheckConstraint("progress BETWEEN 0 AND 100"),
 )
 Index("ix_ak_skill_import_claim", skill_imports.c.status, skill_imports.c.available_at)
-Index("ix_ak_skill_import_owner", skill_imports.c.owner_id, skill_imports.c.created_at)
+Index("ix_ak_skill_import_uploader", skill_imports.c.uploader_id, skill_imports.c.created_at)
 
 reply_artifacts = Table(
     "ak_project_reply_artifacts",

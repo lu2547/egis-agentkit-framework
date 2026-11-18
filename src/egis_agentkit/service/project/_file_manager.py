@@ -9,8 +9,6 @@
 import asyncio
 import hashlib
 import logging
-import os
-import stat
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -21,7 +19,6 @@ from agentscope.tool import ToolResponse
 from egis_agentkit.client._tracing import trace_phase
 from egis_agentkit.client.nacos._settings import (
     ProjectChangesConfig,
-    ProjectContextConfig,
     ProjectScanConfig,
     ProjectWorkbookConfig,
 )
@@ -75,16 +72,6 @@ class ProjectFileManager:
     @property
     def max_upload_bytes(self):
         return self.files.max_bytes
-
-    @staticmethod
-    def _uploaded_file(target, root, content):
-        return {
-            "name": target.name,
-            "path": target.relative_to(root).as_posix(),
-            "is_directory": False,
-            "size": len(content),
-            "modified_at": target.stat().st_mtime,
-        }
 
     async def project_file_changes(self, user, project_id, cursor=None, limit=None):
         """观察所属项目后返回文件变更页。"""
@@ -144,7 +131,7 @@ class ProjectFileManager:
             await self.observe_safe(user.user_id, project_id)
             # 2. Storage 在锁内检测旧摘要，拒绝覆盖其他编辑者的新内容。
             async with self.locked([project_id]):
-                target = await asyncio.to_thread(
+                metadata = await asyncio.to_thread(
                     self.files.update_file,
                     user.user_id,
                     project_id,
@@ -152,15 +139,12 @@ class ProjectFileManager:
                     path,
                     content,
                     checksum,
+                    return_metadata=True,
                 )
             # 3. 页面编辑不归属于任何 Agent 回复，只记录普通文件变更。
             await self.observe_safe(user.user_id, project_id)
             return {
-                **self._uploaded_file(
-                    target,
-                    self.files.area_root(user.user_id, project_id, area),
-                    content,
-                ),
+                **metadata,
                 "area": area,
                 "checksum": hashlib.sha256(content).hexdigest(),
             }
@@ -205,7 +189,7 @@ class ProjectFileManager:
         async with self.projects.guard(user, project_id):
             await self.observe_safe(user.user_id, project_id)
             async with self.locked([project_id]):
-                target = await asyncio.to_thread(
+                metadata = await asyncio.to_thread(
                     self.files.write,
                     user.user_id,
                     project_id,
@@ -213,14 +197,10 @@ class ProjectFileManager:
                     content,
                     area="uploads",
                     overwrite=overwrite,
+                    return_metadata=True,
                 )
             await self.observe_safe(user.user_id, project_id)
-            return {
-                **self._uploaded_file(
-                    target, self.files.project_root(user.user_id, project_id), content
-                ),
-                "area": "uploads",
-            }
+            return {**metadata, "area": "uploads"}
 
     async def deliver_project_file(self, user, project_id, path):
         """交付所属项目的工作文件并记录变更。"""
@@ -257,101 +237,8 @@ class ProjectFileManager:
         return self.storage.project_files.locked(project_ids)
 
     def scan(self, user_id, project_id, limits=None):
-        """按同一份扫描限额读取字节并计算文件指纹。"""
-        if limits is None:
-            limits = (
-                self.config.snapshot.project.scan
-                if self.config
-                else ProjectScanConfig()
-            )
-        result = {}
-        count = total = 0
-
-        def walk(fd, area, prefix, depth):
-            nonlocal count, total
-            if depth > limits.max_depth:
-                raise Conflict("文件目录过深，无法完整记录变更")
-            for name in os.listdir(fd):
-                if name.casefold() == self.files.PROBE_DIRECTORY:
-                    continue
-                count += 1
-                if count > limits.max_entries:
-                    raise Conflict("文件数量超过变更记录扫描限制")
-                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                if stat.S_ISLNK(info.st_mode):
-                    continue
-                path = f"{prefix}/{name}" if prefix else name
-                if len(path.encode("utf-8")) > limits.max_path_bytes:
-                    raise Conflict("文件路径过长，无法完整记录变更")
-                if stat.S_ISDIR(info.st_mode):
-                    child = os.open(
-                        name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
-                    )
-                    try:
-                        if (
-                            area == "uploads"
-                            and not prefix
-                            and name.casefold() in self.files.RESERVED
-                        ):
-                            walk(
-                                child,
-                                "work" if name.casefold() == ".work" else "artifacts",
-                                "",
-                                depth + 1,
-                            )
-                        else:
-                            walk(child, area, path, depth + 1)
-                    finally:
-                        os.close(child)
-                elif stat.S_ISREG(info.st_mode):
-                    if (
-                        area == "uploads"
-                        and not prefix
-                        and name.casefold() in self.files.RESERVED
-                    ):
-                        continue
-                    total += info.st_size
-                    if total > limits.max_total_bytes:
-                        raise Conflict("文件数量或大小超过变更记录扫描限制")
-                    item = os.open(
-                        name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd
-                    )
-                    try:
-                        before = os.fstat(item)
-                        if not stat.S_ISREG(before.st_mode):
-                            raise Conflict("文件在扫描期间发生变化")
-                        digest = hashlib.sha256()
-                        size = 0
-                        while chunk := os.read(item, limits.read_chunk_bytes):
-                            size += len(chunk)
-                            if (
-                                size > before.st_size
-                                or total - info.st_size + size > limits.max_total_bytes
-                            ):
-                                raise Conflict("文件在扫描期间发生变化")
-                            digest.update(chunk)
-                        after = os.fstat(item)
-                        if (before.st_size, before.st_mtime_ns, before.st_ino) != (
-                            after.st_size,
-                            after.st_mtime_ns,
-                            after.st_ino,
-                        ) or size != before.st_size:
-                            raise Conflict("文件在扫描期间发生变化")
-                        result[(area, path)] = (digest.hexdigest(), size)
-                    finally:
-                        os.close(item)
-
-        try:
-            fd = self.files._directory_fd(
-                self.files.project_root(user_id, project_id), []
-            )
-        except NotFound:
-            return result
-        try:
-            walk(fd, "uploads", "", 0)
-        finally:
-            os.close(fd)
-        return result
+        """取得用于变更记录的文件指纹。"""
+        return self.files.scan(user_id, project_id, limits)
 
     @asynccontextmanager
     async def track_changes(self, user_id, project_id, session_id, reply_id):
@@ -589,36 +476,9 @@ class ProjectFileManager:
         if response is not None:
             yield response
 
-    def context_inputs(self, workdir):
-        """有界枚举项目可见输入，忽略内部目录和符号链接。"""
-        limits = (
-            self.config.snapshot.project.context
-            if self.config
-            else ProjectContextConfig()
-        )
-        result = []
-        root = workdir.parent
-        if root.is_symlink():
-            return result
-        for index, (directory, dirs, names) in enumerate(
-            os.walk(root, followlinks=False)
-        ):
-            dirs[:] = sorted(
-                name
-                for name in dirs
-                if not name.startswith(".")
-                and not (Path(directory) == root and name == "artifacts")
-                and not (Path(directory) / name).is_symlink()
-            )
-            if index >= limits.max_directories:
-                break
-            for name in sorted(names):
-                path = Path(directory) / name
-                if not path.is_symlink() and path.is_file():
-                    result.append(str(path))
-                if len(result) >= limits.max_files:
-                    return result
-        return result
+    def context_inputs(self, user_id, project_id):
+        """取得可用于项目提示的输入文件。"""
+        return self.files.context_inputs(user_id, project_id)
 
     def _change_settings(self):
         """一次工具回调使用同一份已校验的变更配置。"""

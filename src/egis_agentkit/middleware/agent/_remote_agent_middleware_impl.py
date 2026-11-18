@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 from typing import Any, AsyncIterator, Awaitable, Callable, Sequence
 
 from agentscope.agent import Agent
@@ -19,6 +18,7 @@ from agentscope.tool import ToolResponse
 from sqlalchemy.engine import RowMapping
 
 from egis_agentkit.client.remote_agent._base import RemoteAgentClientBase
+from egis_agentkit.middleware.team._message import team_message_text
 from egis_agentkit.service.agent._remote_agent import (
     RemoteAgentService,
 )
@@ -30,7 +30,6 @@ from egis_agentkit.storage.model._remote_agent import (
 from egis_agentkit.storage.model.agent._remote_config import validate_endpoint
 
 logger = logging.getLogger(__name__)
-_TEAM_MESSAGE = re.compile(r'<team-message from="[^"]+">\n(.*)\n</team-message>$', re.S)
 _REPORT_PREFIX = "remote-report-"
 
 
@@ -104,21 +103,12 @@ class RemoteAgentMiddlewareImpl(MiddlewareBase):
                 if msg.role != "assistant":
                     continue
                 for hint in msg.get_content_blocks("hint"):
-                    if hint.id in self._seen_sources or not isinstance(hint.hint, str):
+                    if hint.id in self._seen_sources:
                         continue
-                    try:
-                        source = json.loads(hint.source or "{}")
-                    except ValueError:
-                        continue
-                    if not isinstance(source, dict) or source.get("label") not in {
-                        "team",
-                        "team_message",
-                    }:
-                        continue
-                    match = _TEAM_MESSAGE.search(hint.hint)
-                    if match and match[1].strip():
+                    text = team_message_text(hint)
+                    if text:
                         source_ids.append(hint.id)
-                        texts.append(match[1])
+                        texts.append(text)
         if not texts and not attachments:
             return None
         digest = hashlib.sha256(

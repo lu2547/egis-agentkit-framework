@@ -1,7 +1,8 @@
 """按所有者和项目查询原生会话，复用原生删除规则。"""
 
 from agentscope.app.storage._sql._mappers import _from_record
-from agentscope.app.storage._sql._tables import MessageRow, SessionRow
+from agentscope.app.storage._sql._storage import _utcnow
+from agentscope.app.storage._sql._tables import MessageRow, SessionRow, TeamRow
 from agentscope.message import Msg
 from sqlalchemy import column, insert, literal, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -152,6 +153,30 @@ class SessionStorage:
                     .limit(limit)
                 )
             ).all()
+
+    async def detach_collaborator(self, parent, team, worker_id):
+        """原子更新主会话邀请记录、原生名单及工作会话归属。"""
+        parent.updated_at = _utcnow()
+        parent_row = _from_record(SessionRow, parent)
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                update(SessionRow)
+                .where(SessionRow.id == parent.id, SessionRow.user_id == parent.user_id)
+                .values(payload=parent_row.payload, updated_at=parent_row.updated_at)
+            )
+            await conn.execute(
+                update(SessionRow)
+                .where(SessionRow.id == worker_id, SessionRow.user_id == parent.user_id)
+                .values(team_id=None)
+            )
+            if team:
+                team.updated_at = parent.updated_at
+                team_row = _from_record(TeamRow, team)
+                await conn.execute(
+                    update(TeamRow)
+                    .where(TeamRow.id == team.id, TeamRow.user_id == parent.user_id)
+                    .values(payload=team_row.payload, updated_at=team_row.updated_at)
+                )
 
     async def delete_sessions(self, user_id, sessions, owned_projections):
         """借用清理事务，沿用原生消息和 Team 级联删除规则。"""

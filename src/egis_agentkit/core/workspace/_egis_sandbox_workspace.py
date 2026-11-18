@@ -6,6 +6,7 @@
 - renew_workspace / close_workspace：续期或暂停当前实例，关闭 SDK 和 MCP 连接。
 - destroy_sandbox_instances：校验归属并销毁指定用户、项目的全部底层实例。
 - get_builtin_tools / configure_workspace_resources：构造原生工具，装载已授权工具和 MCP。
+- offload_data_block：将多模态内容落盘到当前项目的工作目录。
 - publish_skill / unpublish_skill：发布或移除沙箱中的技能运行副本。
 内部实现
 - 元数据摘要、技能目标路径、文件复制与 MCP 分区校验均由下划线方法承担。
@@ -19,11 +20,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import mimetypes
 import re
 import shlex
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
+from agentscope.message import Base64Source, DataBlock, URLSource
 from agentscope.skill import Skill
 from agentscope.tool import Bash, Read
 from agentscope.workspace._gateway_client import GatewayMCPClient
@@ -31,6 +34,10 @@ from agentscope.workspace._sandboxed_base import SandboxedWorkspaceBase
 from agentscope.workspace._utils import _GATEWAY_BASE_REQUIREMENTS, UV_VERSION
 
 from egis_agentkit.client._tracing import trace_phase
+from egis_agentkit.client.mcp._gateway_mcp_client_override import (
+    AuthorizedGatewayClient,
+    credential_fingerprint,
+)
 from egis_agentkit.client.nacos._settings import (
     SandboxWorkspaceConfig,
     WorkspaceProbeConfig,
@@ -38,6 +45,7 @@ from egis_agentkit.client.nacos._settings import (
 from egis_agentkit.client.sandbox import SandboxClient, SandboxMount
 from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.storage.project._files import ProjectFileStorage
+from egis_agentkit.storage.skill._version import SkillVersionStorage
 
 from ._checks._egis_sandbox_checks import _EgisSandboxChecks
 from ._egis_sandbox_backend import EgisSandboxBackend
@@ -95,30 +103,30 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
         self.gateway_port = settings.gateway_port
         super().__init__(workspace_id=logical_id)
         mounts = self.build_mounts()
-        self._binding_metadata = {
+        self.sandbox_metadata = {
             # 外部身份可以包含 Unicode 或邮箱，不能直接作为 provider label。
             "agentkit.user.hash": self._hash_metadata(user_id.encode()),
             "agentkit.project.id": project_id,
             # 服务端 metadata 遵循 label 长度约束；Base32 保留完整摘要且仅含字母数字。
             "agentkit.mount.hash": client.mount_fingerprint(mounts),
+            "agentkit.workspace.id": self.workspace_id,
+            "agentscope.workspace.id": self.runtime_binding_id,
         }
-        self.sandbox_metadata = dict(self._binding_metadata)
-        self.sandbox_metadata["agentkit.workspace.id"] = self.workspace_id
-        self.sandbox_metadata["agentscope.workspace.id"] = self.runtime_binding_id
 
     # 公开执行能力：挂载、续期、资源装载、技能发布及实例关闭和销毁。
 
     def build_mounts(self) -> list[SandboxMount]:
         """用户目录持久化到 NAS，只挂入当前项目，不暴露其他项目或用户。"""
         user = self.egis_files.user_root(self.egis_user_id)
-        runtime = Path(self.workdir)
+        runtime = PurePosixPath(self.workdir)
         binding = self.runtime_binding_id
         project = self.egis_files.project_root(self.egis_user_id, self.egis_project_id)
         return [
-            SandboxMount("user-data", str(user / "data"), str(runtime / "data")),
             # 运行资源仍按绑定隔离，但实际文件均落在该用户的 NAS 目录下。
             SandboxMount(
-                "user-skills", str(user / "skills" / binding), str(runtime / "skills")
+                "user-skills",
+                str(self.egis_files.user_skill_runtime_root(self.egis_user_id, binding)),
+                str(runtime / "skills"),
             ),
             # NAS 按约定使用单数 session，沙箱内复用 SDK 的 sessions 路径。
             SandboxMount(
@@ -126,7 +134,6 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
                 str(user / "session" / binding),
                 str(runtime / "sessions"),
             ),
-            SandboxMount("user-mcp", str(user / "mcp" / binding), str(runtime / "mcp")),
             SandboxMount(
                 "project-inputs",
                 str(project),
@@ -230,13 +237,16 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
         self, skill: Skill, *, agent_id: str, checksum: str
     ) -> Skill:
         """先完整暂存再安装技能，已完成的同一内容直接复用。"""
-        # 1. 校验目标及受管源，不挂载整个公共缓存。
+        # 1. 校验目标及受管源，仅挂载当前运行副本目录。
         destination = self._get_skill_destination(agent_id, checksum)
-        source = Path(skill.dir)
-        if source.is_symlink() or not source.resolve().is_relative_to(
-            self.egis_files.root
-        ):
-            raise Forbidden("技能缓存不在受管目录")
+        if self.egis_files.uses_nas_api:
+            source = PurePosixPath(skill.dir)
+        else:
+            source = Path(skill.dir)
+            if source.is_symlink() or not source.resolve().is_relative_to(
+                self.egis_files.root
+            ):
+                raise Forbidden("技能版本不在受管目录")
         backend = self.get_backend()
         marker = destination + ".complete"
         async with self._skill_publication_lock:
@@ -245,7 +255,7 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
             if not complete or await backend.read_file(marker) != checksum.encode():
                 staging = destination + ".staging-" + uuid4().hex
                 try:
-                    await self._copy_skill(source, staging)
+                    await self._copy_skill(source, staging, checksum=checksum)
                     # 未完成内容可能来自上次中断，完整暂存后才清理并替换。
                     await backend.delete_path(destination)
                     moved = await backend.exec_shell(["mv", staging, destination])
@@ -259,7 +269,7 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
         )
 
     async def unpublish_skill(self, *, agent_id: str, checksum: str) -> None:
-        """授权失效时移除运行副本，不删除原资源及宿主缓存。"""
+        """授权失效时移除运行副本，保留原始技能版本。"""
         destination = self._get_skill_destination(agent_id, checksum)
         async with self._skill_publication_lock:
             await self.get_backend().delete_path(destination)
@@ -300,28 +310,43 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
             raise Forbidden("技能运行分区或内容校验值无效")
         return self.get_backend().join_path(self.workdir, "skills", agent_id, checksum)
 
-    async def _copy_skill(self, source: Path, staging: str) -> None:
+    async def _skill_contents(self, source: PurePosixPath, checksum: str):
+        """读取安装内容，HTTP 模式由文件服务校验正式版本目录和摘要。"""
+        if self.egis_files.uses_nas_api:
+            versions = SkillVersionStorage(
+                self.egis_files.root, config_provider=self.egis_files.config
+            )
+            contents = await asyncio.to_thread(
+                versions.read_runtime, source, checksum=checksum,
+                max_bytes=self.settings.max_skill_bytes,
+            )
+            for relative, content in contents.items():
+                yield relative, content
+            return
+
+        local = Path(source)
+        remaining = self.settings.max_skill_bytes
+        for path in sorted(local.rglob("*")):
+            if path.is_symlink():
+                raise Forbidden("技能内容不允许符号链接")
+            if path.is_file():
+                relative = path.relative_to(local).as_posix()
+                content, _ = await asyncio.to_thread(
+                    self.egis_files._read_root, local, relative,
+                    max_bytes=remaining,
+                )
+                remaining -= len(content)
+                yield relative, content
+
+    async def _copy_skill(
+        self, source: PurePosixPath, staging: str, *, checksum: str
+    ) -> None:
         """按总量限制读取受管内容，仅写入当前发布的暂存目录。"""
         backend = self.get_backend()
         result = await backend.exec_shell(["mkdir", "-p", staging])
         if not result.ok():
             raise Conflict("无法创建沙箱技能暂存目录")
-        total = 0
-        for path in sorted(source.rglob("*")):
-            if path.is_symlink():
-                raise Forbidden("技能内容不允许符号链接")
-            if not path.is_file():
-                continue
-            relative = path.relative_to(source).as_posix()
-            content, _ = await asyncio.to_thread(
-                self.egis_files._read_root,
-                source,
-                relative,
-                max_bytes=self.settings.max_skill_bytes - total,
-            )
-            total += len(content)
-            if total > self.settings.max_skill_bytes:
-                raise Conflict("技能内容超过沙箱发布限制")
+        async for relative, content in self._skill_contents(source, checksum):
             target = backend.join_path(staging, relative)
             result = await backend.exec_shell(["mkdir", "-p", backend.dirname(target)])
             if not result.ok():
@@ -337,12 +362,17 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
     # AgentScope 原生接口与覆盖钩子：名称由父类协议规定。
 
     async def _provision_backend(self):
-        """原生 initialize 的接入点：检查持久身份、连接实例并绑定 Core Backend。"""
-        # 1. 先准备 NAS 挂载源；这里只创建用户标准目录，不代替项目创建。
+        """准备 NAS 挂载源，创建或恢复实例，再初始化沙箱内目录。"""
+        # 1. 进入沙箱 Client 前补齐当前执行绑定的全部 NAS 挂载源。
         await asyncio.to_thread(
             self.egis_files.initialize_user_workspace,
             self.egis_user_id,
             self.runtime_binding_id,
+        )
+        await asyncio.to_thread(
+            self.egis_files.initialize_project,
+            self.egis_user_id,
+            self.egis_project_id,
         )
         # 2. 查找实例不代表可以接入，必须逐项检查执行绑定和挂载身份。
         existing = await self.client.find_instance(self.runtime_binding_id)
@@ -359,8 +389,42 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
                 await self.client.create_instance(
                     dict(self.sandbox_metadata), self.build_mounts()
                 )
-        # 3. 命令和文件能力由 Core Backend 统一提供，不导入厂商 Backend。
-        self._backend = EgisSandboxBackend(self.client, self.workdir)
+        # 3. 实例连接可用后，初始化原生运行目录，再将 Backend 交给父类。
+        backend = EgisSandboxBackend(self.client, self.workdir)
+        self._backend = backend
+        result = await backend.exec_shell(
+            [
+                "mkdir", "-p", self.workdir, self._skills_dir,
+                self._sessions_dir, self._gateway_home,
+            ],
+            cwd="/",
+        )
+        if not result.ok():
+            raise RuntimeError("沙箱运行目录初始化失败")
+
+    async def _ensure_workspace_layout(self) -> None:
+        """目录已在 _provision_backend 准备完成，保留原生初始化钩子。"""
+
+    async def offload_data_block(self, block: DataBlock) -> DataBlock:
+        """沿用原生卸载协议，将媒体和引用放到当前项目。"""
+        if not isinstance(block.source, Base64Source):
+            return block
+
+        work = self.egis_files.area_root(
+            self.egis_user_id, self.egis_project_id, "work"
+        )
+        digest = hashlib.sha256(block.source.data.encode()).hexdigest()
+        suffix = mimetypes.guess_extension(block.source.media_type) or ".bin"
+        path = work / "data" / f"{digest}{suffix}"
+        backend = self.get_backend()
+        if not await backend.file_exists(str(path)):
+            await backend.write_file(str(path), base64.b64decode(block.source.data))
+
+        source = URLSource(
+            url=f"workspace:///{path.relative_to(self.workdir).as_posix()}",
+            media_type=block.source.media_type,
+        )
+        return block.model_copy(update={"source": source})
 
     async def _teardown_backend(self):
         """原生 close 的接入点；关闭实例与销毁项目是不同操作。"""
@@ -405,7 +469,8 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
         self._gateway.tmp_dir = self.settings.gateway_tmp_dir
 
     async def _save_mcp_file(self):
-        """受管连接凭据只发送给沙箱网关，不持久化到 .mcp。"""
+        """覆盖原生写入钩子，避免创建 .mcp。"""
+        return None
 
     async def list_tools(self):
         return (
@@ -423,29 +488,23 @@ class EgisSandboxWorkspace(SandboxedWorkspaceBase):
         aid, sid = self._validate_mcp_partition(agent_id, session_id)
         declared = self._selected_mcps
         async with self.egis_mcp_reconcile:
+            if self._gateway is not None and not isinstance(self._gateway, AuthorizedGatewayClient):
+                self._gateway = AuthorizedGatewayClient(
+                    self._gateway,
+                    declarations=self._declared_specs,
+                    client_factory=self._mcp_client_factory,
+                )
             previous = self.egis_mcp_clients.setdefault((aid, sid), {})
             desired = {
-                client.name: client.model_dump(mode="json") for client in declared
+                client.name: (client.model_dump(mode="json"), credential_fingerprint(client))
+                for client in declared
             }
             for name, old in list(previous.items()):
                 if desired.get(name) != old:
                     await super().remove_mcp(name, agent_id=aid, session_id=sid)
             self._mcp_specs[(aid, sid)] = declared
             self.egis_mcp_clients[(aid, sid)] = desired
-            clients = await super().list_mcps(agent_id=aid, session_id=sid)
-            # 原生网关创建普通代理；保留同一注册身份，补充企业权限来源标签。
-            result = []
-            for client in clients:
-                if not isinstance(client, self._mcp_client_factory):
-                    client = self._mcp_client_factory.model_validate(
-                        client.model_dump()
-                    )
-                    client.attach(
-                        self._gateway, agent_id=aid, session_id=sid, connected=True
-                    )
-                    self._mcp_instances[(aid, sid)][client.name] = client
-                result.append(client)
-            return result
+            return await super().list_mcps(agent_id=aid, session_id=sid)
 
     async def close(self):
         """接入 AgentScope 固定关闭接口，转入本类的单实例关闭能力。"""

@@ -6,7 +6,7 @@
 
 | 文件 | 执行内容 |
 | --- | --- |
-| [nas.sh](nas.sh) | 检查 NAS 已挂载，创建用户根目录和技能归档目录，验证文件写入、读回 |
+| [nas.sh](nas.sh) | 检查 NAS 已挂载，创建用户根目录、系统技能目录和技能上传暂存目录，验证文件写入、读回 |
 | [pg.sql](pg.sql) | 在空的目标 schema 中创建 29 张表及约束、索引，包括 Session 项目生成列 |
 | [kafka.sh](kafka.sh) | 创建 `<前缀>.triggers`、`<前缀>.broadcast`，核对分区数和副本数 |
 | [redis.sh](redis.sh) | 验证地址、认证、TLS 和逻辑库；当前框架没有需要预置的 Redis 业务 Key |
@@ -43,12 +43,12 @@ bash scripts/init/nas.sh
 
 - `NAS_MOUNTPOINT` 是实际挂载点。未挂载时直接失败，不在本地盘降级创建目录。
 - `NAS_ROOT` 是应用持久根目录；脚本建立其 `user/` 子目录。
-- `SKILL_STORAGE_ROOT` 保存技能 ZIP 和待处理上传文件，通常是 `NAS_ROOT/skill-archives`。
+- `SKILL_STORAGE_ROOT` 暂存待处理的技能 ZIP，通常是 `NAS_ROOT/skill-uploads`。正式的系统技能保存在 `NAS_ROOT/common/skills`，个人技能保存在各用户的 `skills` 子目录。
 - 两个业务根目录均须位于该挂载点内；新目录权限由 `NAS_DIR_MODE` 决定。
 - 已存在的 `user/` 不能是符号链接；持久根、用户根和技能根均执行读写探针。
 - 不递归修改已有权限，不预建具体用户或项目；文件探针执行后会清理。
 
-所有 API/技能导入节点与沙箱执行宿主机必须将同一份 NAS 挂载到相同绝对路径。Nacos 的 `workspace.runtime.root` 是唯一持久根目录，值与 `NAS_ROOT` 一致；沙箱直接挂载当前项目目录，无需复制项目文件。使用 OpenSandbox 开发适配器时，服务端的 `storage.allowed_host_paths` 必须包含该根目录。用户 NAS 目录按 `user/{uid}/{data,skills,session,mcp,projects}` 组织，由 Workspace 初始化补齐；初始化脚本不预建具体用户。`data` 按用户共享，`skills/session/mcp` 下按执行绑定分区并挂入沙箱，NAS `session` 对应 SDK `sessions`。项目创建时建立项目基础目录，会话创建时安全补齐缺失目录。
+所有 API/技能导入节点与沙箱执行宿主机必须将同一份 NAS 挂载到相同绝对路径。Nacos 的 `workspace.runtime.root` 是唯一持久根目录，值与 `NAS_ROOT` 一致；沙箱直接挂载当前项目目录，无需复制项目文件。使用 OpenSandbox 开发适配器时，服务端的 `storage.allowed_host_paths` 必须包含该根目录。用户 NAS 目录按 `user/{uid}/{skills,session,projects}` 组织，由 Workspace 初始化补齐；初始化脚本不预建具体用户。多模态卸载文件放在当前项目的 `.work/data/`，`skills/session` 下按执行绑定分区并挂入沙箱，NAS `session` 对应 SDK `sessions`。项目创建时建立项目基础目录，会话创建时安全补齐缺失目录。
 
 ## 3 PostgreSQL
 
@@ -111,6 +111,7 @@ python scripts/init/nacos.py --file "$HOME/.config/agentkit/agentkit.yaml"
 | `revision` | 首次配置版本，模板为 1 |
 | `workspace.runtime.root` | 唯一的 NAS 根目录，与 `NAS_ROOT` 一致；`workdir` 自动派生为该根目录下的 `user/{uid}`，不单独配置 |
 | `skill.storage.root` | `SKILL_STORAGE_ROOT` |
+| `project.upload.maxBytes` | 项目单文件上传上限，模板为 50 MiB（52,428,800 字节） |
 | `workspace.runtime.mode` | 固定为 `pks` |
 | `workspace.runtime.sandbox` | 沙箱服务地址、镜像、凭据引用及执行参数；公司 Client 由接入方注入 |
 | `client.postgres.connection` | PostgreSQL 的 mode、host、port、database、username、TLS 和取密配置，见下节 |
@@ -137,5 +138,15 @@ Framework 本身输出到标准输出，不自行指定日志文件或轮转。�
 首次不存在时才发布；配置相同则保留，不同则拒绝覆盖。仅明确的配置不存在码 `20004` 当作首次创建，网络、403 等其他错误直接失败。发布后读回比较，输出只包含结果和版本，不打印配置正文或密钥。
 
 同一个 namespace/group/Data ID 的首次初始化必须由平台安排**单个任务串行执行**。当前客户端的“先查再发布”不是分布式条件创建，不能让两个持有不同 YAML 的初始化任务并发运行。
+
+## 7 Nginx 上传限制
+
+在转发上传请求的 `server` 或 `location` 中设置请求体上限。
+
+```nginx
+client_max_body_size 50m;
+```
+
+Nginx 按整个 `multipart/form-data` 请求体计大小。要支持恰好 50 MiB 的文件，在上传路由生效的 `location` 中设为 `client_max_body_size 51m;`，给表单封装留出空间。修改后执行 `nginx -t`，通过后重新加载配置。 [Nginx 指令文档](https://nginx.org/en/docs/http/ngx_http_core_module.html#client_max_body_size)
 
 执行顺序为 **NAS → PG → Kafka → Redis 检查 → Nacos**。全部成功后，由应用部署流程注入实际运行密钥并启动服务；本组脚本不安装和启动基础设施，也不执行旧环境迁移。

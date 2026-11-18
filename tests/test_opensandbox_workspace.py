@@ -116,10 +116,8 @@ async def test_project_mounts_expose_only_current_project_and_protect_inputs(
         user_root = target.parents[1]
         binding = workspace.runtime_binding_id
         assert sources == {
-            "user-data": (str(user_root / "data"), str(user_root / "data"), False),
-            "user-skills": (str(user_root / "skills" / binding), str(user_root / "skills"), False),
+            "user-skills": (str(user_root / "skills" / ".runtime" / binding), str(user_root / "skills"), False),
             "user-session": (str(user_root / "session" / binding), str(user_root / "sessions"), False),
-            "user-mcp": (str(user_root / "mcp" / binding), str(user_root / "mcp"), False),
             "project-inputs": (str(target), str(target), True),
             "project-work": (str(target / ".work"), str(target / ".work"), False),
             "project-artifacts": (
@@ -273,7 +271,7 @@ async def test_skill_loader_publishes_runtime_path_but_persists_host_cache(tmp_p
         Path(loader.loaded["report"].dir) / "SKILL.md"
     ).read_text() == "Full report instructions"
     pin = state.middle_context["egis_agentkit"]["activated_skills"]["report"]
-    assert pin["cache_dir"] == "skills/report"
+    assert pin["source_checksum_sha256"] == "a" * 64
     assert (
         resources.saved[-1][-1].middle_context["egis_agentkit"]["activated_skills"][
             "report"
@@ -338,7 +336,7 @@ def test_binding_metadata_obeys_opensandbox_label_contract(tmp_path):
         settings=configuration(tmp_path),
         client=OpenSandboxClient(configuration(tmp_path), api_key="test-only"),
     )
-    for value in workspace._binding_metadata.values():
+    for value in workspace.sandbox_metadata.values():
         assert re.fullmatch(r"[a-zA-Z0-9]([a-zA-Z0-9._-]{0,61}[a-zA-Z0-9])?", value)
 
 
@@ -391,38 +389,39 @@ async def test_gateway_tool_uses_same_resource_authorization_and_revocation(
 ):
     import json
 
+    from cryptography.fernet import Fernet
     from test_domain import expert, identities
 
     from egis_agentkit.client.mcp._gateway_mcp_client_override import (
+        AuthorizedGatewayClient,
         AuthorizedGatewayMCPClient,
     )
+    from egis_agentkit.service.access._grant import GrantService
     from egis_agentkit.service.agent._agent_manager import AgentManager
     from egis_agentkit.service.resource._catalog import ResourceService
     from egis_agentkit.service.session._preparation import SessionPreparationService
     from egis_agentkit.service.session._session import SessionService
 
-    _, _, alice, _ = await identities(storage)
-    resources = ResourceService(storage, tmp_path)
+    _, admin, alice, _ = await identities(storage)
+    resources = ResourceService(storage, tmp_path, credential_key=Fernet.generate_key())
     await resources.save_mcp(
-        alice,
+        admin,
         {
             "resource_id": "gateway-check",
             "config": {
                 "transport": "streamable_http",
                 "url": "https://mcp.example.test/mcp",
-                "auth_type": "none",
+                "auth_type": "api_key",
             },
         },
     )
+    with pytest.raises(Forbidden):
+        await resources.test_mcp(alice, "gateway-check")
+    await resources.mcp_auth_action(alice, "gateway-check", "set_api_key", key="test-key")
+    installed = await resources.install(alice, "mcp", "gateway-check")
+    assert installed["is_installed"] and installed["is_authorized"]
     definition = expert()
-    refs = [
-        {
-            "resource_type": "mcp",
-            "resource_id": "gateway-check",
-            "resource_version": "1.0.0",
-            "resource_view_type": "private",
-        }
-    ]
+    refs = [{"resource_type": "mcp", "resource_id": "gateway-check"}]
     definition.payload["bindings"] = refs
     saved = await AgentManager(storage).add_definition(alice, definition)
     session = await SessionService(storage, tmp_path).add_session(
@@ -430,7 +429,12 @@ async def test_gateway_tool_uses_same_resource_authorization_and_revocation(
     )
 
     class Endpoint:
-        async def exec_request(self, *args, **kwargs):
+        async def exec_request(self, method, path, *, params=None, body=None, **kwargs):
+            if method == "POST" and path == "/mcps":
+                assert body["runtime_headers"] == {"Authorization": "Bearer test-key"}
+                assert "test-key" not in json.dumps(body["mcp_config"])
+                assert params == {"agent_id": scope.agent_id, "session_id": scope.session_id}
+                return 200, b"{}"
             return 200, json.dumps(
                 [{"name": "echo", "inputSchema": {"type": "object"}}]
             ).encode()
@@ -441,16 +445,29 @@ async def test_gateway_tool_uses_same_resource_authorization_and_revocation(
         declaration = (
             await resources.mcps_for_refs(alice, refs, authorization_scope=scope)
         )[0]
-        client = AuthorizedGatewayMCPClient.model_validate(declaration.model_dump())
-        client.attach(
+        gateway = AuthorizedGatewayClient(
             Endpoint(),
+            declarations=lambda *args: [declaration],
+            client_factory=AuthorizedGatewayMCPClient,
+        )
+        client = gateway.make_client(
+            declaration.model_dump(mode="json"),
             agent_id=scope.agent_id,
             session_id=scope.session_id,
-            connected=True,
         )
+        await client.connect()
+        assert "test-key" not in client.model_dump_json()
         tool = await client.get_tool("echo")
         assert await resources.authorize_mcp_tool(alice, scope, tool) is True
-        await resources.set_asset_enabled(alice, "mcp", "gateway-check", "1.0.0", False)
+        grants = GrantService(storage)
+        (company_grant,) = [
+            grant
+            for grant in await grants.list_grants(admin)
+            if grant["resource_type"] == "mcp" and grant["resource_id"] == "gateway-check"
+        ]
+        assert company_grant["principal_type"] == "group"
+        assert company_grant["principal_id"] == "company"
+        await grants.revoke(admin, company_grant["id"])
         with pytest.raises(Forbidden):
             await resources.authorize_mcp_tool(alice, scope, tool)
 
@@ -476,10 +493,39 @@ async def test_agents_and_sessions_do_not_share_running_resources(
             len({a.runtime_binding_id, b.runtime_binding_id, c.runtime_binding_id}) == 3
         )
         mounts = [{mount.name: mount for mount in workspace.build_mounts()} for workspace in (a, b, c)]
-        for name in ("user-data", "project-inputs", "project-work", "project-artifacts"):
+        for name in ("project-inputs", "project-work", "project-artifacts"):
             assert mounts[0][name] == mounts[1][name] == mounts[2][name]
-        for name in ("user-skills", "user-session", "user-mcp"):
+        for name in ("user-skills", "user-session"):
             assert len({mount[name].source for mount in mounts}) == 3
+
+
+@pytest.mark.asyncio
+async def test_multimodal_offload_writes_to_current_project_work_directory(tmp_path):
+    from agentscope.message import Base64Source, DataBlock
+    from agentscope.tool import LocalBackend
+    from sandbox_helpers import TestSandboxClient
+
+    from egis_agentkit.storage.project._files import ProjectFileStorage
+
+    files = ProjectFileStorage(tmp_path)
+    block = DataBlock(
+        name="image",
+        source=Base64Source(data="dGVzdA==", media_type="image/png"),
+    )
+    for project in ("one", "two"):
+        files.initialize_project("alice", project)
+        workspace = EgisSandboxWorkspace(
+            user_id="alice", agent_id="agent", project_id=project,
+            files=files, settings=configuration(tmp_path), client=TestSandboxClient(),
+        )
+        workspace._backend = LocalBackend()
+        result = await workspace.offload_data_block(block)
+        ref = str(result.source.url)
+        assert ref.startswith(f"workspace:///projects/{project}/.work/data/")
+        saved = Path(workspace.workdir) / ref.removeprefix("workspace:///")
+        assert saved.read_bytes() == b"test"
+        assert await workspace.offload_data_block(result) is result
+    assert not (files.user_root("alice") / "data").exists()
 
 
 @pytest.mark.asyncio

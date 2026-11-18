@@ -121,6 +121,15 @@ class UserStorage:
                 dict(member) for member in members
             ]
 
+    async def ensure_group(self, data: Group, *, actor: str) -> None:
+        """Initialize a group without changing existing settings."""
+        conn = transaction_connection(self.engine, None)
+        await conn.execute(
+            insert(t.groups)
+            .values(**data.model_dump(), created_by=actor, updated_by=actor)
+            .on_conflict_do_nothing(index_elements=[t.groups.c.group_id])
+        )
+
     async def save_group(self, data: Group, *, actor: str) -> dict:
         conn = transaction_connection(self.engine, None)
         values = data.model_dump()

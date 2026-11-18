@@ -1,7 +1,7 @@
 import httpx
 import pytest
 import yaml
-from config_helpers import sandbox_runtime
+from config_helpers import nacos_config_envelope, sandbox_runtime
 
 from egis_agentkit.client.nacos import (
     NacosBootstrap,
@@ -60,6 +60,9 @@ async def test_real_v33_config_query_envelope_extracts_content_and_rejects_neste
         with pytest.raises(NacosError) as exc:
             await client.get_config("real.yaml")
         assert exc.value.operation_code == 20004
+        body["data"] = "config_version: 1"
+        with pytest.raises(NacosError):
+            await client.get_config("real.yaml")
 
 
 def documents(revision=1):
@@ -71,10 +74,9 @@ def documents(revision=1):
                 "project": {"upload": {"maxBytes": 20_971_520}},
                 "user": {
                     "identity": {
-                        "mode": "demo",
                         "issuer": "egis",
                         "audience": "agentkit",
-                        "algorithm": "HS256",
+                        "jwksUrl": "https://identity.example.test/.well-known/jwks.json",
                     }
                 },
                 "model": {
@@ -103,7 +105,7 @@ async def test_client_config_reads_envelope_and_publishes_correct_namespace_grou
         requests.append(req)
         if req.method == "GET":
             assert req.url.params["groupName"] == "EGIS_AGENTKIT"
-            return httpx.Response(200, json={"code": 0, "data": "config_version: 1"})
+            return httpx.Response(200, json=nacos_config_envelope("config_version: 1"))
         return httpx.Response(200, json={"code": 0, "data": True})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
@@ -154,7 +156,7 @@ async def test_snapshot_reads_one_document_and_updates_typed_hot_settings(
         requests.append(data_id)
         return httpx.Response(
             200,
-            json={"code": 0, "data": yaml.safe_dump(docs[data_id])},
+            json=nacos_config_envelope(yaml.safe_dump(docs[data_id])),
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
@@ -214,7 +216,7 @@ async def test_first_refresh_rejects_missing_or_invalid_key_without_exposing_val
     def handle(req):
         return httpx.Response(
             200,
-            json={"code": 0, "data": yaml.safe_dump(docs[req.url.params["dataId"]])},
+            json=nacos_config_envelope(yaml.safe_dump(docs[req.url.params["dataId"]])),
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
@@ -238,7 +240,7 @@ async def test_snapshot_consumers_cannot_mutate_shared_provider_state():
     def handle(req):
         return httpx.Response(
             200,
-            json={"code": 0, "data": yaml.safe_dump(docs[req.url.params["dataId"]])},
+            json=nacos_config_envelope(yaml.safe_dump(docs[req.url.params["dataId"]])),
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
@@ -258,7 +260,7 @@ async def test_config_batch_rejects_changed_content_without_new_version():
     def handle(req):
         return httpx.Response(
             200,
-            json={"code": 0, "data": yaml.safe_dump(docs[req.url.params["dataId"]])},
+            json=nacos_config_envelope(yaml.safe_dump(docs[req.url.params["dataId"]])),
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
@@ -278,7 +280,7 @@ async def test_explicit_console_address_routes_only_management_not_config_reads(
 
     def handle(req):
         urls.append(str(req.url))
-        return httpx.Response(200, json={"code": 0, "data": "text"})
+        return httpx.Response(200, json=nacos_config_envelope("text"))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
         client = NacosClient(
@@ -303,7 +305,7 @@ async def test_outage_keeps_last_configuration_without_local_fallback():
             raise httpx.ConnectError("network contains a secret", request=req)
         return httpx.Response(
             200,
-            json={"code": 0, "data": yaml.safe_dump(docs[req.url.params["dataId"]])},
+            json=nacos_config_envelope(yaml.safe_dump(docs[req.url.params["dataId"]])),
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
@@ -331,7 +333,7 @@ async def test_config_poller_refreshes_and_shutdown_stops_further_fetches():
         fetched += 1
         return httpx.Response(
             200,
-            json={"code": 0, "data": yaml.safe_dump(docs[req.url.params["dataId"]])},
+            json=nacos_config_envelope(yaml.safe_dump(docs[req.url.params["dataId"]])),
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
@@ -359,7 +361,7 @@ async def test_unregistered_platform_default_keeps_last_valid_snapshot():
     def handle(req):
         return httpx.Response(
             200,
-            json={"code": 0, "data": yaml.safe_dump(docs[req.url.params["dataId"]])},
+            json=nacos_config_envelope(yaml.safe_dump(docs[req.url.params["dataId"]])),
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
@@ -395,5 +397,5 @@ def test_checked_in_agentkit_example_validates():
 
     example = Path(__file__).resolve().parents[1] / "examples/nacos/agentkit.yaml"
     settings = load_agentkit_config(example.read_text())
-    assert settings.project.upload.max_bytes == 20_971_520
+    assert settings.project.upload.max_bytes == 50 * 1024 * 1024
     assert settings.model.selection.default_key == "company"

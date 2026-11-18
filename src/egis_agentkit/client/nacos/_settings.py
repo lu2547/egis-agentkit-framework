@@ -51,29 +51,19 @@ class PaginationConfig(ConfigModel):
 
 
 class AuthConfig(ConfigModel):
-    mode: Literal["jwt", "demo"]
+    mode: Literal["jwt"] = "jwt"
     issuer: NonEmptyString
     audience: NonEmptyString
-    algorithm: Literal["RS256", "HS256"]
-    jwks_url: str | None = None
-    signing_secret_env: SecretRef = "AGENTKIT_JWT_SECRET"
-    demo_password_env: SecretRef = "AGENTKIT_DEMO_PASSWORD"
-    jwt_lifetime_seconds: PositiveInt = 3600
+    algorithm: Literal["RS256"] = "RS256"
+    jwks_url: NonEmptyString
     jwt_clock_skew_seconds: NonNegativeSeconds = 10
     jwt_max_token_length: PositiveInt = 16_384
-    jwt_min_signing_secret_length: Annotated[int, Field(strict=True, ge=32)] = 32
     jwks_cache_seconds: PositiveInt = 300
     jwks_timeout_seconds: Seconds = 10
-    demo_min_password_length: Annotated[int, Field(strict=True, ge=16)] = 16
 
 
 class IdentityConfig(ConfigModel):
     identity: AuthConfig
-
-
-class MemoryConfig(ConfigModel):
-    is_enabled: StrictBool = False
-    top_k: PositiveInt = 5
 
 
 class TemplateConfig(ConfigModel):
@@ -89,7 +79,6 @@ class PersonalDocumentsConfig(ConfigModel):
 
 class PersonalConfig(ConfigModel):
     documents: PersonalDocumentsConfig = Field(default_factory=PersonalDocumentsConfig)
-    memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
 
 class RemoteRequestConfig(ConfigModel):
@@ -255,10 +244,11 @@ class SkillImportConfig(ConfigModel):
     retry_backoff_seconds: Seconds = 5
     max_retry_delay_seconds: Seconds = 60
     list_limit: PositiveInt = 100
+    approval_batch_limit: PositiveInt = 50
 
 
 class SkillStorageConfig(ConfigModel):
-    """API 可访问的 NAS 挂载绝对目录，不设置时禁止发布和读取技能包。"""
+    """API 实例共用的 NAS 上传暂存绝对路径。"""
 
     root: NonEmptyString | None = None
 
@@ -311,6 +301,8 @@ class ToolConfig(ConfigModel):
 
 
 class AccessConfig(ConfigModel):
+    company_group_id: Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[\w.-]+$")] = "company"
+    company_group_name: Annotated[str, Field(min_length=1, max_length=128)] = "公司组"
     allow_private_self_use: StrictBool = True
     allow_personal_self_use: StrictBool = True
 
@@ -417,7 +409,7 @@ class SandboxConfig(SandboxWorkspaceConfig):
 
 
 class WorkspaceRuntimeConfig(ConfigModel):
-    """声明 API 与沙箱宿主机共同使用的 NAS 根目录及执行提供方。"""
+    """声明 NAS 根目录及沙箱执行提供方。"""
 
     root: NonEmptyString
     mode: Literal["pks"] = "pks"
@@ -536,9 +528,15 @@ class ProjectPresentationConfig(ConfigModel):
     thumbnail_concurrency: PositiveInt = 2
 
 
-class ProjectConfig(ConfigModel):
-    """项目规则及其文件、预览、上下文和交付配置。"""
+class ProjectMemoryConfig(ConfigModel):
+    is_enabled: StrictBool = False
+    top_k: PositiveInt = 5
 
+
+class ProjectConfig(ConfigModel):
+    """项目文件、预览、上下文、记忆和交付配置。"""
+
+    memory: ProjectMemoryConfig = Field(default_factory=ProjectMemoryConfig)
     defaults: ProjectDefaultsConfig = Field(default_factory=ProjectDefaultsConfig)
     context: ProjectContextConfig = Field(default_factory=ProjectContextConfig)
     changes: ProjectChangesConfig = Field(default_factory=ProjectChangesConfig)
@@ -604,12 +602,38 @@ class WorkspaceLockConfig(ConfigModel):
     wait_timeout_seconds: Seconds = 30
 
 
+class WorkspaceFilesConfig(ConfigModel):
+    """选择工作区文件由 Agent 宿主读取还是交给 Linux 文件服务。"""
+
+    win: StrictBool = False
+    endpoint: NonEmptyString | None = None
+    token_env: SecretRef = "AGENTKIT_NAS_FILE_TOKEN"
+    timeout_seconds: Seconds = 60
+
+    @model_validator(mode="after")
+    def validate_connection(self):
+        if self.win and self.endpoint is None:
+            raise ValueError("agentkit.workspace.files.endpoint 不能为空")
+        if self.endpoint is not None:
+            url = urlsplit(self.endpoint)
+            if (
+                url.scheme not in ("http", "https")
+                or not url.hostname
+                or url.username is not None
+                or url.query
+                or url.fragment
+            ):
+                raise ValueError("文件服务 endpoint 必须为无凭据的 HTTP(S) 地址")
+        return self
+
+
 class WorkspaceConfig(ConfigModel):
-    """工作区仅配置执行环境，不承载项目文件管理。"""
+    """配置工作区执行环境与文件访问。"""
 
     runtime: WorkspaceRuntimeConfig
     probe: WorkspaceProbeConfig = Field(default_factory=WorkspaceProbeConfig)
     lock: WorkspaceLockConfig = Field(default_factory=WorkspaceLockConfig)
+    files: WorkspaceFilesConfig = Field(default_factory=WorkspaceFilesConfig)
     read_guard: WorkspaceReadGuardConfig = Field(
         default_factory=WorkspaceReadGuardConfig
     )

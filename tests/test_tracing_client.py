@@ -145,12 +145,12 @@ async def test_standard_asgi_child_spans_follow_http_project(monkeypatch):
 
 
 async def test_memory_job_has_its_own_phase_and_does_not_fail_successful_reply(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ):
     from agentscope.middleware import ReMeMiddleware
 
-    from egis_agentkit.middleware.agent._personal_memory_middleware_override import (
-        PersonalMemoryMiddlewareOverride,
+    from egis_agentkit.middleware.agent._project_memory_middleware_override import (
+        ProjectMemoryMiddlewareOverride,
     )
 
     async def job(self, name, **kwargs):
@@ -162,7 +162,7 @@ async def test_memory_job_has_its_own_phase_and_does_not_fail_successful_reply(
     exporter = memory_export(monkeypatch)
     client = TracingClient(TracingConfig(enabled=True))
     client.start()
-    memory = PersonalMemoryMiddlewareOverride()
+    memory = ProjectMemoryMiddlewareOverride(workspace_dir=str(tmp_path))
     try:
         with client.span("chat.run", root=True):
             assert await memory._run_job("search", query="test query") == "test query"

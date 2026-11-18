@@ -1,4 +1,4 @@
-"""未提供 NAS 路径仍可预览升级，实际执行则必须先配置挂载目录。"""
+"""Skill 表独立重置，其它数据库升级可在未配置 Skill 时执行。"""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -27,21 +27,17 @@ async def test_upgrade_preview_is_available_before_nas_configuration(
             pass
 
     engine = SimpleNamespace(dispose=AsyncMock())
-    operation = AsyncMock(
-        return_value=_schema.SchemaReport("test", "public", {"技能文件存储": "pending"})
-    )
+    operation = AsyncMock(return_value=_schema.SchemaReport("test", "public", {}))
     monkeypatch.setattr(_provision, "NacosClient", lambda *args: Client())
     monkeypatch.setattr(_provision, "NacosConfigProvider", lambda *args: provider)
     monkeypatch.setattr(
         _provision, "create_postgres_engine_from_config", lambda *args, **kwargs: engine
     )
     monkeypatch.setattr(_schema, "upgrade_schema", operation)
-    if apply:
-        with pytest.raises(ValueError, match="NAS"):
-            await _provision.provision("upgrade-db", database="test", apply=True)
-        operation.assert_not_awaited()
-    else:
-        await _provision.provision("upgrade-db")
-        operation.assert_awaited_once()
-        assert operation.call_args.kwargs.get("skill_archives") is None
+    await _provision.provision(
+        "upgrade-db", database="test" if apply else None, apply=apply
+    )
+    operation.assert_awaited_once_with(
+        engine, database="test" if apply else None, apply=apply
+    )
     engine.dispose.assert_awaited_once()
