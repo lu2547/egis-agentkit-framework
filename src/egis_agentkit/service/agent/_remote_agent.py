@@ -218,5 +218,12 @@ class RemoteAgentService:
         try:
             await self.bus.publish(_build_result_key(run_id), {"run_id": run_id})
         except Exception:
-            logger.warning("Remote callback wakeup could not be published")
+            logger.warning(
+                "Remote callback wakeup could not be published; result remains stored",
+                extra={
+                    "component": "RemoteAgentService.save_callback_result",
+                    "context": {"run_id": run_id},
+                },
+                exc_info=True,
+            )
         return outcome

@@ -28,7 +28,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from egis_agentkit.client.nacos._settings import (
     ConnectorOAuthConfig,
 )
-from egis_agentkit.errors import AgentKitError, Forbidden
+from egis_agentkit.errors import AgentKitError, BadRequest, Forbidden
 from egis_agentkit.storage._resource import MCPCredentialStorage
 from egis_agentkit.storage.model import (
     utcnow,
@@ -158,7 +158,7 @@ class MCPAuthorization:
         """读取当前连接配置，并核对本次操作的认证方式。"""
         config = asset["payload"].get("config", {})
         if expected is not None and config.get("auth_type") != expected:
-            raise ValueError("MCP connection authentication method does not match")
+            raise BadRequest("MCP connection authentication method does not match")
         return config
 
     def _connection(self, asset):
@@ -211,7 +211,11 @@ class MCPAuthorization:
         """校验并加密保存当前用户对该连接的 API Key。"""
         # 1. 核对认证方式并加密凭据。
         self._config(asset, "api_key")
-        credential = self._encrypt({"key": self._header_value(key)})
+        try:
+            value = self._header_value(key)
+        except ValueError as exc:
+            raise BadRequest("Invalid MCP credential") from exc
+        credential = self._encrypt({"key": value})
         identity = user.user_id, self._connection(asset)
         # 2. 由 Storage 锁定该用户的连接凭据并原子写入。
         async with self.credentials.write() as credentials:

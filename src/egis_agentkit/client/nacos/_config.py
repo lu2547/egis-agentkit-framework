@@ -212,11 +212,13 @@ class NacosConfigProvider:
                     logger.warning(
                         "config.refresh_failed",
                         extra={
+                            "component": "NacosConfigProvider.refresh",
                             "context": {
                                 "error": str(exc),
                                 "restart_required": self.restart_required,
                             }
                         },
+                        exc_info=True,
                     )
                 self.is_connected = False
                 self.last_error = str(exc)
@@ -226,6 +228,7 @@ class NacosConfigProvider:
                 logger.info(
                     "config.loaded",
                     extra={
+                        "component": "NacosConfigProvider.refresh",
                         "context": {
                             "revision": candidate.revision,
                         }

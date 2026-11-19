@@ -4,6 +4,9 @@ from egis_agentkit.client.nacos._settings import AccessConfig
 from egis_agentkit.errors import Forbidden, NotFound
 from egis_agentkit.storage import AgentKitStorage
 from egis_agentkit.storage.model import Group, User
+from egis_agentkit.storage.model._base import new_id
+
+from ._admin_page import AdminPage
 
 VIRTUAL_USER_PREFIX = "skill-system."
 
@@ -58,6 +61,15 @@ class UserService:
         require_admin(admin)
         return await self.storage.users.list_users()
 
+    async def list_users_page(
+        self, admin: User, page: AdminPage, *, group_id: str | None = None
+    ) -> dict:
+        require_admin(admin)
+        rows = await self.storage.users.list_users(
+            group_id=group_id, offset=page.offset, limit=page.fetch_limit
+        )
+        return page.response(rows)
+
     async def update_user(self, admin: User, data: User) -> dict:
         require_admin(admin)
         data.group_ids = list(dict.fromkeys(data.group_ids))
@@ -79,8 +91,10 @@ class UserService:
                 raise NotFound()
             return row
 
-    async def list_groups(self, admin: User) -> list[dict]:
+    async def list_groups(self, admin: User, *, include_members: bool = True) -> list[dict]:
         require_admin(admin)
+        if not include_members:
+            return await self.storage.users.list_group_options()
         rows, members = await self.storage.users.list_groups_with_members()
         for row in rows:
             row["users"] = [
@@ -90,7 +104,28 @@ class UserService:
             ]
         return rows
 
+    async def list_groups_page(self, admin: User, page: AdminPage) -> dict:
+        require_admin(admin)
+        rows = await self.storage.users.list_groups_page(
+            offset=page.offset, limit=page.fetch_limit
+        )
+        return page.response(rows)
+
     async def save_group(self, admin: User, data: Group) -> dict:
         require_admin(admin)
         async with self.storage.users.write() as users:
             return await users.save_group(data, actor=admin.user_id)
+
+    async def create_group(self, admin: User, name: str, *, is_enabled: bool) -> dict:
+        require_admin(admin)
+        group = Group(group_id=new_id(), group_name=name, is_enabled=is_enabled)
+        async with self.storage.users.write() as users:
+            return await users.create_group(group, actor=admin.user_id)
+
+    async def update_group(self, admin: User, data: Group) -> dict:
+        require_admin(admin)
+        async with self.storage.users.write() as users:
+            group = await users.update_group(data, actor=admin.user_id)
+            if group is None:
+                raise NotFound("用户组不存在")
+            return group

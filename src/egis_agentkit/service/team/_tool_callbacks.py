@@ -7,9 +7,10 @@
 
 from egis_agentkit.service.team._collaboration import collaborators, team_say_allowed
 from egis_agentkit.service.team._invitation import apply_invitations
+from egis_agentkit.service.team._skill_invitation import stage_skill_invitation
 
 
-def tool_access_callbacks(user, scope, permissions):
+def tool_access_callbacks(user, scope, permissions, *, files=None):
     """生成每次工具调用使用的实时授权及专家协作回调。"""
 
     async def validate_access():
@@ -20,7 +21,11 @@ def tool_access_callbacks(user, scope, permissions):
             await permissions.require_execution(user, definition, allow_pinned=True)
 
     async def prepare_collaboration(agent, inputs):
-        if scope.binding.get("collaboration"):
+        if files is not None:
+            await stage_skill_invitation(
+                user, scope, agent.state, inputs, permissions, files
+            )
+        if agent.state.middle_context.get("egis_agentkit", {}).get("collaboration"):
             native_create = await agent.toolkit.get_tool("TeamCreate")
             await apply_invitations(
                 user, scope, agent.state, native_create, inputs, permissions

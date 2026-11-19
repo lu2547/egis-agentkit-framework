@@ -72,7 +72,7 @@ def test_middleware_contains_only_native_or_http_middleware():
         "ReMeMiddleware",
         "Protocol",
     }
-    http_middleware = {"IdentityGuard", "StreamReady"}
+    http_middleware = {"IdentityGuard", "RequestLogging", "StreamReady"}
     violations = []
     for path in root.rglob("*.py"):
         for node in ast.parse(path.read_text()).body:

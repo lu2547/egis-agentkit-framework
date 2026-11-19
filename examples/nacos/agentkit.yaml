@@ -4,7 +4,7 @@ agentkit:
   revision: 1
   agent:
     catalog:
-      defaultPageSize: 50
+      defaultPageSize: 10
       maxPageSize: 100
       maxQueryLength: 500
       maxCursorLength: 2048
@@ -43,11 +43,20 @@ agentkit:
     roster:
       maxMembers: 20
   skill:
+    catalog:
+      defaultPageSize: 10
+      maxPageSize: 100
+      maxQueryLength: 500
+      maxCursorLength: 2048
     storage:
       root: /mnt/company-nas/agentkit/skill-uploads
     archive:
       maxBytes: 52428799
       maxExpandedBytes: null
+    avatar:
+      enabled: true
+      modelKey: null
+      timeoutSeconds: 45
     import:
       leaseSeconds: 90.0
       maxAttempts: 3
@@ -90,6 +99,11 @@ agentkit:
       maxMessages: 2000
       nameSuffix: ' · 分支'
   connector:
+    catalog:
+      defaultPageSize: 10
+      maxPageSize: 100
+      maxQueryLength: 500
+      maxCursorLength: 2048
     oauth:
       credentialKeyEnv: AGENTKIT_MCP_CREDENTIAL_KEY
       redirectUri: null
@@ -100,6 +114,11 @@ agentkit:
       tokenLifetimeSeconds: 3600
       maxTokenLifetimeSeconds: 31536000
   tool:
+    catalog:
+      defaultPageSize: 10
+      maxPageSize: 100
+      maxQueryLength: 500
+      maxCursorLength: 2048
     defaults:
       registeredIds: null
   access:
@@ -271,9 +290,16 @@ agentkit:
       allowOverride: true
       allowedKeys:
       - company
+  admin:
+    pagination:
+      defaultPageSize: 20
+      maxPageSize: 100
   logging:
     level: INFO
     format: json
+    textPattern: '{time} [{level}] {package}.{function} - {message}'  # format: text 时生效。
+    textDateFormat: null  # 文本日志时间默认 UTC ISO 8601，也可填 '%Y-%m-%d %H:%M:%S %z'。
+    directory: null  # 填服务进程可写的绝对目录，例如 /var/log/agentkit；null 仅输出 stdout。
     accessLog: true
   client:
     postgres:

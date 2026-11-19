@@ -10,7 +10,6 @@ from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.resource._catalog import ResourceService
-from egis_agentkit.storage import tables as t
 from egis_agentkit.storage.model import Asset, ResourceRef
 
 
@@ -28,11 +27,7 @@ async def prepare(storage):
                 owner_id="bob",
                 checksum_sha256=digest,
             )
-            await conn.execute(
-                t.assets.insert().values(
-                    **asset.model_dump(), created_by="bob", updated_by="bob"
-                )
-            )
+            await storage.assets.insert_asset(asset, actor=bob.user_id, conn=conn)
 
     await publish("1.0.0", 1, "a" * 64)
     shares = ShareService(storage)

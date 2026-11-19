@@ -47,15 +47,30 @@ def test_tracing_rejects_invalid_export_configuration(data):
         _settings.TracingConfig.model_validate(data)
 
 
-def test_nacos_config_supports_observability_and_scrubs_secret_validation_errors():
+def test_nacos_config_supports_observability_and_scrubs_secret_validation_errors(
+    tmp_path,
+):
     doc = documents()["agentkit.yaml"]
-    doc["agentkit"].update(logging={"level": "DEBUG", "format": "json"})
+    log_directory = tmp_path / "log"
+    doc["agentkit"].update(
+        logging={
+            "level": "DEBUG",
+            "format": "text",
+            "directory": str(log_directory),
+            "textPattern": "{level} {message}",
+            "textDateFormat": "%Y/%m/%d",
+        }
+    )
     doc["agentkit"]["client"] = {
         "postgres": {"connection": {"password": "private-password"}},
         "tracing": {"enabled": True, "headers": {"authorization": "private-header"}},
     }
     config = load_agentkit_config(yaml.safe_dump(doc))
     assert config.logging.level == "DEBUG"
+    assert config.logging.format == "text"
+    assert config.logging.directory == log_directory
+    assert config.logging.text_pattern == "{level} {message}"
+    assert config.logging.text_date_format == "%Y/%m/%d"
     assert config.client.tracing.enabled
     assert "private-header" not in repr(config)
     doc["agentkit"]["client"]["postgres"]["connection"]["port"] = "private-password"
@@ -63,3 +78,18 @@ def test_nacos_config_supports_observability_and_scrubs_secret_validation_errors
         load_agentkit_config(yaml.safe_dump(doc))
     assert "private-password" not in str(exc.value)
     assert "port" in str(exc.value)
+
+
+@pytest.mark.parametrize("directory", ["", "relative/log"])
+def test_logging_rejects_relative_directories(directory):
+    with pytest.raises(ValidationError, match="directory must be an absolute path"):
+        _settings.LoggingConfig(directory=directory)
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["{unknown} {message}", "{message[0]}", "{message!r}", "{level}"],
+)
+def test_logging_rejects_invalid_text_patterns(pattern):
+    with pytest.raises(ValidationError, match="Value error, textPattern"):
+        _settings.LoggingConfig(textPattern=pattern)

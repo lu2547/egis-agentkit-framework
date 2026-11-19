@@ -215,8 +215,11 @@ async def test_expert_with_unavailable_dependency_is_not_callable(
     else:
         async with storage.transaction() as conn:
             await conn.execute(
-                update(t.assets)
-                .where(t.assets.c.resource_id == "report")
+                update(t.skill_detail)
+                .where(
+                    t.skill_detail.c.skill_id == "report",
+                    t.skill_detail.c.resource_version == "1.0.0",
+                )
                 .values(is_enabled=False)
             )
     assert (await service.options(alice, "experts"))["items"] == []

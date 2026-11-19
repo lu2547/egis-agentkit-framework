@@ -9,7 +9,13 @@ from itertools import islice
 from pathlib import PurePosixPath
 
 from egis_agentkit.client.nacos._settings import ComposerOptionsConfig
-from egis_agentkit.errors import Conflict, Forbidden, InvalidRequest, NotFound
+from egis_agentkit.errors import (
+    BadRequest,
+    Conflict,
+    Forbidden,
+    InvalidRequest,
+    NotFound,
+)
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.team._collaboration import (
     collaboration_allowed,
@@ -48,7 +54,7 @@ class ComposerService:
         if not user.is_enabled:
             raise Forbidden()
         if category not in {"context", "experts", "skills", "commands"}:
-            raise ValueError("Unknown composer category")
+            raise BadRequest("Unknown composer category")
         configuration = self.config.snapshot if self.config else None
         settings = (
             configuration.session.composer if configuration else ComposerOptionsConfig()
@@ -128,7 +134,7 @@ class ComposerService:
                 raise ValueError
             return after
         except (ValueError, TypeError, UnicodeError):
-            raise ValueError("Invalid composer cursor") from None
+            raise BadRequest("Invalid composer cursor") from None
 
     @staticmethod
     def _matches(query, name, detail, identifier=""):
@@ -200,7 +206,7 @@ class ComposerService:
         result = []
         scanned = after.rsplit("@", 1)[0] if after else ""
         while len(result) < count:
-            # Page resources so an older installed version stays in its resource's page.
+            # 按稳定技能 ID 分页，再选当前用户可用的版本。
             identifiers, rows = await self.storage.assets.page_versions(
                 "skill", scanned, limit=batch_size
             )

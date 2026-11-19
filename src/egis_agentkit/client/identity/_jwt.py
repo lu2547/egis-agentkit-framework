@@ -4,7 +4,7 @@ from functools import cached_property
 
 import jwt
 
-from egis_agentkit.errors import Forbidden
+from egis_agentkit.errors import AgentKitError, Forbidden
 
 
 class JWTIdentity:
@@ -37,5 +37,7 @@ class JWTIdentity:
             if not isinstance(claims["sub"], str) or not claims["sub"]:
                 raise ValueError
             return claims
-        except (jwt.PyJWTError, ValueError, KeyError, OSError):
+        except (jwt.PyJWKClientConnectionError, OSError) as exc:
+            raise AgentKitError("认证服务暂时不可用，请稍后重试", 503) from exc
+        except (jwt.PyJWTError, ValueError, KeyError):
             raise Forbidden("认证无效或已过期") from None

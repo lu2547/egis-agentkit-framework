@@ -89,7 +89,7 @@ class AgentKit:
     _skill_imports: SkillImportService
     _memory: ProjectMemoryService | None
     _owns_engine: bool
-    _logging: LoggingClient
+    _logging: LoggingClient | None
     _tracing: TracingClient
 
     async def check_database(self) -> None:
@@ -97,40 +97,64 @@ class AgentKit:
 
     @asynccontextmanager
     async def lifespan(self, native_lifespan: AbstractAsyncContextManager):
-        async with AsyncExitStack() as stack:
-            # 1. 先开启日志和 Trace，启动失败及后续清理也能被观测。
-            stack.callback(self._logging.close)
-            stack.push_async_callback(self._tracing.aclose)
-            if self._owns_engine:
-                stack.push_async_callback(self._storage.engine.dispose)
-            if self._owned_client is not None:
-                stack.push_async_callback(self._owned_client.close)
-            stack.push_async_callback(self._config.close)
-            if self._memory is not None:
-                stack.push_async_callback(self._memory.close)
-            # 所有已创建对象先登记清理；观测初始化失败同样完整释放。
-            self._logging.start()
-            self._tracing.start()
-            logger.info(
-                "agentkit.starting",
-                extra={
-                    "context": {
-                        "revision": self._config.snapshot.revision,
-                        "tracing_enabled": self._config.snapshot.client.tracing.enabled,
-                    }
-                },
-            )
-            await self._config.start()
-            await stack.enter_async_context(self._storage)
-            await self.services.resources.seed_builtin_tools()
-            await stack.enter_async_context(native_lifespan)
-            stack.push_async_callback(self._skill_imports.close)
-            await self._skill_imports.start()
-            logger.info("agentkit.ready")
-            try:
-                yield
-            finally:
-                logger.info("agentkit.stopping")
+        phase = "logging"
+        try:
+            async with AsyncExitStack() as stack:
+                # 观测初始化失败也释放已创建的资源。
+                stack.push_async_callback(self._tracing.aclose)
+                if self._owns_engine:
+                    stack.push_async_callback(self._storage.engine.dispose)
+                if self._owned_client is not None:
+                    stack.push_async_callback(self._owned_client.close)
+                stack.push_async_callback(self._config.close)
+                if self._memory is not None:
+                    stack.push_async_callback(self._memory.close)
+                if self._logging is not None:
+                    self._logging.start()
+                phase = "tracing"
+                self._tracing.start()
+                logger.info(
+                    "agentkit.starting",
+                    extra={
+                        "component": "AgentKit.lifespan",
+                        "context": {
+                            "revision": self._config.snapshot.revision,
+                            "tracing_enabled": self._config.snapshot.client.tracing.enabled,
+                        },
+                    },
+                )
+                phase = "nacos"
+                await self._config.start()
+                phase = "storage"
+                await stack.enter_async_context(self._storage)
+                phase = "builtin_tools"
+                await self.services.resources.seed_builtin_tools()
+                phase = "native_app"
+                await stack.enter_async_context(native_lifespan)
+                phase = "skill_imports"
+                stack.push_async_callback(self._skill_imports.close)
+                await self._skill_imports.start()
+                phase = "running"
+                logger.info("agentkit.ready", extra={"component": "AgentKit.lifespan"})
+                try:
+                    yield
+                finally:
+                    phase = "shutdown"
+                    logger.info("agentkit.stopping", extra={"component": "AgentKit.lifespan"})
+            logger.info("agentkit.stopped", extra={"component": "AgentKit.lifespan"})
+        except Exception:
+            if phase != "logging":
+                logger.exception(
+                    "AgentKit lifecycle failed",
+                    extra={
+                        "component": "AgentKit.lifespan",
+                        "context": {"category": "system", "phase": phase},
+                    },
+                )
+            raise
+        finally:
+            if self._logging is not None:
+                self._logging.close()
 
 
 def init_agentkit(
@@ -139,6 +163,7 @@ def init_agentkit(
     *,
     engine: AsyncEngine | None = None,
     owns_client: bool = True,
+    manage_logging: bool = True,
     sandbox_client_factory: Callable[[], SandboxClient] | None = None,
 ) -> AgentKit:
     snapshot = config.snapshot
@@ -286,6 +311,10 @@ def init_agentkit(
         _skill_imports=skill_imports,
         _memory=memory,
         _owns_engine=owns_engine,
-        _logging=LoggingClient(snapshot.logging),
+        _logging=(
+            LoggingClient(snapshot.logging, include_runtime=True)
+            if manage_logging
+            else None
+        ),
         _tracing=tracing,
     )

@@ -686,7 +686,10 @@ class SessionService:
             "session_id": workspace.egis_session_id,
             "agent_id": workspace.egis_agent_id,
         }
-        logger.info("reply.started", extra={"context": context})
+        logger.info(
+            "reply.started",
+            extra={"component": "SessionService.on_workspace_reply", "context": context},
+        )
         reason = "interrupted"
         try:
             async with manager.renew_workspace(workspace):
@@ -702,6 +705,7 @@ class SessionService:
             logger.error(
                 "reply.failed",
                 extra={
+                    "component": "SessionService.on_workspace_reply",
                     "context": {
                         **context,
                         "error_type": type(exc).__name__,
@@ -713,6 +717,7 @@ class SessionService:
             logger.info(
                 "reply.finished",
                 extra={
+                    "component": "SessionService.on_workspace_reply",
                     "context": {
                         **context,
                         "reason": reason,

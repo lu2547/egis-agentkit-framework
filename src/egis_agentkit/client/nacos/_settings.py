@@ -1,7 +1,9 @@
 """配置的领域分组、YAML 键和类型。"""
 
-from pathlib import PurePosixPath
-from typing import Annotated, Literal
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from string import Formatter
+from typing import Annotated, ClassVar, Literal
 from urllib.parse import urlsplit
 
 from agentscope.permission import PermissionMode
@@ -48,6 +50,14 @@ class PaginationConfig(ConfigModel):
         if self.default_page_size > self.max_page_size:
             raise ValueError("defaultPageSize exceeds maxPageSize")
         return self
+
+
+class AdminPaginationConfig(PaginationConfig):
+    default_page_size: PositiveInt = 20
+
+
+class AdminConfig(ConfigModel):
+    pagination: AdminPaginationConfig = Field(default_factory=AdminPaginationConfig)
 
 
 class AuthConfig(ConfigModel):
@@ -132,13 +142,14 @@ class RemoteConfig(ConfigModel):
     retry: RemoteRetryConfig = Field(default_factory=RemoteRetryConfig)
 
 
-class AgentCatalogConfig(PaginationConfig):
+class CatalogPaginationConfig(PaginationConfig):
+    default_page_size: PositiveInt = 10
     max_query_length: PositiveInt = 500
     max_cursor_length: PositiveInt = 2048
 
 
 class AgentConfig(ConfigModel):
-    catalog: AgentCatalogConfig = Field(default_factory=AgentCatalogConfig)
+    catalog: CatalogPaginationConfig = Field(default_factory=CatalogPaginationConfig)
     personal: PersonalConfig = Field(default_factory=PersonalConfig)
     remote: RemoteConfig = Field(default_factory=RemoteConfig)
 
@@ -269,12 +280,20 @@ class SkillStorageConfig(ConfigModel):
         return value
 
 
+class SkillAvatarConfig(ConfigModel):
+    enabled: StrictBool = True
+    model_key: NonEmptyString | None = None
+    timeout_seconds: Seconds = 45
+
+
 class SkillConfig(ConfigModel):
+    catalog: CatalogPaginationConfig = Field(default_factory=CatalogPaginationConfig)
     storage: SkillStorageConfig = Field(default_factory=SkillStorageConfig)
     archive: SkillArchiveConfig = Field(default_factory=SkillArchiveConfig)
     import_settings: SkillImportConfig = Field(
         default_factory=SkillImportConfig, alias="import"
     )
+    avatar: SkillAvatarConfig = Field(default_factory=SkillAvatarConfig)
 
 
 class ConnectorOAuthConfig(ConfigModel):
@@ -289,6 +308,7 @@ class ConnectorOAuthConfig(ConfigModel):
 
 
 class ConnectorConfig(ConfigModel):
+    catalog: CatalogPaginationConfig = Field(default_factory=CatalogPaginationConfig)
     oauth: ConnectorOAuthConfig = Field(default_factory=ConnectorOAuthConfig)
 
 
@@ -297,6 +317,7 @@ class ToolDefaultsConfig(ConfigModel):
 
 
 class ToolConfig(ConfigModel):
+    catalog: CatalogPaginationConfig = Field(default_factory=CatalogPaginationConfig)
     defaults: ToolDefaultsConfig = Field(default_factory=ToolDefaultsConfig)
 
 
@@ -827,11 +848,56 @@ class TracingConfig(ConfigModel):
 
 
 class LoggingConfig(ConfigModel):
-    """Framework 日志级别、输出格式及 HTTP 访问日志开关。"""
+    """Framework 的日志级别、格式、输出目录和 HTTP 访问日志开关。"""
 
+    TEXT_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "time",
+            "level",
+            "logger",
+            "package",
+            "function",
+            "component",
+            "file",
+            "line",
+            "message",
+        }
+    )
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     format: Literal["json", "text"] = "json"
+    text_pattern: NonEmptyString = "{time} [{level}] {package}.{function} - {message}"
+    text_date_format: NonEmptyString | None = None
     access_log: StrictBool = True
+    directory: Path | None = None
+
+    @field_validator("text_pattern")
+    @classmethod
+    def check_text_pattern(cls, pattern: str) -> str:
+        if "\n" in pattern or "\r" in pattern:
+            raise ValueError("textPattern must be a single line")
+        fields = set()
+        for _, field, spec, conversion in Formatter().parse(pattern):
+            if field is not None:
+                if field not in cls.TEXT_FIELDS or spec or conversion:
+                    raise ValueError("textPattern only supports simple log field names")
+                fields.add(field)
+        if "message" not in fields:
+            raise ValueError("textPattern must include {message}")
+        return pattern
+
+    @field_validator("text_date_format")
+    @classmethod
+    def check_text_date_format(cls, date_format: str | None) -> str | None:
+        if date_format is not None:
+            datetime.now(timezone.utc).strftime(date_format)
+        return date_format
+
+    @field_validator("directory")
+    @classmethod
+    def check_directory(cls, directory: Path | None) -> Path | None:
+        if directory is not None and not directory.is_absolute():
+            raise ValueError("directory must be an absolute path")
+        return directory
 
 
 class ClientConfig(ConfigModel):
@@ -843,6 +909,7 @@ class ClientConfig(ConfigModel):
 
 class AgentKitConfig(ConfigModel):
     revision: PositiveInt
+    admin: AdminConfig = Field(default_factory=AdminConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     team: TeamConfig = Field(default_factory=TeamConfig)
     skill: SkillConfig = Field(default_factory=SkillConfig)

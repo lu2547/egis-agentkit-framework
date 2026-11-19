@@ -14,7 +14,8 @@ CLUSTER_TABLES = {
     "ak_agent_definition_detail", "ak_agent_personal_resources",
     "ak_agent_remote_runs", "ak_team_definition_summary",
     "ak_team_definition_detail", "ak_resource_assets", "ak_resource_permission",
-    "ak_approve", "ak_skill_imports", "ak_virtual_users", "ak_mcp_credentials", "ak_projects",
+    "ak_approve", "ak_skill_imports", "ak_skill_summary", "ak_skill_detail",
+    "ak_virtual_users", "ak_mcp_credentials", "ak_projects",
     "ak_project_file_changes", "ak_project_file_fingerprints",
     "ak_project_reply_artifacts", "ak_feedback", "ak_bus_keys", "ak_bus_entries",
     "ak_bus_registry", "ak_bus_leases", "ak_bus_broadcast_payloads",
@@ -35,7 +36,7 @@ async def schema_shape(connection, schema):
         WHERE n.nspname = $1 AND c.relkind = 'r'
           AND a.attnum > 0 AND NOT a.attisdropped
         UNION ALL
-        SELECT 'constraint', c.relname, p.contype::text,
+        SELECT 'constraint', c.relname, p.conname,
                pg_get_constraintdef(p.oid)
         FROM pg_constraint p JOIN pg_class c ON c.oid = p.conrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -45,6 +46,14 @@ async def schema_shape(connection, schema):
         FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid
         JOIN pg_class t ON t.oid = x.indrelid
         JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE n.nspname = $1
+        UNION ALL
+        SELECT 'sequence', c.relname, c.relname,
+               format_type(s.seqtypid, NULL) || '|' || s.seqstart || '|'
+               || s.seqincrement || '|' || s.seqmin || '|' || s.seqmax || '|'
+               || s.seqcache || '|' || s.seqcycle
+        FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = $1
         """,
         schema,

@@ -102,11 +102,15 @@ def test_personal_agent_assembly_uses_current_preferences_without_changing_defin
     definition = core.build_definition(
         User(user_id="alice", username="Alice")
     ).model_dump()
-    original_prompt = definition["payload"]["system_prompt"]
+    previous_definition = {
+        **definition,
+        "payload": {**definition["payload"], "system_prompt": "已存储的定义提示"},
+    }
     record = core.build_agent(
         "alice",
-        definition,
-        preferences={"agent_md": "规范", "soul_md": "", "user_md": "背景"},
+        previous_definition,
+        preferences={"agent_md": "规范", "soul_md": "个人助理", "user_md": ""},
     )
-    assert record.data.system_prompt == original_prompt + "\n\n规范\n\n\n\n背景"
-    assert definition["payload"]["system_prompt"] == original_prompt
+    assert record.data.system_prompt == "规范\n\n个人助理"
+    assert previous_definition["payload"]["system_prompt"] == "已存储的定义提示"
+    assert definition["payload"]["system_prompt"] == ""

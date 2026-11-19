@@ -7,6 +7,7 @@
 - 在宿主平台固定受管目录后枚举和删除，避免跨目录访问。
 """
 
+import errno
 import mimetypes
 import os
 import re
@@ -22,7 +23,13 @@ from egis_agentkit.client.nacos._settings import (
     WorkspaceFilesConfig,
 )
 from egis_agentkit.client.nas_files import NasFilesClient
-from egis_agentkit.errors import Conflict, Forbidden, NotFound, UploadNameConflict
+from egis_agentkit.errors import (
+    AgentKitError,
+    Conflict,
+    Forbidden,
+    NotFound,
+    UploadNameConflict,
+)
 
 from ._directory import PosixDirectory, is_link
 from ._file_lock import hold_file_lock
@@ -183,7 +190,9 @@ class FileStorage:
             except FileNotFoundError as exc:
                 raise NotFound("文件目录不存在") from exc
             except OSError as exc:
-                raise Forbidden("不允许访问此文件路径") from exc
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise Forbidden("不允许访问此文件路径") from exc
+                raise AgentKitError("工作区目录暂时无法访问，请检查 NAS 挂载与目录权限", 503) from exc
             yield current
 
     def _read_root(self, root, path, *, max_bytes=None):

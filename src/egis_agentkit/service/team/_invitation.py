@@ -160,6 +160,7 @@ async def _apply_invitations(user, scope, state, native_create, inputs, permissi
     if not collaboration_allowed(scope.session_record, scope.root_definition):
         raise Forbidden("只有个人智能体主对话可以邀请专家协作")
     definitions = await validate_collaborators(permissions, user, binding)
+    scope.collaborator_definitions.update(definitions)
     if native_create is None:
         raise Forbidden("当前会话没有原生协作能力")
     storage = permissions.storage

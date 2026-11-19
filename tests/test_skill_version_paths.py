@@ -186,7 +186,6 @@ async def test_skill_read_rejects_symlinked_user_ancestor(storage, tmp_path):
 async def test_persisted_unsafe_asset_paths_are_rejected(
     storage, tmp_path, rid, version
 ):
-    from egis_agentkit.storage import tables as t
     from egis_agentkit.storage.model import Asset
 
     _, _, alice, _ = await identities(storage)
@@ -200,11 +199,7 @@ async def test_persisted_unsafe_asset_paths_are_rejected(
         owner_id="alice",
     )
     async with storage.transaction() as conn:
-        await conn.execute(
-            t.assets.insert().values(
-                **asset.model_dump(), created_by="alice", updated_by="alice"
-            )
-        )
+        await storage.assets.insert_asset(asset, actor=alice.user_id, conn=conn)
     with pytest.raises((ValueError, Forbidden)):
         await resources.materialize_skill(alice, rid, version)
     assert not (tmp_path / "user").exists() and not (tmp_path / "common").exists()

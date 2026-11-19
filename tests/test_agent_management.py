@@ -109,6 +109,51 @@ async def test_agent_search_cursor_is_bound_to_the_same_query(storage):
 
 
 @pytest.mark.asyncio
+async def test_expert_catalog_loads_ten_and_filters_visible_definitions_before_paging(
+    storage,
+):
+    _, admin, alice, bob = await identities(storage)
+    manager = agent_manager(storage)
+    target = expert(name="catalog_target")
+    target.payload.update(category="分析报告", tags=["月报模板"])
+    await manager.add_definition(alice, target)
+    for index in range(11):
+        await manager.add_definition(alice, expert(name=f"catalog_item_{index}"))
+
+    shared = expert("bob", name="catalog_shared")
+    shared.payload["category"] = "跨组协作"
+    await manager.add_definition(bob, shared)
+    sharing = ShareService(storage)
+    review = await sharing.submit(bob, "agent", shared.id, target=COMPANY)
+    await sharing.decide(admin, review["review_id"], True, "已确认")
+    hidden = expert("bob", name="catalog_hidden")
+    hidden.payload["category"] = "仅所有者可见"
+    await manager.add_definition(bob, hidden)
+
+    first = await manager.page_definitions(alice, catalog=True, mine=True)
+    assert len(first["items"]) == 10
+    assert target.id not in {row["id"] for row in first["items"]}
+    assert set(first["categories"]) == {"分析报告", "办公协同", "跨组协作"}
+    second = await manager.page_definitions(
+        alice, catalog=True, mine=True, cursor=first["next_cursor"]
+    )
+    assert len(second["items"]) == 2 and second["next_cursor"] is None
+    assert target.id in {row["id"] for row in second["items"]}
+    assert "categories" not in second
+    with pytest.raises(ValueError, match="游标"):
+        await manager.page_definitions(
+            alice, catalog=True, cursor=first["next_cursor"], category="分析报告"
+        )
+
+    matching = await manager.page_definitions(
+        alice, catalog=True, query="月报模板", category="分析报告"
+    )
+    assert [row["id"] for row in matching["items"]] == [target.id]
+    assert matching["next_cursor"] is None
+    assert set(matching["categories"]) == set(first["categories"])
+
+
+@pytest.mark.asyncio
 async def test_resource_admin_list_uses_active_agent_bindings(storage, tmp_path):
     _, admin, alice, _ = await identities(storage)
     await put_asset(storage, owner_type="user", owner_id=alice.user_id)

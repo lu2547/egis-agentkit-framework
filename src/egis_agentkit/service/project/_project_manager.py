@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from agentscope.app.message_bus import MessageBusKeys
@@ -13,6 +14,8 @@ from agentscope.app.message_bus import MessageBusKeys
 from egis_agentkit.core.project._project import Project
 from egis_agentkit.errors import Conflict, NotFound
 from egis_agentkit.storage.project._files import ProjectFileStorage
+
+logger = logging.getLogger(__name__)
 
 
 async def purge_session_bus(bus, sid):
@@ -84,7 +87,13 @@ class ProjectManager:
         project = await projects.create(
             self.project.build(user_id, name, is_default=is_default)
         )
+        fields = {
+            "component": "ProjectManager._create",
+            "context": {"project_id": project["id"], "is_default": is_default},
+        }
+        logger.info("Initializing project directories", extra=fields)
         await asyncio.to_thread(self.initialize_files, user_id, project["id"])
+        logger.info("Project directories initialized", extra=fields)
         return project
 
     async def default(self, user):

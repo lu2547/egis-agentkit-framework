@@ -53,11 +53,12 @@ class SkillImportStorage:
         async with self.engine.connect() as conn:
             return [dict(row) for row in (await conn.execute(statement)).mappings()]
 
-    async def list_reviews(self, *, limit):
+    async def list_reviews(self, *, limit, offset=0):
         statement = (
             select(*_STATUS_COLUMNS, _IMPORTS.c.uploader_id.label("uploaded_by"))
             .where(_IMPORTS.c.status == "pending_approval")
             .order_by(_IMPORTS.c.created_at, _IMPORTS.c.job_id)
+            .offset(offset)
             .limit(limit)
         )
         async with self.engine.connect() as conn:

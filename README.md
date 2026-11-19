@@ -6,7 +6,11 @@ AgentScope 的配置管理与企业增强框架。首版已实现，不修改 Ag
 
 数据库支持 Nacos `agentkit.client.postgres.connection.mode: key | cyberark`：key 使用 password 字段，cyberark 使用 CCP REST 获取新建连接所需密码。日志配置位于 `agentkit.logging`；Phoenix 导出位于 `agentkit.client.tracing`，启动后由原生 TracingMiddleware 记录回复、模型和工具调用，Framework 管理导出和关闭。配置示例及运维步骤见上述初始化说明。
 
-Phoenix 的运行主项目默认 `egis-agentkit`，以 `chat.run` 为根记录会话、项目、沙箱、资源、记忆、原生 Agent/模型/工具和收尾阶段，使用 `session.id` 对应实际会话。普通 HTTP 与 FastAPI 内部 Span 默认进入 `egis-agentkit-http`，由 `client.tracing.httpProjectName` 配置。Span 结束后导出，执行中的父阶段不提前标记完成。Framework 日志输出到 stdout；当前开发机的 `/private/tmp/agentkit-observability-api.log` 是启动时重定向文件，不是沙箱目录，也不代表已经配置生产文件落盘或轮转。
+Phoenix 的运行主项目默认 `egis-agentkit`，以 `chat.run` 为根记录会话、项目、沙箱、资源、记忆、原生 Agent/模型/工具和收尾阶段，使用 `session.id` 对应实际会话。普通 HTTP 与 FastAPI 内部 Span 默认进入 `egis-agentkit-http`，由 `client.tracing.httpProjectName` 配置。Span 结束后导出，执行中的父阶段不提前标记完成。
+
+App CLI 使用 Python `logging.config.dictConfig` 统一配置 AgentKit、AgentScope 和 Uvicorn 的日志。Nacos `agentkit.logging` 控制 `level`、`format`（`json` 或 `text`）、`directory` 和 `accessLog`。默认输出到 stdout。设置 `directory` 为服务进程可写的绝对目录后，同时写入 `agentkit-<主机名>-<PID>.log`，文件和 stdout 使用相同的格式与级别。目录变更在服务重启后生效。管理与聊天请求的响应带有 `X-Request-ID`，可关联访问日志与错误记录。访问日志包含路由模板、状态和耗时，身份验证成功时也包含用户标识。业务拒绝记录异常类型、公开说明和抛出位置。系统故障保留异常类型、栈和原因链，可识别的操作系统错误附带错误编号和描述。
+
+`format: text` 时，`textPattern` 控制单条日志的字段顺序和分隔符，默认是 `{time} [{level}] {package}.{function} - {message}`。其中 `function` 为调用方法全名，类方法显示为 `类名.方法名`。模板还支持 `{logger}`、`{component}`、`{file}` 和 `{line}`，并须包含 `{message}`。请求、链路和异常详情自动附在行尾。`textDateFormat` 使用 Python `strftime` 格式设置 UTC 时间的显示方式，设为 `null` 时使用带毫秒的 ISO 8601。JSON 使用固定字段，包含 `function`、`file` 与 `line`。模板变更在服务重启后生效。
 
 `src/egis_agentkit/` 的 Agent 能力采用以下分层；其他业务仍保留现有目录，后续逐项梳理。
 
@@ -47,11 +51,11 @@ Agent 当前实现见 [Agent 管理与定义](./docs/Agent管理与定义.md)，
 
 普通用户、管理员和经授权的外部系统使用 `POST /manager/skills/imports` 提交 ZIP。管理员在用户管理签发虚拟用户 Bearer 凭证，外部系统可先用 `GET /manager/skills/imports` 验证凭证。系统技能通过导入审核后发布，实际上传人和审核人分别记录。上传 ZIP 暂存在 Nacos 的 `agentkit.skill.storage.root` 下，任务成功或审核拒绝后删除。
 
-已有开发库可使用 App 的显式重置命令。先停止 API 和导入 Worker，预览目标库及目录，再确认库名执行：
+已有开发库可使用 App 的显式重置命令。先停止 API 和导入 Worker，将 `DB_NAME` 设为 Nacos 配置中的当前开发库名，预览目标库及目录后再执行：
 
 ```bash
-python -m egis_agentkit_app reset-skills --database egis_agentkit_clean_dev
-python -m egis_agentkit_app reset-skills --database egis_agentkit_clean_dev --apply
+python -m egis_agentkit_app reset-skills --database "$DB_NAME"
+python -m egis_agentkit_app reset-skills --database "$DB_NAME" --apply
 ```
 
 重置清理技能记录、授权、导入文件和 Agent 定义中的技能绑定，重建导入表。新部署直接执行 `init-db`。

@@ -7,6 +7,7 @@
 """
 
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
+from egis_agentkit.service._admin_page import AdminPage
 from egis_agentkit.service._user import UserService, require_admin
 from egis_agentkit.service.access._permission import (
     DEFINITION_KINDS,
@@ -16,7 +17,6 @@ from egis_agentkit.storage.model import Grant, ShareTarget, User, new_id
 from egis_agentkit.storage.model._base import publication_label, resource_available
 from egis_agentkit.storage.model._resource import (
     MCP_STORAGE_VERSION,
-    asset_version_order,
     is_managed_connector,
     require_skill_publication_revision,
 )
@@ -43,6 +43,13 @@ class GrantService:
         require_admin(admin)
         return await self.storage.access.list_grants()
 
+    async def list_grants_page(self, admin: User, page: AdminPage) -> dict:
+        require_admin(admin)
+        rows = await self.storage.access.list_grants(
+            offset=page.offset, limit=page.fetch_limit
+        )
+        return page.response(rows)
+
     async def grantable_resources(self, admin):
         """列出每项资源可直接授权的当前版本。"""
         require_admin(admin)
@@ -57,30 +64,19 @@ class GrantService:
                         kind, row["id"], row, row[f"{kind}_display_name"]
                     )
                 )
-        selected = {}
-        for row in await self.storage.assets.list_versions("skill"):
+        skills = await self.storage.assets.list_current_skill_versions()
+        for row in sorted(skills, key=lambda skill: skill["resource_id"]):
+            version = row["shared_version"] or row["owner_version"]
+            if row["publication_revision"] != version or not row["is_enabled"]:
+                continue
             identifier = row["resource_id"]
-            previous = selected.get(identifier)
-            if previous is None or self._publication_order(
-                row
-            ) > self._publication_order(previous):
-                selected[identifier] = row
-        for identifier, row in sorted(selected.items()):
-            if row["is_enabled"]:
-                resources.append(
-                    self._grantable_row(
-                        "skill", identifier, row,
-                        row["payload"].get("display_name") or identifier,
-                    )
+            resources.append(
+                self._grantable_row(
+                    "skill", identifier, row,
+                    row["payload"].get("display_name") or identifier,
                 )
+            )
         return resources
-
-    @staticmethod
-    def _publication_order(row):
-        return (
-            row["is_shared_current"],
-            asset_version_order(row),
-        )
 
     @staticmethod
     def _grantable_row(kind, identifier, row, name):

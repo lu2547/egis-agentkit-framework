@@ -1,5 +1,8 @@
 import json
 import logging
+import re
+import subprocess
+import sys
 from datetime import datetime
 
 import pytest
@@ -63,6 +66,100 @@ def test_text_format_honors_level_and_preserves_structured_context(capsys):
     assert "hidden info" not in captured.out
     assert len(captured.out.splitlines()) == 1
     assert captured.err == ""
+
+
+def test_text_pattern_controls_field_order_and_date_without_losing_context(capsys):
+    from egis_agentkit.client._logging import LoggingClient
+
+    logger = logging.getLogger("egis_agentkit.service.project")
+
+    class ProjectManager:
+        def create(self):
+            logger.warning("目录创建失败", extra={"context": {"category": "system"}})
+
+    client = LoggingClient(
+        LoggingConfig(
+            format="text",
+            text_pattern="[{level}] {package}.{function} {time} {file}:{line} {message}",
+            text_date_format="%Y/%m/%d %H:%M:%S %z",
+        )
+    )
+    client.start()
+    try:
+        ProjectManager().create()
+    finally:
+        client.close()
+
+    output = capsys.readouterr().out
+    assert re.fullmatch(
+        r"\[WARNING\] egis_agentkit\.service\.project\.ProjectManager\.create "
+        r"\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} \+0000 "
+        r'test_logging_client\.py:\d+ 目录创建失败 \{"context": \{"category": "system"\}\}\n',
+        output,
+    )
+
+
+def test_json_names_the_actual_class_method_when_using_stacklevel(capsys):
+    from egis_agentkit.client._logging import LoggingClient
+
+    logger = logging.getLogger("egis_agentkit.service.project")
+
+    def report():
+        logger.info("project.created", stacklevel=2)
+
+    class ProjectManager:
+        @staticmethod
+        def create():
+            report()
+
+    client = LoggingClient(LoggingConfig())
+    client.start()
+    try:
+        ProjectManager.create()
+    finally:
+        client.close()
+
+    event = json.loads(capsys.readouterr().out)
+    assert event["package"] == "egis_agentkit.service.project"
+    assert event["function"] == "ProjectManager.create"
+    assert event["file"] == "test_logging_client.py"
+    assert isinstance(event["line"], int)
+
+
+def test_embedded_logging_writes_configured_directory_with_the_same_format(
+    tmp_path, capsys
+):
+    from egis_agentkit.client._logging import LoggingClient
+
+    directory = tmp_path / "service" / "logs"
+    client = LoggingClient(
+        LoggingConfig(directory=directory, format="text", level="WARNING")
+    )
+    client.start()
+    try:
+        logger = logging.getLogger("egis_agentkit.client.test")
+        logger.info("hidden info")
+        logger.warning("工作区创建失败")
+    finally:
+        client.close()
+
+    (log_file,) = directory.glob("agentkit-*.log")
+    output = log_file.read_text(encoding="utf-8")
+    assert output == capsys.readouterr().out
+    assert "[WARNING] egis_agentkit.client.test." in output
+    assert " - 工作区创建失败" in output
+    assert len(output.splitlines()) == 1
+
+
+def test_embedded_logging_rejects_unusable_directory(tmp_path):
+    from egis_agentkit.client._logging import LoggingClient
+
+    directory = tmp_path / "regular-file"
+    directory.touch()
+    client = LoggingClient(LoggingConfig(directory=directory))
+    with pytest.raises(FileExistsError):
+        client.start()
+    client.close()
 
 
 def test_start_and_close_are_repeatable_and_restore_namespace_state(capsys):
@@ -286,3 +383,81 @@ def test_excessively_nested_context_does_not_break_logging(capsys):
     event = json.loads(captured.out)
     assert event["message"] == "context checked"
     assert event["context"] == "[UNSUPPORTED]"
+
+
+def test_chained_failure_records_component_and_original_frames_safely(capsys):
+    from egis_agentkit.client._logging import LoggingClient
+
+    class Provider:
+        def call(self):
+            try:
+                raise ConnectionError("upstream-api-secret")
+            except ConnectionError as exc:
+                raise RuntimeError("request-prompt-secret") from exc
+
+    client = LoggingClient(settings())
+    client.start()
+    try:
+        try:
+            Provider().call()
+        except RuntimeError:
+            logging.getLogger("egis_agentkit.provider").exception(
+                "Provider call failed"
+            )
+    finally:
+        client.close()
+    output = capsys.readouterr().out
+    event = json.loads(output)
+    assert event["package"] == "egis_agentkit.provider"
+    assert event["component"].endswith(
+        "test_chained_failure_records_component_and_original_frames_safely"
+    )
+    assert event["exception"]["type"] == "RuntimeError"
+    cause = event["exception"]["cause"]
+    assert cause["type"] == "ConnectionError"
+    assert cause["frames"][-1]["function"].endswith("Provider.call")
+    assert "upstream-api-secret" not in output
+    assert "request-prompt-secret" not in output
+
+
+@pytest.mark.parametrize("write_file", [False, True])
+def test_process_logging_unifies_uvicorn_and_scrubs_native_runtime_messages(
+    tmp_path, write_file
+):
+    script = """
+import logging
+import sys
+
+from egis_agentkit.client._logging import configure_process_logging
+from egis_agentkit.client.nacos._settings import LoggingConfig
+
+directory = sys.argv[1] if len(sys.argv) > 1 else None
+configure_process_logging(LoggingConfig(directory=directory))
+logging.getLogger("uvicorn.error").info("Server started")
+logging.getLogger("uvicorn.access").info("private-query")
+try:
+    raise RuntimeError("provider-secret")
+except RuntimeError:
+    logging.getLogger("as").exception("Unhandled operation %s", "private-prompt")
+"""
+    directory = tmp_path / "process-logs"
+    command = [sys.executable, "-c", script]
+    if write_file:
+        command.append(str(directory))
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert result.stderr == ""
+    assert len(result.stdout.splitlines()) == 2
+    uvicorn, native = [json.loads(line) for line in result.stdout.splitlines()]
+    assert uvicorn["logger"] == "uvicorn.error"
+    assert uvicorn["message"] == "Server started"
+    assert native["logger"] == "as"
+    assert native["context"]["category"] == "system"
+    assert native["exception"]["type"] == "RuntimeError"
+    assert "provider-secret" not in result.stdout
+    assert "private-query" not in result.stdout
+    assert "private-prompt" not in result.stdout
+    if write_file:
+        (log_file,) = directory.glob("agentkit-*.log")
+        assert log_file.read_text(encoding="utf-8") == result.stdout
+    else:
+        assert not directory.exists()

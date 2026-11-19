@@ -14,6 +14,7 @@ from egis_agentkit.storage.model import AgentDefinition, User
 from egis_agentkit.storage.model._base import resource_available
 from egis_agentkit.storage.model._resource import (
     MCP_STORAGE_VERSION,
+    SYSTEM_DEFAULT_TOOL_SOURCES,
     is_managed_connector,
 )
 
@@ -27,7 +28,7 @@ def is_system_default_tool(asset):
         asset.get("resource_type") == "tool"
         and asset["owner_type"] == "system"
         and payload.get("exposure") == "model"
-        and payload.get("source") in ("workspace", "toolkit", "middleware")
+        and payload.get("source") in SYSTEM_DEFAULT_TOOL_SOURCES
     )
 
 

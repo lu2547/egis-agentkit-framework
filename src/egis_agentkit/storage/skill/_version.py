@@ -9,6 +9,7 @@ from pathlib import PurePosixPath
 from uuid import uuid4
 
 from egis_agentkit.core.skill._archive import calculate_files_digest
+from egis_agentkit.core.skill._avatar import AVATAR_MAX_BYTES
 from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.storage._directory import is_link
 from egis_agentkit.storage._files import FileStorage
@@ -121,6 +122,36 @@ class SkillVersionStorage(FileStorage):
             )
         parts = self._location(asset)
         return self._read_version(parts, asset["checksum_sha256"], max_bytes=max_bytes)
+
+    def write_avatar(self, asset, content):
+        """Persist the generated thumbnail separately from the executable skill files."""
+        if self._nas is not None:
+            return self._nas.call(
+                "skill_version", "write_avatar", asset=asset, content=content
+            )
+        directory, filename = self._avatar_path(asset)
+        self._write_root(
+            directory,
+            filename,
+            content,
+            overwrite=True,
+            max_bytes=AVATAR_MAX_BYTES,
+        )
+
+    def read_avatar(self, asset):
+        if self._nas is not None:
+            return self._nas.call("skill_version", "read_avatar", asset=asset)
+        directory, filename = self._avatar_path(asset)
+        content, _ = self._read_root(
+            directory,
+            filename,
+            max_bytes=AVATAR_MAX_BYTES,
+        )
+        return content
+
+    def _avatar_path(self, asset):
+        parts = self._location(asset)
+        return self.root.joinpath(*parts[:-1], ".avatars"), f"{parts[-1]}.svg"
 
     def read_runtime(self, source, *, checksum, max_bytes):
         """Read only a canonical skill version with the expected digest."""

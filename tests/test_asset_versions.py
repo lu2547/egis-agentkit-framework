@@ -2,6 +2,7 @@
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 from test_domain import identities
 
 from egis_agentkit.bootstrap._demo_tools import deploy_demo_report_tools
@@ -26,30 +27,22 @@ def test_skill_asset_requires_publication_revision():
         )
 
 
-async def test_current_storage_rejects_skill_without_publication_revision(storage):
-    async with storage.engine.begin() as conn:
-        await conn.execute(
-            t.assets.insert().values(
-                resource_type="skill",
-                resource_id="missing-revision",
-                resource_version="1.0.0",
-                owner_type="user",
-                owner_id="alice",
-                checksum_sha256="",
-                is_enabled=True,
-                payload={},
-                created_by="test",
-                updated_by="test",
+async def test_skill_owner_version_requires_a_published_detail(storage):
+    with pytest.raises(IntegrityError) as failure:
+        async with storage.transaction() as conn:
+            await conn.execute(
+                t.skill_summary.insert().values(
+                    skill_id="missing-revision",
+                    owner_type="user",
+                    owner_id="alice",
+                    source_user_id="alice",
+                    owner_version=1,
+                    created_by="alice",
+                    updated_by="alice",
+                )
             )
-        )
-    with pytest.raises(
-        ValueError, match="Skill assets require a positive publication revision"
-    ):
-        await storage.assets.get("skill", "missing-revision", "1.0.0")
-    with pytest.raises(
-        ValueError, match="Skill assets require a positive publication revision"
-    ):
-        await storage.assets.find_asset("skill", "missing-revision")
+    assert failure.value.orig.sqlstate == "23503"
+    assert await storage.assets.find_asset("skill", "missing-revision") is None
 
 
 async def test_disabling_one_skill_edition_keeps_stable_owner_grant(storage, tmp_path):

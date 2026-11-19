@@ -4,6 +4,7 @@ from functools import partial
 
 import httpx
 import pytest
+from agentscope.app.message_bus import MessageBusKeys
 from config_helpers import sandbox_runtime
 from egis_agentkit_app.bootstrap import build_app
 from identity_helpers import TEST_IDENTITY, configure_test_issuer, signed_token
@@ -214,6 +215,22 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             assert page.status_code == 200
             assert [item["id"] for item in page.json()["items"]] == [identifier]
             assert page.json()["next_cursor"] is None
+            filtered = await client.get(
+                "/manager/agents",
+                params={
+                    "catalog": True,
+                    "mine": True,
+                    "query": "受控",
+                    "category": "办公协同",
+                },
+            )
+            assert filtered.status_code == 200
+            assert [item["id"] for item in filtered.json()["items"]] == [identifier]
+            assert filtered.json()["categories"] == ["办公协同"]
+            invalid_category = await client.get(
+                "/manager/agents", params={"catalog": True, "category": "\0"}
+            )
+            assert invalid_category.status_code == 422
             personal = (await client.get("/manager/assistant")).json()
             assert personal["agent_type"] == "personal"
             assert (
@@ -228,6 +245,30 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             )
             assert pending.status_code == 201
             failed_task = pending.json()
+            status_path = f"/sessions/{failed_task['session_id']}/status"
+            status_params = {"agent_id": failed_task["agent_id"]}
+            session_status = await client.get(status_path, params=status_params)
+            assert session_status.status_code == 200
+            assert session_status.json()["status"] == "idle"
+            async with app.state.egis_bus.acquire_lock(
+                MessageBusKeys.session_lock(failed_task["session_id"])
+            ):
+                session_status = await client.get(status_path, params=status_params)
+                assert session_status.status_code == 200
+                assert session_status.json()["status"] == "running"
+                assert (
+                    await client.get(
+                        status_path,
+                        params=status_params,
+                        headers={"Authorization": "Bearer " + signed_token("bob")},
+                    )
+                ).status_code == 403
+            assert (
+                await client.get(status_path, params={"agent_id": "wrong-agent"})
+            ).status_code == 403
+            assert (
+                await client.post(status_path, params=status_params)
+            ).status_code == 403
             coordinator = app.state.egis_bus.coordinator
             bind = coordinator.bind
             failing_sessions = {failed_task["session_id"]}
@@ -253,8 +294,6 @@ async def test_http_identity_native_write_seal_and_real_task_files(
                 },
             )
             assert triggered.status_code == 200
-            from agentscope.app.message_bus import MessageBusKeys
-
             terminal = None
             async with asyncio.timeout(2):
                 while terminal is None:

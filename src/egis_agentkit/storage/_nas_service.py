@@ -13,6 +13,7 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from egis_agentkit.client._logging import exception_origin
 from egis_agentkit.client.nacos import AgentKitConfig
 from egis_agentkit.client.nas_files import decode_wire, encode_wire
 from egis_agentkit.core.agent._personal_definition import DOCUMENT_FILES
@@ -46,7 +47,7 @@ _OPERATIONS = {
         "read_probe_file",
         "remove_probe_file",
     },
-    "skill_version": {"publish", "read", "read_runtime"},
+    "skill_version": {"publish", "read", "read_runtime", "read_avatar", "write_avatar"},
     "skill_upload": {"write", "read", "remove"},
 }
 _PREFERENCE_FILES = frozenset(DOCUMENT_FILES.values())
@@ -117,7 +118,7 @@ def _validate_arguments(snapshot, scope, operation, arguments):
             raise Forbidden("只允许访问受管偏好文档")
         arguments["max_bytes"] = limit
 
-    if scope == "skill_version":
+    if scope == "skill_version" and operation in {"publish", "read", "read_runtime"}:
         arguments["max_bytes"] = _bounded_limit(
             arguments.get("max_bytes"), snapshot.skill.archive.expanded_bytes_limit
         )
@@ -143,12 +144,32 @@ def _execute(snapshot, storage, scope, operation, body):
         result = getattr(storage, operation)(**arguments)
         return JSONResponse(encode_wire(result))
     except AgentKitError as exc:
+        system = exc.status_code >= 500
+        logger.log(
+            logging.ERROR if system else logging.WARNING,
+            "NAS file operation failed" if system else "NAS file operation rejected",
+            extra={
+                "component": f"{type(storage).__name__}.{operation}",
+                "context": {
+                    "category": "system" if system else "business",
+                    "scope": scope,
+                    "error_type": type(exc).__name__,
+                    "error_description": str(exc),
+                    "origin": exception_origin(exc),
+                },
+            },
+            exc_info=exc if system else None,
+        )
         return _error(exc.status_code, type(exc).__name__, str(exc))
     except (TypeError, ValueError, KeyError, OverflowError, RecursionError):
         return _error(422, "InvalidRequest", "无效的文件操作参数")
-    except Exception as exc:
-        logger.error(
-            "nas.file_operation_failed %s/%s (%s)", scope, operation, type(exc).__name__
+    except Exception:
+        logger.exception(
+            "NAS file operation failed",
+            extra={
+                "component": "_execute",
+                "context": {"category": "system", "scope": scope, "operation": operation},
+            },
         )
         return _error(503, "Unavailable", "工作区文件服务暂时不可用")
 

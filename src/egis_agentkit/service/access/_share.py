@@ -6,6 +6,7 @@
 """
 
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
+from egis_agentkit.service._admin_page import AdminPage
 from egis_agentkit.service._user import UserService, require_admin
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._permission import (
@@ -29,7 +30,7 @@ class ShareService:
         if not user.is_enabled:
             raise Forbidden()
         users = await self.storage.users.list_users()
-        groups, _ = await self.storage.users.list_groups_with_members()
+        groups = await self.storage.users.list_group_options()
         return [
             *(
                 {
@@ -50,6 +51,19 @@ class ShareService:
                 if row["is_enabled"]
             ),
         ]
+
+    async def recipients_page(
+        self, user: User, principal_type: str, query: str, page: AdminPage
+    ) -> dict:
+        """按类型搜索可接收共享或授权的对象。"""
+        if not user.is_enabled:
+            raise Forbidden()
+        rows = await self.storage.users.search_recipients(
+            principal_type, query.strip(), offset=page.offset, limit=page.fetch_limit
+        )
+        return page.response(
+            [{**row, "principal_type": principal_type} for row in rows]
+        )
 
     async def submit(
         self, user, resource_type, resource_id, *, target: ShareTarget | None = None
@@ -132,6 +146,18 @@ class ShareService:
             await self._with_publication_label(row, storage=self.storage)
             for row in rows
         ]
+
+    async def list_reviews_page(self, admin: User, page: AdminPage) -> dict:
+        require_admin(admin)
+        rows = await self.storage.access.list_reviews(
+            offset=page.offset, limit=page.fetch_limit
+        )
+        response = page.response(rows)
+        response["items"] = [
+            await self._with_publication_label(row, storage=self.storage)
+            for row in response["items"]
+        ]
+        return response
 
     @staticmethod
     async def _with_publication_label(row, *, storage):

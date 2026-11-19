@@ -7,7 +7,14 @@ from tempfile import mkdtemp
 from sqlalchemy import text
 
 from ._schema import SchemaReport, _existing_tables, _qualified, _target
-from .model._tables import metadata, skill_imports, virtual_users
+from .migration._skills import SKILL_TABLES
+from .model._tables import (
+    metadata,
+    skill_detail,
+    skill_imports,
+    skill_summary,
+    virtual_users,
+)
 
 RESOURCE_TABLES = (
     "ak_agent_personal_resources",
@@ -17,6 +24,7 @@ RESOURCE_TABLES = (
 )
 DEFINITION_TABLES = ("ak_agent_definition_detail", "ak_team_definition_detail")
 SKILL_ONLY_TABLES = ("ak_skill_imports", "ak_skill_archives", "skills")
+SKILL_VERSION_TABLES = tuple(table.name for table in SKILL_TABLES)
 SESSION_SKILL_STATE = "'{state,middle_context,egis_agentkit,activated_skills}'"
 SKILL_BINDINGS = "jsonb_typeof(payload->'bindings') = 'array'"
 HAS_SKILL_BINDING = f"{SKILL_BINDINGS} AND payload->'bindings' @> '[{{\"resource_type\":\"skill\"}}]'::jsonb"
@@ -55,6 +63,7 @@ async def _reset_rows(connection, schema, names, *, apply):
     filters = {
         **dict.fromkeys(RESOURCE_TABLES, "resource_type = 'skill'"),
         **dict.fromkeys(SKILL_ONLY_TABLES, "TRUE"),
+        **dict.fromkeys(SKILL_VERSION_TABLES, "TRUE"),
         **dict.fromkeys(DEFINITION_TABLES, HAS_SKILL_BINDING),
         "sessions": f"payload::jsonb #> {SESSION_SKILL_STATE} IS NOT NULL",
     }
@@ -70,6 +79,9 @@ async def _reset_rows(connection, schema, names, *, apply):
 
     for name in counts:
         table = _qualified(connection, schema, name)
+        if name == skill_detail.name and skill_summary.name in counts:
+            # 汇总删除时由外键一并清理历史版本。
+            continue
         if name in SKILL_ONLY_TABLES:
             await connection.execute(text(f"DROP TABLE {table} RESTRICT"))
         elif name in DEFINITION_TABLES:
@@ -96,7 +108,7 @@ async def _reset_rows(connection, schema, names, *, apply):
         else:
             await connection.execute(text(f"DELETE FROM {table} WHERE {filters[name]}"))
     await connection.run_sync(
-        metadata.create_all, tables=[skill_imports, virtual_users]
+        metadata.create_all, tables=[skill_imports, virtual_users, *SKILL_TABLES]
     )
     return counts
 
@@ -121,6 +133,7 @@ async def reset_skills(
                     (
                         *RESOURCE_TABLES,
                         *SKILL_ONLY_TABLES,
+                        *SKILL_VERSION_TABLES,
                         *DEFINITION_TABLES,
                         "sessions",
                     )

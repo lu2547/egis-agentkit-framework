@@ -15,7 +15,7 @@ from agentscope.workspace import WorkspaceBase
 
 from egis_agentkit.client._tracing import trace_phase
 from egis_agentkit.core.session._context import get_session_execution_context
-from egis_agentkit.errors import Forbidden
+from egis_agentkit.errors import AgentKitError
 from egis_agentkit.middleware import (
     SkillBindingMiddleware,
     TeamPromptMiddleware,
@@ -45,9 +45,10 @@ def build_tool_access_middleware(
     *,
     authorize_tool=None,
     resolve_sandbox_path=None,
+    files=None,
 ):
     validate_access, may_send_team_message, prepare_collaboration = (
-        tool_access_callbacks(user, scope, permissions)
+        tool_access_callbacks(user, scope, permissions, files=files)
     )
     return ToolAccessMiddleware(
         scope=scope,
@@ -135,6 +136,7 @@ async def build_middlewares(
             skills,
             authorize_tool=tool_authorizer,
             resolve_sandbox_path=resolve_sandbox_path if remote_files else None,
+            files=getattr(file_changes, "files", None),
         ),
         SkillBindingMiddleware(
             skills, bind_state=skills.bind_state if skills is not None else None
@@ -146,7 +148,7 @@ async def build_middlewares(
         result.insert(0, TracingMiddleware())
     if scope.definition["agent_type"] == "remote":
         if remote_agents is None:
-            raise Forbidden("未配置远程专家执行服务")
+            raise AgentKitError("未配置远程专家执行服务", 503)
         leader_name = await sessions.get_team_leader_name(scope)
         result.append(
             RemoteAgentMiddlewareImpl(

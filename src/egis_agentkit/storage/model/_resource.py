@@ -10,6 +10,7 @@ from ._base import Model
 
 MCP_STORAGE_VERSION = "1.0.0"
 MCP_MANAGED_FLAG = "managed_connector"
+SYSTEM_DEFAULT_TOOL_SOURCES = ("workspace", "toolkit", "middleware")
 RESOURCE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}")
 
 

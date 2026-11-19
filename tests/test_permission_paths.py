@@ -1,5 +1,4 @@
 import pytest
-from sqlalchemy.dialects.postgresql import insert
 from test_domain import COMPANY, agent_changes, expert, identities
 
 from egis_agentkit.errors import Forbidden
@@ -7,7 +6,6 @@ from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.service.agent._agent_manager import AgentManager
-from egis_agentkit.storage import tables as t
 from egis_agentkit.storage.model import Asset, Grant, Group
 
 
@@ -52,11 +50,7 @@ async def test_unreviewed_binding_does_not_expand_shared_inherited_use(storage):
                 owner_type="system",
                 owner_id="sys",
             )
-            await conn.execute(
-                insert(t.assets).values(
-                    **asset.model_dump(), created_by="admin", updated_by="admin"
-                )
-            )
+            await storage.assets.insert_asset(asset, actor=admin.user_id, conn=conn)
     for name in ("a", "b"):
         await GrantService(storage).grant(
             admin,
@@ -111,11 +105,7 @@ async def test_private_binding_does_not_keep_revoked_external_permission(storage
         owner_id="sys",
     )
     async with storage.transaction() as conn:
-        await conn.execute(
-            insert(t.assets).values(
-                **asset.model_dump(), created_by="admin", updated_by="admin"
-            )
-        )
+        await storage.assets.insert_asset(asset, actor=admin.user_id, conn=conn)
     permissions = PermissionService(storage)
     grant = await GrantService(storage).grant(
         admin,
@@ -166,11 +156,7 @@ async def test_team_capture_retains_both_versions_from_real_approved_experts(sto
             owner_id="sys",
         )
         async with storage.transaction() as conn:
-            await conn.execute(
-                insert(t.assets).values(
-                    **asset.model_dump(), created_by="admin", updated_by="admin"
-                )
-            )
+            await storage.assets.insert_asset(asset, actor=admin.user_id, conn=conn)
         await GrantService(storage).grant(
             admin,
             Grant(

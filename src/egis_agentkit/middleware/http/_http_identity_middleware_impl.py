@@ -2,11 +2,15 @@
 
 import asyncio
 import json
+import logging
 from urllib.parse import parse_qs
 
 from egis_agentkit.client.remote_agent._base import CALLBACK_RESULT_PATH
 from egis_agentkit.errors import AgentKitError, Forbidden
+from egis_agentkit.middleware.http._request_logging import log_http_error
 from egis_agentkit.service._virtual_user import VIRTUAL_TOKEN_PREFIX, VirtualUserService
+
+logger = logging.getLogger(__name__)
 
 
 class IdentityGuard:
@@ -29,91 +33,109 @@ class IdentityGuard:
             "/redoc",
         ):
             return await self.app(scope, receive, send)
+        body_events = []
         try:
-            headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+            headers = {
+                k.decode("latin-1").lower(): v.decode("latin-1")
+                for k, v in scope["headers"]
+            }
             authorization = headers.get("authorization", "")
             if not authorization.startswith("Bearer "):
-                return await self._error(send, 401, "请先登录")
+                raise AgentKitError("请先登录", 401)
             token = authorization[7:]
             if token.startswith(VIRTUAL_TOKEN_PREFIX):
                 try:
                     user = await self.services.virtual_users.authenticate(token)
-                except Forbidden:
-                    return await self._error(send, 401, "虚拟用户凭证无效")
-                if not VirtualUserService.allows_request(method, path):
-                    raise Forbidden("虚拟用户只能使用技能导入接口")
+                except Forbidden as exc:
+                    raise AgentKitError("虚拟用户凭证无效", 401) from exc
                 state = scope.setdefault("state", {})
                 state["egis_user"] = user
                 state["egis_virtual_user"] = True
-                return await self.app(scope, receive, send)
-            try:
-                claims = await asyncio.to_thread(
-                    self.identity.verify, token
-                )
-            except Forbidden:
-                return await self._error(send, 401, "认证无效或已过期")
-            users = self.services.users
-            # Trusted company identity can introduce an ordinary user, never an admin.
-            user = await users.sync_identity(
-                claims["sub"], claims.get("name") or claims["sub"]
-            )
-            scope.setdefault("state", {})["egis_user"] = user
-            if path.startswith("/manager/"):
-                return await self.app(scope, receive, send)
-            body_events = []
-            if path == "/chat/" and method == "POST":
-                body = b""
-                while True:
-                    event = await receive()
-                    body_events.append(event)
-                    body += event.get("body", b"")
-                    if len(body) > 2 * 1024 * 1024:
-                        return await self._error(send, 413, "请求内容过大")
-                    if not event.get("more_body"):
-                        break
-                try:
-                    data = json.loads(body)
-                except (ValueError, UnicodeError):
-                    return await self._error(send, 400, "无效聊天请求")
-                if not isinstance(data, dict):
-                    return await self._error(send, 400, "聊天请求必须是对象")
-                await self.services.sessions.get_session_record(
-                    user, data.get("session_id", ""), agent_id=data.get("agent_id", "")
-                )
-            elif path.startswith("/sessions/"):
-                parts = path.strip("/").split("/")
-                # Expose native streaming/history/interrupt only. Creation and
-                # configuration writes must go through managed definitions.
-                if len(parts) != 3 or parts[2] not in (
-                    "stream",
-                    "messages",
-                    "interrupt",
-                ):
-                    raise Forbidden("请通过任务管理接口操作会话")
-                if method != ("POST" if parts[2] == "interrupt" else "GET"):
-                    raise Forbidden()
-                params = parse_qs(scope.get("query_string", b"").decode())
-                aid = params.get("agent_id", [""])[0]
-                if not aid:
-                    raise Forbidden("缺少智能体标识")
-                await self.services.sessions.get_session_record(
-                    user, parts[1], agent_id=aid
-                )
-            elif path.startswith("/hub/"):
-                # Native card detail selects registry "latest". Managed routes
-                # require the exact PG version and reviewed source digest.
-                raise Forbidden("请通过管理接口访问固定版本的资源")
+                if not VirtualUserService.allows_request(method, path):
+                    raise Forbidden("虚拟用户只能使用技能导入接口")
             else:
-                raise Forbidden("此原生接口未向企业工作台开放")
-
-            async def replay():
-                if body_events:
-                    return body_events.pop(0)
-                return await receive()
-
-            return await self.app(scope, replay if body_events else receive, send)
+                await self._authenticate_user(
+                    scope, method, path, token, receive, body_events
+                )
         except AgentKitError as exc:
+            log_http_error(
+                logger,
+                scope,
+                "Identity or request policy rejected access",
+                exc.status_code,
+                component="IdentityGuard",
+                exc=exc,
+            )
             return await self._error(send, exc.status_code, str(exc))
+
+        async def replay():
+            if body_events:
+                return body_events.pop(0)
+            return await receive()
+
+        return await self.app(scope, replay if body_events else receive, send)
+
+    async def _authenticate_user(
+        self, scope, method, path, token, receive, body_events
+    ):
+        try:
+            claims = await asyncio.to_thread(self.identity.verify, token)
+        except Forbidden as exc:
+            raise AgentKitError("认证无效或已过期", 401) from exc
+        # Trusted company identity can introduce an ordinary user, never an admin.
+        user = await self.services.users.sync_identity(
+            claims["sub"], claims.get("name") or claims["sub"]
+        )
+        scope.setdefault("state", {})["egis_user"] = user
+        if path.startswith("/manager/"):
+            return
+        if path == "/chat/" and method == "POST":
+            body = b""
+            while True:
+                event = await receive()
+                if event["type"] == "http.disconnect":
+                    raise AgentKitError("聊天请求已中断", 400)
+                body_events.append(event)
+                body += event.get("body", b"")
+                if len(body) > 2 * 1024 * 1024:
+                    raise AgentKitError("请求内容过大", 413)
+                if not event.get("more_body"):
+                    break
+            try:
+                data = json.loads(body)
+            except (ValueError, UnicodeError) as exc:
+                raise AgentKitError("无效聊天请求", 400) from exc
+            if not isinstance(data, dict):
+                raise AgentKitError("聊天请求必须是对象", 400)
+            await self.services.sessions.get_session_record(
+                user, data.get("session_id", ""), agent_id=data.get("agent_id", "")
+            )
+        elif path.startswith("/sessions/"):
+            parts = path.strip("/").split("/")
+            # Expose native streaming/history/status/interrupt only. Creation and
+            # configuration writes must go through managed definitions.
+            if len(parts) != 3 or parts[2] not in (
+                "stream",
+                "messages",
+                "status",
+                "interrupt",
+            ):
+                raise Forbidden("请通过任务管理接口操作会话")
+            if method != ("POST" if parts[2] == "interrupt" else "GET"):
+                raise Forbidden()
+            params = parse_qs(scope.get("query_string", b"").decode())
+            aid = params.get("agent_id", [""])[0]
+            if not aid:
+                raise Forbidden("缺少智能体标识")
+            await self.services.sessions.get_session_record(
+                user, parts[1], agent_id=aid
+            )
+        elif path.startswith("/hub/"):
+            # Native card detail selects registry "latest". Managed routes
+            # require the exact PG version and reviewed source digest.
+            raise Forbidden("请通过管理接口访问固定版本的资源")
+        else:
+            raise Forbidden("此原生接口未向企业工作台开放")
 
     @staticmethod
     async def _error(send, status, detail):

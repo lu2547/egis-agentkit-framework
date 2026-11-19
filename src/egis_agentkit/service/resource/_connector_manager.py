@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from egis_agentkit.client._mcp_config import mcp_config_checksum
 from egis_agentkit.core.mcp import MCPAuthorization
-from egis_agentkit.errors import InvalidRequest
+from egis_agentkit.errors import BadRequest, InvalidRequest
 from egis_agentkit.service._user import UserService, require_admin
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.storage.model import Asset
@@ -33,9 +33,16 @@ class ConnectorManager:
         require_admin(admin)
         if "resource_version" in data:
             raise InvalidRequest("MCP 配置只使用资源 ID")
-        config = MCPAuthorization.validate_config(data.get("config"))
         identifier = data.get("resource_id") or "mcp-" + uuid4().hex
-        validate_resource_id(identifier)
+        try:
+            validate_resource_id(identifier)
+        except ValueError as exc:
+            raise BadRequest("Invalid resource identifier") from exc
+        try:
+            config = MCPAuthorization.validate_config(data.get("config"))
+            checksum = mcp_config_checksum(config)
+        except ValueError as exc:
+            raise BadRequest("Invalid MCP connection configuration") from exc
         company = UserService(self.storage, self.policies).company_group()
 
         # 串行化同一个连接器的配置写入和启停操作。
@@ -62,7 +69,7 @@ class ConnectorManager:
                 ),
                 owner_type="system",
                 owner_id="system",
-                checksum_sha256=mcp_config_checksum(config),
+                checksum_sha256=checksum,
                 payload=payload,
             )
             if current:

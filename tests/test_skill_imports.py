@@ -107,7 +107,8 @@ async def test_import_claim_fencing_recovery_and_retry_without_duplicate_asset(
     await first.run_once()
     assert (await first.get(alice, job["job_id"]))["status"] == "succeeded"
     async with storage.engine.connect() as conn:
-        assert len((await conn.execute(select(t.assets))).all()) == 1
+        assert len((await conn.execute(select(t.skill_summary))).all()) == 1
+        assert len((await conn.execute(select(t.skill_detail))).all()) == 1
 
 
 @pytest.mark.asyncio
@@ -143,6 +144,114 @@ async def test_skill_edit_preserves_attachments_and_frontmatter_version(
     assert detail["payload"]["markdown"] == edited
     with pytest.raises(ValueError, match="version"):
         await resources.upload_skill(alice, bundle(), "9.9.9")
+
+
+@pytest.mark.asyncio
+async def test_import_uses_skill_initial_when_avatar_generation_is_unavailable(
+    storage, tmp_path
+):
+    from egis_agentkit.service.resource._skill_import import SkillImportService
+
+    _, _, alice, _ = await identities(storage)
+    resources = ResourceService(storage, tmp_path)
+    imports = SkillImportService(storage, resources)
+    job = await imports.enqueue(alice, io.BytesIO(bundle()), filename="demo.zip")
+    await imports.run_once()
+    done = await imports.get(alice, job["job_id"])
+    assert done["status"] == "succeeded"
+    skill = await resources.detail(alice, "skill", done["resource_id"], "1.2.3")
+    assert skill["display_name"] == "demo"
+    assert skill["payload"]["avatar"] == "auto"
+    assert not skill["payload"].get("has_generated_avatar")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("safe_drawing", [True, False])
+async def test_import_generates_permission_checked_svg_or_uses_initial(
+    storage, tmp_path, monkeypatch, safe_drawing
+):
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import httpx
+    from egis_agentkit_app.bootstrap._router import manager_router
+    from egis_agentkit_app.controller.base import current_user
+    from egis_agentkit_app.controller.base._exception import register_exception_handlers
+    from fastapi import FastAPI
+    from test_app_http import app_snapshot
+
+    from egis_agentkit.service._model import ModelService
+    from egis_agentkit.service.resource._skill_import import SkillImportService
+
+    drawing = {
+        "background": "#203E92",
+        "foreground": "#FFFFFF",
+        "paths": [
+            {
+                "d": "M12 30 L25 43 L51 18" if safe_drawing else 'M0 0"><script/>',
+                "style": "stroke",
+            }
+        ],
+    }
+    model = SimpleNamespace(
+        generate_structured_output=AsyncMock(
+            return_value=SimpleNamespace(content=drawing)
+        )
+    )
+    build = AsyncMock(return_value=model)
+    monkeypatch.setattr(ModelService, "build_chat_model", build)
+
+    _, _, alice, bob = await identities(storage)
+    config = SimpleNamespace(snapshot=app_snapshot(tmp_path))
+    resources = ResourceService(storage, tmp_path, config=config)
+    imports = SkillImportService(storage, resources)
+    app = FastAPI()
+    app.state.egis_services = SimpleNamespace(resources=resources, skill_imports=imports)
+    app.include_router(manager_router)
+    register_exception_handlers(app)
+    app.dependency_overrides[current_user] = lambda: alice
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/manager/skills/imports",
+            files={"file": ("avatar.zip", bundle(), "application/zip")},
+        )
+        assert response.status_code == 202
+        job = response.json()
+        await imports.run_once()
+        done = await imports.get(alice, job["job_id"])
+        assert done["status"] == "succeeded"
+        build.assert_awaited_once()
+        messages = model.generate_structured_output.await_args.kwargs["messages"]
+        assert json.loads(messages[-1].get_text_content()) == {
+            "name": "demo", "description": "Demo"
+        }
+        rid = done["resource_id"]
+        skill = await resources.detail(alice, "skill", rid, "1.2.3")
+        assert skill["payload"]["avatar"] == "auto"
+        assert bool(skill["payload"].get("has_generated_avatar")) is safe_drawing
+        assert "avatar_checksum" not in skill["payload"]
+        avatar_url = f"/manager/skills/{rid}/avatar?version=1.2.3"
+        avatar = await client.get(avatar_url)
+        if not safe_drawing:
+            assert avatar.status_code == 404
+            assert not list(tmp_path.rglob("*.svg"))
+            return
+        assert avatar.status_code == 200
+        assert avatar.headers["content-type"] == "image/svg+xml"
+        assert b'M12 30 L25 43 L51 18' in avatar.content
+        sidecar = tmp_path / "user" / alice.user_id / "skills" / rid / ".avatars" / "1.2.3.svg"
+        assert sidecar.read_bytes() == avatar.content
+        assert read_archive_files(await resources.download_skill(alice, rid, "1.2.3")) == (
+            read_archive_files(bundle())
+        )
+        app.dependency_overrides[current_user] = lambda: bob
+        assert (await client.get(avatar_url)).status_code == 403
+        app.dependency_overrides[current_user] = lambda: alice
+        sidecar.write_text("<svg><script/></svg>")
+        assert (await client.get(avatar_url)).status_code == 404
 
 
 @pytest.mark.asyncio
@@ -367,6 +476,7 @@ async def test_virtual_user_bearer_import_review_and_publication(storage, tmp_pa
         IdentityGuard,
     )
     from egis_agentkit.service.resource._skill_import import SkillImportService
+    from egis_agentkit.storage import tables as t
 
     _, admin, _, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
@@ -416,6 +526,17 @@ async def test_virtual_user_bearer_import_review_and_publication(storage, tmp_pa
         assert asset["owner_type"] == "system" and asset["owner_id"] == "system"
         assert asset["created_by"] == account["user_id"]
         assert asset["payload"]["uploader_type"] == "virtual"
+        async with storage.engine.connect() as conn:
+            summary = (await conn.execute(select(t.skill_summary))).mappings().one()
+            detail = (await conn.execute(select(t.skill_detail))).mappings().one()
+        assert summary["source_user_id"] == account["user_id"]
+        assert summary["owner_version"] == detail["version"] == 1
+        assert summary["shared_version"] is None
+        assert detail["import_job_id"] == job["job_id"]
+        assert detail["resource_version"] == "1.2.3"
+        assert (
+            tmp_path / "common" / "skills" / detail["skill_id"] / "1.2.3" / "SKILL.md"
+        ).is_file()
         assert not (queue.uploads.incoming / (job["job_id"] + ".zip")).exists()
         await queue.virtual_users.rotate(admin, account["user_id"])
         assert (await client.get("/manager/skills/imports")).status_code == 401
@@ -452,7 +573,8 @@ async def test_development_skill_reset_keeps_other_records(storage, tmp_path):
     (project / "source.md").write_text("keep")
     database = storage.engine.url.database
     preview = await reset_skills(storage.engine, tmp_path, uploads, database=database)
-    assert preview.tables["ak_resource_assets"] == "1 条"
+    assert preview.tables["ak_skill_summary"] == "1 条"
+    assert preview.tables["ak_skill_detail"] == "1 条"
     assert preview.tables["ak_agent_definition_detail"] == "1 条"
     assert (uploads / "old.zip").exists()
     assert await storage.assets.get("skill", skill["resource_id"], "1.2.3")

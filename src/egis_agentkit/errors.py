@@ -6,6 +6,13 @@ class AgentKitError(Exception):
         self.status_code = status_code
 
 
+class BadRequest(AgentKitError, ValueError):
+    """明确标记向调用方公开的 400 输入错误。"""
+
+    def __init__(self, message: str):
+        super().__init__(message, 400)
+
+
 class InvalidRequest(AgentKitError, ValueError):
     """输入不符合当前业务限制。"""
 

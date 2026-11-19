@@ -390,8 +390,12 @@ class EgisSandboxManager(WorkspaceManagerBase):
     async def _close_workspace_safely(workspace):
         try:
             await workspace.close_workspace()
-        except Exception as exc:
-            logger.warning("工作区连接关闭失败：%s", type(exc).__name__)
+        except Exception:
+            logger.warning(
+                "工作区连接关闭失败",
+                extra={"component": "EgisSandboxManager._close_workspace_safely"},
+                exc_info=True,
+            )
 
     async def _recycle_idle_workspaces(self):
         """先确认本地空闲，再在分布式实例锁内检查远端 Session，避免跨节点误暂停。"""
@@ -424,8 +428,15 @@ class EgisSandboxManager(WorkspaceManagerBase):
                         continue
                     self._cache.pop(identifier)
                     await self._close_workspace_safely(entry[0])
-            except Exception as exc:
-                logger.warning("工作区回收未完成：%s", type(exc).__name__)
+            except Exception:
+                logger.warning(
+                    "工作区回收未完成",
+                    extra={
+                        "component": "EgisSandboxManager._recycle_idle_workspaces",
+                        "context": {"runtime_binding_id": identifier},
+                    },
+                    exc_info=True,
+                )
 
     async def _recycle_loop(self):
         while True:
@@ -444,10 +455,12 @@ class EgisSandboxManager(WorkspaceManagerBase):
             "session_id": session_id,
             "runtime_binding_id": runtime_id,
         }
-        logger.info("workspace.preparing", extra={"context": context})
-        client = self._client_factory()
+        component = "EgisSandboxManager._build_workspace"
+        logger.info("workspace.preparing", extra={"component": component, "context": context})
+        client = None
         workspace = None
         try:
+            client = self._client_factory()
             workspace = EgisSandboxWorkspace(
                 user_id=user_id,
                 agent_id=agent_id,
@@ -475,6 +488,7 @@ class EgisSandboxManager(WorkspaceManagerBase):
             logger.info(
                 "workspace.ready",
                 extra={
+                    "component": component,
                     "context": {
                         **context,
                         "sandbox_id": workspace.sandbox_id,
@@ -484,24 +498,34 @@ class EgisSandboxManager(WorkspaceManagerBase):
             )
             return workspace
         except BaseException as exc:
-            logger.warning(
-                "workspace.prepare_failed",
-                extra={
-                    "context": {
-                        **context,
-                        "error_type": type(exc).__name__,
-                        "duration_ms": round((time.monotonic() - started) * 1000),
-                    }
-                },
-            )
-            if workspace is not None:
-                # 取消可能来自租约丢失；此时只释放句柄，禁止暂停新持有者的实例。
-                try:
+            if isinstance(exc, Exception):
+                logger.error(
+                    "workspace.prepare_failed",
+                    extra={
+                        "component": component,
+                        "context": {
+                            **context,
+                            "category": "system",
+                            "stage": getattr(exc, "stage", None),
+                            "reason": getattr(exc, "reason", None),
+                            "retryable": getattr(exc, "retryable", False),
+                            "duration_ms": round((time.monotonic() - started) * 1000),
+                        },
+                    },
+                    exc_info=True,
+                )
+            # 取消可能来自租约丢失；此时只释放句柄，禁止暂停新持有者的实例。
+            try:
+                if workspace is not None:
                     await workspace.disconnect_workspace()
-                except Exception:
-                    logger.warning("工作区本地连接释放失败")
-            else:
-                await client.close()
+                elif client is not None:
+                    await client.close()
+            except Exception:
+                logger.warning(
+                    "工作区本地连接释放失败",
+                    extra={"component": "EgisSandboxManager._build_workspace", "context": context},
+                    exc_info=True,
+                )
             raise
 
     async def close(self, workspace_id):

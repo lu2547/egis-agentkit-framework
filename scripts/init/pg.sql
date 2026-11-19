@@ -2,7 +2,7 @@
 
 -- 执行前选定目标数据库及 search_path；本文件不创建角色、数据库或 schema。
 
--- 范围：AgentScope 原生 6 表、AgentKit 企业 19 表、cluster 消息总线 5 表。
+-- 范围：AgentScope 原生 6 表、AgentKit 21 表、cluster 消息总线 5 表，共 32 表。
 
 -- 定义来源：storage/_schema.py、storage/model/_tables.py、storage/_remote_agent.py、storage/_message_bus.py。
 
@@ -313,6 +313,56 @@ CREATE UNIQUE INDEX uq_ak_asset_publication_revision ON ak_resource_assets (reso
 
 CREATE UNIQUE INDEX uq_ak_asset_shared_current ON ak_resource_assets (resource_type, resource_id) WHERE is_shared_current;
 
+-- Skill 按稳定 ID 保存归属和发布指针，包版本、摘要和文件清单落在明细。
+
+CREATE TABLE ak_skill_summary (
+    skill_id VARCHAR(128) NOT NULL,
+    owner_type VARCHAR(16) NOT NULL,
+    owner_id VARCHAR(128) NOT NULL,
+    source_user_id VARCHAR(128) NOT NULL,
+    is_enabled BOOLEAN DEFAULT true NOT NULL,
+    owner_version BIGINT NOT NULL,
+    shared_version BIGINT,
+    created_by VARCHAR(128) NOT NULL,
+    updated_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
+    PRIMARY KEY (skill_id),
+    CHECK (owner_type IN ('user','system')),
+    CHECK (owner_version > 0)
+);
+
+CREATE INDEX ix_ak_skill_owner ON ak_skill_summary (owner_type, owner_id, skill_id);
+
+CREATE TABLE ak_skill_detail (
+    skill_id VARCHAR(128) NOT NULL,
+    version BIGINT NOT NULL,
+    resource_version VARCHAR(128) NOT NULL,
+    checksum_sha256 VARCHAR(64) NOT NULL,
+    entrypoint TEXT,
+    is_enabled BOOLEAN DEFAULT true NOT NULL,
+    display_name TEXT,
+    description TEXT,
+    category TEXT,
+    avatar TEXT,
+    avatar_checksum VARCHAR(64),
+    files JSONB,
+    import_job_id VARCHAR(128),
+    payload JSONB NOT NULL,
+    created_by VARCHAR(128) NOT NULL,
+    updated_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
+    PRIMARY KEY (skill_id, version),
+    CHECK (version > 0),
+    UNIQUE (skill_id, resource_version),
+    FOREIGN KEY(skill_id) REFERENCES ak_skill_summary (skill_id) ON DELETE CASCADE
+);
+
+ALTER TABLE ak_skill_summary ADD CONSTRAINT fk_ak_skill_owner_version FOREIGN KEY(skill_id, owner_version) REFERENCES ak_skill_detail (skill_id, version) DEFERRABLE INITIALLY DEFERRED;
+
+ALTER TABLE ak_skill_summary ADD CONSTRAINT fk_ak_skill_shared_version FOREIGN KEY(skill_id, shared_version) REFERENCES ak_skill_detail (skill_id, version) DEFERRABLE INITIALLY DEFERRED;
+
 CREATE TABLE ak_resource_permission (
     id VARCHAR(64) NOT NULL,
     principal_type VARCHAR(16) NOT NULL,
@@ -351,6 +401,8 @@ CREATE INDEX ix_ak_resource_permission_resource_principal ON ak_resource_permiss
 CREATE INDEX ix_ak_resource_permission_root_grant_id ON ak_resource_permission (root_grant_id);
 
 CREATE UNIQUE INDEX uq_ak_resource_permission_origin ON ak_resource_permission (principal_type, principal_id, resource_type, resource_id, resource_view_type, resource_owner_type, resource_owner_id, grant_source_type, origin_key) WHERE revoked_at IS NULL;
+
+-- 导入和上架审批共用任务表；ZIP 暂存于 NAS，任务表保存完整性元数据。
 
 CREATE TABLE ak_skill_imports (
     job_id VARCHAR(64) NOT NULL,

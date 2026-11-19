@@ -14,12 +14,15 @@ from contextlib import suppress
 from hashlib import sha256
 from uuid import uuid4
 
+from egis_agentkit.client._logging import exception_origin
 from egis_agentkit.client.nacos._settings import (
     SkillImportConfig,
 )
 from egis_agentkit.core.skill._archive import read_archive_files
+from egis_agentkit.core.skill._avatar import AUTO_AVATAR
 from egis_agentkit.errors import (
     AgentKitError,
+    BadRequest,
     Conflict,
     Forbidden,
     InvalidRequest,
@@ -27,9 +30,11 @@ from egis_agentkit.errors import (
 )
 from egis_agentkit.service._user import UserService, require_admin
 from egis_agentkit.service._virtual_user import VirtualUserService
-from egis_agentkit.service.resource._catalog import catalog_icon_id
+from egis_agentkit.service.resource._catalog import normalize_skill_avatar
 from egis_agentkit.storage.project._files import ProjectFileStorage
 from egis_agentkit.storage.skill._upload import SkillUploadStorage
+
+from ._skill import decode_skill_markdown
 
 log = logging.getLogger(__name__)
 VALIDATION_PROGRESS = 10
@@ -103,7 +108,7 @@ class SkillImportService:
         *,
         filename,
         category="other",
-        avatar="book",
+        avatar=AUTO_AVATAR,
         owner_type="user",
         virtual=False,
         resource_id=None,
@@ -125,13 +130,13 @@ class SkillImportService:
         )
         category = str(category).strip() or "other"
         if len(category) > CATEGORY_MAX_LENGTH:
-            raise ValueError("Skill category exceeds limit")
-        avatar = catalog_icon_id(avatar, default="book")
+            raise BadRequest("Skill category exceeds limit")
+        avatar = normalize_skill_avatar(avatar)
         # 1. 有界读取上传包；归档格式和内容规则仍交给异步任务校验。
         maximum = self.resources.max_skill_archive_bytes
         content = await asyncio.to_thread(stream.read, maximum + 1)
         if len(content) > maximum:
-            raise ValueError("Skill archive exceeds upload limit")
+            raise BadRequest("Skill archive exceeds upload limit")
         # 2. NAS 文件完整可读后才能入队；其他 API 实例可从同一挂载目录恢复。
         job_id = uuid4().hex
         location = await asyncio.to_thread(self.uploads.write, job_id, content)
@@ -172,9 +177,12 @@ class SkillImportService:
         self._wake.set()
         return row
 
-    async def list_reviews(self, admin):
+    async def list_reviews(self, admin, *, page=None):
         require_admin(admin)
-        return await self.jobs.list_reviews(limit=self._settings().list_limit)
+        if page is None:
+            return await self.jobs.list_reviews(limit=self._settings().list_limit)
+        rows = await self.jobs.list_reviews(limit=page.fetch_limit, offset=page.offset)
+        return page.response(rows)
 
     async def download_review(self, admin, job_id):
         require_admin(admin)
@@ -208,6 +216,22 @@ class SkillImportService:
                     await self._remove_upload(job_id)
                 results.append({"id": job_id, "ok": True})
             except AgentKitError as exc:
+                system = exc.status_code >= 500
+                log.log(
+                    logging.ERROR if system else logging.WARNING,
+                    "Skill import review failed" if system else "Skill import review rejected",
+                    extra={
+                        "component": "SkillImportService.decide_batch",
+                        "context": {
+                            "job_id": job_id,
+                            "category": "system" if system else "business",
+                            "error_type": type(exc).__name__,
+                            "error_description": str(exc),
+                            "origin": exception_origin(exc),
+                        },
+                    },
+                    exc_info=exc if system else None,
+                )
                 results.append({"id": job_id, "ok": False, "detail": str(exc)})
         return results
 
@@ -222,7 +246,7 @@ class SkillImportService:
     def _validate_submission(self, archive):
         files = read_archive_files(archive, self.resources.archive_limits)
         return self.resources._skill_data(
-            files["SKILL.md"].decode("utf-8"), {}, require_version=True
+            decode_skill_markdown(files["SKILL.md"]), {}, require_version=True
         )
 
     async def claim(self, *, settings=None):
@@ -252,6 +276,11 @@ class SkillImportService:
 
     async def process(self, job, *, settings=None):
         settings = settings or self._settings()
+        context = {"job_id": job["job_id"], "attempt": job["attempts"]}
+        log.info(
+            "Skill import started",
+            extra={"component": "SkillImportService.process", "context": context},
+        )
         heartbeat = asyncio.create_task(
             self._heartbeat(job, asyncio.current_task(), settings)
         )
@@ -273,7 +302,7 @@ class SkillImportService:
             system_owned = job["owner_type"] == "system"
             if system_owned and not job["reviewed_by"]:
                 skill = await asyncio.to_thread(self._validate_submission, archive)
-                await self._update(
+                submitted = await self._update(
                     job,
                     status="pending_approval",
                     stage="pending_approval",
@@ -285,6 +314,11 @@ class SkillImportService:
                     },
                     lease_until=None,
                 )
+                if submitted:
+                    log.info(
+                        "Skill import is ready for approval",
+                        extra={"component": "SkillImportService.process", "context": context},
+                    )
                 return
             publisher = (
                 await self.users.get(job["reviewed_by"]) if system_owned else uploader
@@ -319,6 +353,10 @@ class SkillImportService:
             )
             if completed:
                 await self._remove_upload(job["job_id"])
+                log.info(
+                    "Skill import completed",
+                    extra={"component": "SkillImportService.process", "context": context},
+                )
         except asyncio.CancelledError:
             # Graceful shutdown releases our claim; SIGKILL recovers via expiry.
             await asyncio.shield(
@@ -326,21 +364,31 @@ class SkillImportService:
             )
             raise
         except Exception as exc:
-            retry = (
-                not isinstance(exc, (ValueError, Forbidden, Conflict, NotFound))
-                and job["attempts"] < settings.max_attempts
-            )
+            business = isinstance(exc, AgentKitError) and exc.status_code < 500
+            retry = not business and job["attempts"] < settings.max_attempts
             # Domain/validation messages are safe; raw provider failures may contain
             # connection strings or credentials and stay in operational logs only.
             message = (
                 str(exc)
-                if isinstance(exc, (ValueError, Forbidden, Conflict, NotFound))
+                if business
                 else "Skill registration failed; retrying"
                 if retry
                 else "Skill registration failed; please retry"
             )
-            log.warning(
-                "Skill import %s failed (%s)", job["job_id"], type(exc).__name__
+            details = {
+                **context,
+                "category": "business" if business else "system",
+                "error_type": type(exc).__name__,
+                "will_retry": retry,
+            }
+            if business:
+                details["origin"] = exception_origin(exc)
+                details["error_description"] = message
+            log.log(
+                logging.WARNING if business else logging.ERROR,
+                "Skill import rejected" if business else "Skill import failed",
+                extra={"component": "SkillImportService.process", "context": details},
+                exc_info=not business,
             )
             await self._update(
                 job,

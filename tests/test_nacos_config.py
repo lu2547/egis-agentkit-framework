@@ -399,3 +399,5 @@ def test_checked_in_agentkit_example_validates():
     settings = load_agentkit_config(example.read_text())
     assert settings.project.upload.max_bytes == 50 * 1024 * 1024
     assert settings.model.selection.default_key == "company"
+    for resource in (settings.agent, settings.skill, settings.connector, settings.tool):
+        assert resource.catalog.default_page_size == 10

@@ -4,6 +4,9 @@ import json
 import os
 from hashlib import sha256
 
+from agentscope.app._service._access import ResourceAccessService
+from agentscope.app._service._model import get_model
+from agentscope.app.access import DenyAllResourceAccessPolicy
 from agentscope.app.storage import ChatModelConfig
 from agentscope.credential import CredentialFactory
 
@@ -88,3 +91,9 @@ class ModelService:
             model_class=spec.model_class,
             parameters=spec.parameters,
         )
+
+    async def build_chat_model(self, user, model_key=None, *, snapshot=None):
+        """装配非会话任务使用的模型，复用原生凭证解析与模型工厂。"""
+        config = await self.resolve(user, model_key, snapshot=snapshot)
+        access = ResourceAccessService(self.storage, DenyAllResourceAccessPolicy())
+        return await get_model(user.user_id, config, access)

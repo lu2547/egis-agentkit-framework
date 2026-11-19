@@ -6,11 +6,14 @@
 - 保存共享申请及审批结果。
 """
 
-from sqlalchemy import and_, or_, select, text, update
+from collections.abc import Collection
+
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from egis_agentkit.client._postgres import PostgresTransaction, transaction_connection
+from egis_agentkit.errors import NotFound
 from egis_agentkit.storage import tables as t
 from egis_agentkit.storage.model import utcnow
 
@@ -37,13 +40,61 @@ class AccessStorage:
         conn = transaction_connection(self.engine, conn)
         await conn.execute(text("SELECT pg_advisory_xact_lock(727140202)"))
 
-    async def list_grants(self) -> list[dict]:
-        async with self.engine.connect() as conn:
-            rows = await conn.execute(
-                select(t.resource_permission).order_by(
-                    t.resource_permission.c.granted_at.desc(), t.resource_permission.c.id
+    async def list_grants(
+        self, *, offset: int = 0, limit: int | None = None
+    ) -> list[dict]:
+        table = t.resource_permission
+        statement = select(table).order_by(table.c.granted_at.desc(), table.c.id)
+        if limit is not None:
+            grants = statement.offset(offset).limit(limit).subquery()
+            parent = table.alias()
+            statement = (
+                select(
+                    grants,
+                    parent.c.resource_type.label("parent_resource_type"),
+                    parent.c.resource_id.label("parent_resource_id"),
+                    func.coalesce(t.users.c.username, t.groups.c.group_name).label(
+                        "principal_display_name"
+                    ),
                 )
+                .outerjoin(parent, grants.c.parent_grant_id == parent.c.id)
+                .outerjoin(
+                    t.users,
+                    and_(
+                        grants.c.principal_type == "user",
+                        grants.c.principal_id == t.users.c.user_id,
+                    ),
+                )
+                .outerjoin(
+                    t.groups,
+                    and_(
+                        grants.c.principal_type == "group",
+                        grants.c.principal_id == t.groups.c.group_id,
+                    ),
+                )
+                .order_by(grants.c.granted_at.desc(), grants.c.id)
             )
+        async with self.engine.connect() as conn:
+            rows = await conn.execute(statement)
+            return [dict(row) for row in rows.mappings()]
+
+    async def active_grants_for_resources(
+        self, kind: str, identifiers: Collection[str]
+    ) -> list[dict]:
+        if not identifiers:
+            return []
+        table = t.resource_permission
+        statement = (
+            select(table)
+            .where(
+                table.c.resource_type == kind,
+                table.c.resource_id.in_(identifiers),
+                table.c.revoked_at.is_(None),
+            )
+            .order_by(table.c.granted_at.desc(), table.c.id)
+        )
+        async with self.engine.connect() as conn:
+            rows = await conn.execute(statement)
             return [dict(row) for row in rows.mappings()]
 
     async def direct_grants(self, kind, identifier, *, include_revoked=False, conn=None):
@@ -68,6 +119,19 @@ class AccessStorage:
         if conn is None:
             async with self.engine.connect() as connection:
                 return await self.shared_version(kind, identifier, conn=connection)
+        if kind == "skill":
+            summary, detail = t.skill_summary, t.skill_detail
+            return await conn.scalar(
+                select(detail.c.resource_version)
+                .join(
+                    summary,
+                    and_(
+                        detail.c.skill_id == summary.c.skill_id,
+                        detail.c.version == summary.c.shared_version,
+                    ),
+                )
+                .where(summary.c.skill_id == identifier)
+            )
         table = self._get_definition_table(kind)
         if table is not None:
             version = await conn.scalar(
@@ -93,7 +157,9 @@ class AccessStorage:
         """切换共享配置，同时结束其他发布版本的当前审核状态。"""
         conn = transaction_connection(self.engine, conn)
         table = self._get_definition_table(kind)
-        if table is not None:
+        if kind == "skill":
+            await self._set_shared_skill_version(identifier, version, conn=conn)
+        elif table is not None:
             await conn.execute(
                 update(table)
                 .where(table.c.id == identifier)
@@ -134,6 +200,23 @@ class AccessStorage:
                 )
                 .values(review_status_type="cancelled")
             )
+
+    @staticmethod
+    async def _set_shared_skill_version(identifier, version, *, conn):
+        """按包版本定位技能明细，只更新共享指针。"""
+        summary, detail = t.skill_summary, t.skill_detail
+        statement = update(summary).where(summary.c.skill_id == identifier)
+        if version is None:
+            await conn.execute(statement.values(shared_version=None))
+            return
+        result = await conn.execute(
+            statement.where(
+                detail.c.skill_id == summary.c.skill_id,
+                detail.c.resource_version == version,
+            ).values(shared_version=detail.c.version)
+        )
+        if not result.rowcount:
+            raise NotFound("技能版本不存在")
 
     async def has_pending_update(self, kind, identifier, *, conn=None):
         if conn is None:
@@ -344,6 +427,20 @@ class AccessStorage:
                 .values(is_current=False)
             )
 
+    async def cancel_pending_reviews(self, kind, identifier, *, conn=None):
+        """资源删除后结束该资源的全部待审核申请。"""
+        conn = transaction_connection(self.engine, conn)
+        reviews = t.approvals
+        await conn.execute(
+            update(reviews)
+            .where(
+                reviews.c.resource_type == kind,
+                reviews.c.resource_id == identifier,
+                reviews.c.review_status_type == "pending",
+            )
+            .values(review_status_type="cancelled")
+        )
+
     async def get_approved_review(
         self,
         resource_id: str,
@@ -393,10 +490,16 @@ class AccessStorage:
         )
         return dict(result.mappings().one())
 
-    async def list_reviews(self, *, owner_id: str | None = None) -> list[dict]:
+    async def list_reviews(
+        self, *, owner_id: str | None = None, offset: int = 0, limit: int | None = None
+    ) -> list[dict]:
         statement = select(t.approvals).order_by(t.approvals.c.submitted_at.desc())
         if owner_id is not None:
             statement = statement.where(t.approvals.c.owner_id == owner_id)
+        if limit is not None:
+            statement = (
+                statement.order_by(t.approvals.c.review_id).offset(offset).limit(limit)
+            )
         async with self.engine.connect() as conn:
             rows = await conn.execute(statement)
             return [dict(row) for row in rows.mappings()]

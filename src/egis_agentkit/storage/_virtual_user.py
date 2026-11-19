@@ -15,11 +15,13 @@ class VirtualUserStorage:
             row = (await conn.execute(statement)).mappings().one_or_none()
             return dict(row) if row is not None else None
 
-    async def list(self):
+    async def list(self, *, offset: int = 0, limit: int | None = None):
         table = t.virtual_users
         statement = select(
             table.c.user_id, table.c.username, table.c.is_enabled
         ).order_by(table.c.username, table.c.user_id)
+        if limit is not None:
+            statement = statement.offset(offset).limit(limit)
         async with self.engine.connect() as conn:
             return [dict(row) for row in (await conn.execute(statement)).mappings()]
 

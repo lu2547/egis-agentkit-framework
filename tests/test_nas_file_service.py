@@ -10,6 +10,7 @@ import uvicorn
 import yaml
 
 from egis_agentkit.client.nacos import load_agentkit_config
+from egis_agentkit.client.nas_files import decode_wire, encode_wire
 from egis_agentkit.core.skill._archive import calculate_files_digest
 from egis_agentkit.errors import UploadNameConflict
 from egis_agentkit.storage._files import FileStorage
@@ -76,6 +77,25 @@ async def test_rejects_unlisted_storage_helper(client):
     )
 
     assert response.status_code == 404
+
+
+async def test_skill_avatar_round_trips_through_nas(client, tmp_path):
+    asset = {
+        "resource_id": "meeting",
+        "resource_version": "1.0.0",
+        "owner_type": "user",
+        "owner_id": "alice",
+    }
+    content = b'<svg xmlns="http://www.w3.org/2000/svg"/>'
+    write = await client.post(
+        "/v1/nas/skill_version/write_avatar",
+        json=encode_wire({"asset": asset, "content": content}),
+    )
+    assert write.status_code == 200
+    read = await client.post("/v1/nas/skill_version/read_avatar", json={"asset": asset})
+    assert read.status_code == 200
+    assert decode_wire(read.json()) == content
+    assert (tmp_path / "user/alice/skills/meeting/.avatars/1.0.0.svg").read_bytes() == content
 
 
 async def test_only_preferences_can_be_accessed_as_user_texts(client, tmp_path):

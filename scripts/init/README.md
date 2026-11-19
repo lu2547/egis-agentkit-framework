@@ -7,7 +7,7 @@
 | 文件 | 执行内容 |
 | --- | --- |
 | [nas.sh](nas.sh) | 检查 NAS 已挂载，创建用户根目录、系统技能目录和技能上传暂存目录，验证文件写入、读回 |
-| [pg.sql](pg.sql) | 在空的目标 schema 中创建 29 张表及约束、索引，包括 Session 项目生成列 |
+| [pg.sql](pg.sql) | 在空的目标 schema 中创建 32 张表及约束、索引，包括 Session 项目生成列 |
 | [kafka.sh](kafka.sh) | 创建 `<前缀>.triggers`、`<前缀>.broadcast`，核对分区数和副本数 |
 | [redis.sh](redis.sh) | 验证地址、认证、TLS 和逻辑库；当前框架没有需要预置的 Redis 业务 Key |
 | [nacos.py](nacos.py) | 校验并首次发布 `agentkit.yaml`，然后读回核对 |
@@ -58,9 +58,15 @@ bash scripts/init/nas.sh
 psql -X -v ON_ERROR_STOP=1 -f scripts/init/pg.sql
 ```
 
-连接参数来自标准 `PGHOST/PGPORT/PGDATABASE/PGUSER` 及平台认证设置。SQL 为当前企业 cluster 形态：原生 6 表、AgentKit 18 表、PG 消息总线 5 表，共 29 表；包含当前模型的约束、索引与 `sessions.project_id` 生成列。
+连接参数来自标准 `PGHOST/PGPORT/PGDATABASE/PGUSER` 及平台认证设置。SQL 为当前企业 cluster 形态：原生 6 表、AgentKit 21 表、PG 消息总线 5 表，共 32 表；包含当前模型的约束、索引与 `sessions.project_id` 生成列。
 
 本文件只用于首次空 schema：`BEGIN/COMMIT` 保证整批执行，同名表已存在会报错并回滚，不覆盖、不删除原数据。它不创建数据库或角色，不插入默认用户和示例资源；平台默认工具由应用启动流程登记。
+
+已有部署先停止旧版本服务，再通过 App 的 `upgrade-db --database <目标库>` 预览，追加 `--apply` 执行。技能升级会在同一事务内迁移已有版本和共享指针，保留语义版本、授权和 NAS 路径。更早版本的授权结构会先升级；无法确认发布顺序或归属时，升级回滚并保留原记录。
+
+`ak_skill_summary` 保存技能归属、首次上传人和 `owner_version`、`shared_version`。两列引用 `ak_skill_detail` 的数字发布序号；明细里的 `resource_version` 保存技能包版本，用于定位 NAS 文件。经审批发布的系统技能（含虚拟用户提交）存入 `NAS_ROOT/common/skills/<skill_id>/<resource_version>/`，个人技能存入 `NAS_ROOT/user/<user_id>/skills/<skill_id>/<resource_version>/`。
+
+完整表清单见 [数据库表清单](../../../egis-agentkit-app/docs/数据库表清单.md)。外部系统上传接口见 [Skill 接入指南](../../../egis-agentkit-app/docs/Skill接入指南.md)。
 
 ## 4 Kafka
 
@@ -115,7 +121,8 @@ python scripts/init/nacos.py --file "$HOME/.config/agentkit/agentkit.yaml"
 | `workspace.runtime.mode` | 固定为 `pks` |
 | `workspace.runtime.sandbox` | 沙箱服务地址、镜像、凭据引用及执行参数；公司 Client 由接入方注入 |
 | `client.postgres.connection` | PostgreSQL 的 mode、host、port、database、username、TLS 和取密配置，见下节 |
-| `logging.level/format/accessLog` | Framework 控制台日志与 HTTP 访问日志，默认 INFO、JSON、开启访问日志 |
+| `logging.level/format/directory/accessLog` | 应用日志级别、格式、文件目录和 HTTP 访问日志开关。默认 INFO、JSON、仅 stdout、开启访问日志 |
+| `logging.textPattern/textDateFormat` | 文本日志的单行模板和 UTC 日期格式，使用 `format: text` 时生效 |
 | `client.tracing` | Phoenix OTLP HTTP 端点、项目、采样及导出限制；需要时设 enabled 为 true |
 | `client.kafka.connection.deploymentMode` | 企业跨进程运行设为 `cluster` |
 | `client.kafka.connection.bootstrapServers/topicPrefix` | Kafka 地址、`KAFKA_TOPIC_PREFIX` |
@@ -127,11 +134,11 @@ python scripts/init/nacos.py --file "$HOME/.config/agentkit/agentkit.yaml"
 
 数据库普通连接参数、取密、日志与 Tracing 配置变更需要重启应用。模型及沙箱等其他凭据仍通过其配置项引用部署环境变量。地址只填 Nacos origin，不带 `/nacos` 路径。脚本直接读取环境变量中的 `NACOS_SERVER_URL/NACOS_NAMESPACE_ID/NACOS_GROUP`；Data ID 固定为 `agentkit.yaml`，默认 Group 为 `EGIS_AGENTKIT`。
 
-Phoenix 自建部署可使用 `http://phoenix.company.internal:6006/v1/traces`；这是 API 进程可访问的 OTLP HTTP 地址，不能只填 UI 根地址，也不要填容器内部才可达的主机名。打开 `agentkit.client.tracing.enabled` 后，Framework 管理导出生命周期，原生 TracingMiddleware 记录回复、模型及工具调用。`headers` 可填写平台要求的鉴权头，按密码同样保护；开发 Phoenix 未开启认证可保持空对象。日志只输出关键节点、耗时、标识和安全错误类型，不输出提示词、工具参数及密码。Framework/App 日志与原生 AgentScope Loguru、Uvicorn 日志分别由各自组件输出。
+Phoenix 自建部署可使用 `http://phoenix.company.internal:6006/v1/traces`；这是 API 进程可访问的 OTLP HTTP 地址，不能只填 UI 根地址，也不要填容器内部才可达的主机名。打开 `agentkit.client.tracing.enabled` 后，Framework 管理导出生命周期，原生 TracingMiddleware 记录回复、模型及工具调用。`headers` 可填写平台要求的鉴权头，按密码同样保护；开发 Phoenix 未开启认证可保持空对象。
 
 运行主项目 `projectName` 默认 `egis-agentkit`：会话运行根关联 session/user/project/agent 标识，包含锁等待、会话及项目准备、沙箱创建/接入、网关、资源和工具装配、原生 Agent/模型/工具、记忆作业、产物汇总、状态保存等实际阶段。以 `session.id` 查询同一会话；根上的 Link 可关联触发它的 HTTP 请求。`httpProjectName` 默认 `egis-agentkit-http`，普通 API 和 FastAPI 内部 Span 放入这个独立项目；设为 null 则不导出这些 HTTP Span。已有历史 Trace 不移动。标准 OTLP 在 Span 结束后导出，尚未结束的父阶段不会提前伪造成已完成；排查执行中状态可结合结构化日志和已完成子阶段。
 
-Framework 本身输出到标准输出，不自行指定日志文件或轮转。企业平台应采集进程/容器 stdout；本机开发启动若用 shell 重定向，其路径由启动命令决定，`/tmp/agentkit-observability-api.log` 仅是当前开发进程的宿主临时文件，不在沙箱中。
+App CLI 统一配置 Framework、App、AgentScope 和 Uvicorn 的日志。日志记录关键节点、耗时、标识和安全的错误描述。Nacos 的 `agentkit.logging.directory` 可设为服务进程可写的绝对路径，例如 `/var/log/agentkit`。运行在容器内时，路径以应用容器为准，可挂载日志卷持久化。服务启动时创建目录，并用 UTF-8 追加写入 `agentkit-<主机名>-<PID>.log`。设置为 `null` 时仅输出 stdout。
 
 需要经 Nacos 3 console 发布时另设 `NACOS_CONSOLE_URL`；读取配置使用 server 接口，发布权限单独按平台认证方式提供。脚本不创建 namespace，不执行用户名密码登录或自动续 token。
 

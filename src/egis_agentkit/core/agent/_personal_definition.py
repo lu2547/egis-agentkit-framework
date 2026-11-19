@@ -2,7 +2,7 @@
 
 核心能力
 - build_definition 生成稳定的个人助理身份与初始配置。
-- build_agent 将 Service 提供的个人偏好装配到原生提示中。
+- build_agent 使用 Service 提供的个人偏好生成原生提示词。
 - 文档读写及资源开关管理留在 Service。
 """
 
@@ -36,7 +36,7 @@ class PersonalDefinition(AgentDefinitionBase[User]):
         record: AgentRecord | None = None,
         preferences: dict[str, str] | None = None,
     ) -> AgentRecord:
-        """复用原生装配，将本轮读取的三份个人偏好加入提示词。"""
+        """复用原生装配，使用本轮读取的个人文档生成提示词。"""
         record = AgentDefinitionBase.build_agent(
             user_id,
             definition,
@@ -45,12 +45,9 @@ class PersonalDefinition(AgentDefinitionBase[User]):
             record_id=record_id,
             record=record,
         )
-        if preferences:
-            content = "\n\n".join(preferences.values())
-            if content:
-                record.data.system_prompt = "\n\n".join(
-                    (record.data.system_prompt, content)
-                )
+        record.data.system_prompt = "\n\n".join(
+            document for document in (preferences or {}).values() if document
+        )
         return record
 
     def build_definition(
@@ -63,5 +60,5 @@ class PersonalDefinition(AgentDefinitionBase[User]):
             agent_type=self.agent_type,
             agent_name="personal",
             agent_display_name="个人助理",
-            payload={"description": "你的工作助理", "avatar": "spark"},
+            payload={"description": "你的工作助理", "avatar": "spark", "system_prompt": ""},
         )

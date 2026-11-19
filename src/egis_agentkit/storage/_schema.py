@@ -21,12 +21,13 @@ from .migration._project import (
     migrate_session_workspaces,
 )
 from .migration._sequences import repair_sequences
+from .migration._skills import migrate_skills
 from .migration._table_names import RENAMES as TABLE_RENAMES
 from .migration._table_names import migrate_table_names
 from .migration._team import RENAMES as TEAM_RENAMES
 from .migration._team import migrate_team_storage, team_tables
 from .migration._workspace_changes import migrate_workspace_changes
-from .model._tables import metadata
+from .model._tables import assets, metadata
 
 SCHEMA_LOCK = 727140201
 NATIVE_TABLES = (
@@ -119,6 +120,8 @@ async def init_schema(engine):
                     "工作区变更表缺少会话归属字段或索引，请先执行 upgrade-db"
                 )
         await connection.run_sync(native.create_all, tables=required)
+        if assets.name in existing:
+            await migrate_skills(connection, schema, apply=True)
         await connection.run_sync(metadata.create_all)
         await _create_session_project_index(connection, schema)
 
@@ -236,6 +239,9 @@ async def upgrade_schema(
         states["Agent 类型"] = await _agent_upgrade_state(connection, schema)
         states["Session 绑定"] = await _session_upgrade_state(connection, schema)
         states["授权和共享版本"] = await check_access_upgrade(connection, schema)
+        states["技能版本指针"] = await migrate_skills(
+            connection, schema, access_pending=states["授权和共享版本"] == "pending"
+        )
         states["MCP 历史配置"] = await migrate_connectors(connection, schema)
         states[LEGACY_PROJECT_SESSIONS] = (
             await _check_legacy_project_links(
@@ -269,6 +275,7 @@ async def upgrade_schema(
             if states["授权和共享版本"] == "pending":
                 await upgrade_access_tables(connection, schema)
                 states["授权和共享版本"] = "upgraded"
+            states["技能版本指针"] = await migrate_skills(connection, schema, apply=True)
             states["Agent 存储结构"] = await migrate_agent_storage(
                 connection, schema, apply=True
             )

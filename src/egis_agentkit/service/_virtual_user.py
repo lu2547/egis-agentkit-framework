@@ -9,6 +9,7 @@ from uuid import uuid4
 from egis_agentkit.errors import Forbidden, InvalidRequest, NotFound
 from egis_agentkit.storage.model import User
 
+from ._admin_page import AdminPage
 from ._user import VIRTUAL_USER_PREFIX, require_admin
 
 VIRTUAL_TOKEN_PREFIX = "ak-skill."
@@ -61,6 +62,11 @@ class VirtualUserService:
     async def list(self, admin):
         require_admin(admin)
         return await self.storage.list()
+
+    async def list_page(self, admin: User, page: AdminPage) -> dict:
+        require_admin(admin)
+        rows = await self.storage.list(offset=page.offset, limit=page.fetch_limit)
+        return page.response(rows)
 
     async def set_enabled(self, admin, user_id, enabled):
         require_admin(admin)

@@ -13,12 +13,13 @@ from egis_agentkit.core.skill._archive import (
     calculate_archive_digest,
     read_archive_files,
 )
-from egis_agentkit.errors import Conflict, Forbidden
+from egis_agentkit.errors import Conflict, Forbidden, NotFound
 from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.storage import tables as t
-from egis_agentkit.storage.model import Asset, Grant, ResourceRef
+from egis_agentkit.storage.model import Asset, Grant, ResourceRef, ShareTarget
 
 
 def archive(name="report", extra="references/checklist.md"):
@@ -30,6 +31,67 @@ def archive(name="report", extra="references/checklist.md"):
         )
         z.writestr(name + "/" + extra, "Actual attached content")
     return out.getvalue()
+
+
+async def test_owner_deletes_skill_and_revokes_access_to_all_versions(storage, tmp_path):
+    import httpx
+    from egis_agentkit_app.bootstrap._router import manager_router
+    from egis_agentkit_app.controller.base import current_user
+    from egis_agentkit_app.controller.base._exception import register_exception_handlers
+    from fastapi import FastAPI
+
+    _, admin, alice, bob = await identities(storage)
+    resources = ResourceService(storage, tmp_path)
+    shares = ShareService(storage)
+    skill = await resources.save_skill(alice, {
+        "resource_id": "daily-report",
+        "markdown": "# Daily report",
+    })
+    rid, version = skill["resource_id"], skill["resource_version"]
+    approved = await shares.submit(
+        alice, "skill", rid, target=ShareTarget(principal_type="user", principal_id="bob")
+    )
+    await shares.decide(admin, approved["review_id"], True, "")
+    pending = await shares.submit(
+        alice, "skill", rid, target=ShareTarget(principal_type="group", principal_id="company")
+    )
+    await resources.install(bob, "skill", rid)
+    await resources.save_skill(alice, {
+        "resource_id": rid, "base_version": version, "resource_version": "1.1.0",
+        "markdown": "# Daily report v2",
+    })
+    app = FastAPI()
+    app.state.egis_services = SimpleNamespace(resources=resources)
+    app.include_router(manager_router)
+    register_exception_handlers(app)
+    url = f"/manager/skills/{rid}"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        app.dependency_overrides[current_user] = lambda: bob
+        assert (await client.delete(url)).status_code == 403
+        app.dependency_overrides[current_user] = lambda: alice
+        assert (await client.delete(url)).status_code == 204
+        assert (await client.delete(url)).status_code == 404
+    assert not await resources.list(alice, "skill")
+    assert not await resources.list(bob, "skill")
+    assert not await resources.personal.list_resources(bob, "skill")
+    with pytest.raises(NotFound):
+        await resources.detail(alice, "skill", rid, version)
+    with pytest.raises(Conflict):
+        await resources.save_skill(alice, {"resource_id": rid, "markdown": "# Reuse"})
+    assert all(
+        row["revoked_at"] is not None for row in await GrantService(storage).list_grants(admin)
+        if row["resource_id"] == rid
+    )
+    assert next(row for row in await shares.list(alice) if row["review_id"] == pending["review_id"])[
+        "review_status_type"
+    ] == "cancelled"
+    async with storage.engine.connect() as conn:
+        assert len((await conn.execute(
+            select(t.skill_detail.c.version).where(t.skill_detail.c.skill_id == rid)
+        )).all()) == 2
+    assert (tmp_path / "user" / "alice" / "skills" / rid / version / "SKILL.md").exists()
 
 
 async def put_asset(
@@ -68,11 +130,7 @@ async def put_asset(
     if checksum is not None:
         asset = asset.model_copy(update={"checksum_sha256": checksum})
     async with storage.transaction() as conn:
-        await conn.execute(
-            t.assets.insert().values(
-                **asset.model_dump(), created_by="test", updated_by="test"
-            )
-        )
+        await storage.assets.insert_asset(asset, actor="test", conn=conn)
     return asset
 
 
@@ -105,6 +163,18 @@ async def test_system_skill_catalog_and_install_require_exact_version_grant(
     (system_skill,) = await resources.list(alice, "skill")
     assert system_skill["is_usable"]
     assert system_skill["owner_display_name"] == "系统"
+    (descriptor,) = await resources.skill_descriptors(
+        alice,
+        [
+            {
+                "resource_type": "skill",
+                "resource_id": "report",
+                "resource_version": "1.0.0",
+                "resource_view_type": "system",
+            }
+        ],
+    )
+    assert system_skill["runtime_name"] == descriptor.name
     installed = await resources.install(alice, "skill", "report")
     assert installed["is_installed"] and installed["is_enabled"]
     assert (await resources.personal.list_resources(alice, "skill"))["report"][
@@ -150,7 +220,9 @@ async def test_own_private_publish_immutable_concurrent_save_and_other_owner_den
         row = (
             (
                 await conn.execute(
-                    select(t.assets).where(t.assets.c.resource_id == "own-report")
+                    select(t.skill_detail).where(
+                        t.skill_detail.c.skill_id == "own-report"
+                    )
                 )
             )
             .mappings()
@@ -267,11 +339,13 @@ async def test_shared_resource_uses_only_approved_asset_version(storage, tmp_pat
     )
     # An existing version with the former display flag remains governed by grants.
     async with storage.engine.begin() as conn:
-        asset = await storage.assets.get("skill", "shared-report", "1.0.0", conn=conn)
+        detail = t.skill_detail
+        entry = (detail.c.skill_id == "shared-report", detail.c.version == 1)
+        payload = await conn.scalar(select(detail.c.payload).where(*entry))
         await conn.execute(
-            t.assets.update()
-            .where(t.assets.c.resource_id == "shared-report")
-            .values(payload={**asset["payload"], "is_skill_market_visible": False})
+            detail.update()
+            .where(*entry)
+            .values(payload={**payload, "is_skill_market_visible": False})
         )
     (owned,) = await resources.list(alice, "skill")
     assert owned["resource_id"] == "shared-report"

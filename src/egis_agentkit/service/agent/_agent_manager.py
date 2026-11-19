@@ -11,13 +11,14 @@ from __future__ import annotations
 import base64
 import json
 from datetime import datetime
+from hashlib import sha256
 from typing import Any, Literal, Sequence
 
 from egis_agentkit.client.nacos import NacosConfigProvider
 from egis_agentkit.client.nacos._config import LivePolicies
 from egis_agentkit.client.nacos._settings import (
     AccessConfig,
-    AgentCatalogConfig,
+    CatalogPaginationConfig,
     RemoteConfig,
 )
 from egis_agentkit.client.remote_agent._base import build_connection_config
@@ -266,11 +267,14 @@ class AgentManager:
         cursor: str | None = None,
         limit: int | None = None,
         query: str = "",
+        catalog: bool = False,
+        category: str = "",
+        mine: bool = False,
     ) -> dict[str, Any]:
         """返回当前可见的定义和下一页游标。"""
         configuration = self.config.snapshot if self.config else None
         pagination = (
-            configuration.agent.catalog if configuration else AgentCatalogConfig()
+            configuration.agent.catalog if configuration else CatalogPaginationConfig()
         )
         limit = pagination.default_page_size if limit is None else limit
         # 校验筛选条件和游标范围，再映射到数据库中的 Agent 类型。
@@ -282,10 +286,17 @@ class AgentManager:
             )
         if len(query) > pagination.max_query_length:
             raise InvalidRequest(f"专家查询最多 {pagination.max_query_length} 个字符")
+        if len(category) > pagination.max_query_length:
+            raise InvalidRequest(f"专家分类最多 {pagination.max_query_length} 个字符")
+        if "\0" in query or "\0" in category:
+            raise InvalidRequest("无效的目录筛选")
         if cursor is not None and len(cursor) > pagination.max_cursor_length:
             raise InvalidRequest(f"专家游标最多 {pagination.max_cursor_length} 个字符")
         query = query.strip().casefold()
         scope = [user.user_id, sorted(set(types)), query]
+        if catalog or category or mine:
+            filters = json.dumps([*scope, catalog, category, mine]).encode()
+            scope = [sha256(filters).hexdigest()]
         after = self._decode_cursor(cursor, scope) if cursor is not None else None
         from egis_agentkit.service._user import UserService
 
@@ -296,17 +307,31 @@ class AgentManager:
             after=after,
             limit=limit + 1,
             query=query,
+            category=category,
+            owner_only=mine,
             policies=configuration.access
             if configuration
             else self.permissions.policies,
         )
         items = rows[:limit]
-        cursor = (
+        next_cursor = (
             self._encode_cursor(scope, (items[-1]["created_at"], items[-1]["id"]))
             if len(rows) > limit
             else None
         )
-        return {"items": items, "next_cursor": cursor}
+        result: dict[str, Any] = {"items": items, "next_cursor": next_cursor}
+        if catalog and cursor is None:
+            result["categories"] = await self.repository.list_visible_categories(user, types)
+        return result
+
+    async def page_remote_definitions(self, user: User, page) -> dict[str, Any]:
+        """分页查询管理员可维护的第三方专家，只返回管理摘要。"""
+        require_admin(user)
+        rows = await self.repository.page_visible_definitions(
+            user, ("remote",), after=None, limit=page.fetch_limit,
+            offset=page.offset, editable_only=True, policies=self.permissions.policies,
+        )
+        return page.response(rows)
 
     @staticmethod
     def _encode_cursor(

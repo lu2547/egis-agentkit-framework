@@ -197,10 +197,10 @@ class EgisMessageBus(MessageBus):
                 try:
                     async with asyncio.timeout(5):
                         await self._pg.release(key, token)
-                except Exception as exc:
-                    logger.error(
-                        "Bus lease release failed; lease will expire (%s)",
-                        type(exc).__name__,
+                except Exception:
+                    logger.exception(
+                        "Bus lease release failed; lease will expire",
+                        extra={"component": "EgisMessageBus.aclose"},
                     )
         self._claims.clear()
 
@@ -311,6 +311,10 @@ class EgisMessageBus(MessageBus):
             except asyncio.CancelledError:
                 raise
             except Exception:
+                logger.exception(
+                    "Bus lease renewal failed; cancelling the protected task",
+                    extra={"component": "EgisMessageBus.acquire_lock"},
+                )
                 lost.set()
                 owner.cancel()
 
@@ -337,10 +341,10 @@ class EgisMessageBus(MessageBus):
             try:
                 async with asyncio.timeout(min(5, ttl_secs / 3)):
                     await self._pg.release(key, token)
-            except Exception as exc:
-                logger.error(
-                    "Bus lease release failed; lease will expire (%s)",
-                    type(exc).__name__,
+            except Exception:
+                logger.exception(
+                    "Bus lease release failed; lease will expire",
+                    extra={"component": "EgisMessageBus.acquire_lock"},
                 )
 
     async def registry_set(self, namespace, field, value, *, ttl_secs=None):

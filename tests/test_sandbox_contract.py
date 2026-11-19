@@ -142,16 +142,19 @@ async def test_different_bindings_do_not_hold_a_global_lock_across_provision(
 
 
 @pytest.mark.asyncio
-async def test_pks_injected_client_needs_no_opensandbox_credentials(
-    storage, tmp_path, native_gateway
+async def test_app_pks_injected_client_needs_no_opensandbox(
+    storage, tmp_path, native_gateway, monkeypatch
 ):
     import sys
 
+    from egis_agentkit_app.bootstrap import build_app
     from test_app_http import Config, app_snapshot
 
-    from egis_agentkit.bootstrap import init_agentkit
+    from egis_agentkit.client.nacos import NacosBootstrap, NacosClient
     from egis_agentkit.client.nacos._settings import WorkspaceProbeConfig
 
+    monkeypatch.setitem(sys.modules, "egis_agentkit.client.sandbox._opensandbox", None)
+    monkeypatch.setenv("TEST_DOWNLOAD", "download-secret-with-more-than-thirty-two-bytes")
     config = Config(
         app_snapshot(
             tmp_path,
@@ -170,18 +173,20 @@ async def test_pks_injected_client_needs_no_opensandbox_credentials(
             },
         )
     )
-    kit = init_agentkit(
-        config,
-        None,
-        engine=storage.engine,
-        owns_client=False,
-        sandbox_client_factory=TestSandboxClient,
-    )
-    async with kit.workspace:
-        workspace = await kit.workspace.get_workspace(
-            "alice", "agent", "session", project_id="project"
+    async with NacosClient(NacosBootstrap(server_url="http://unused.test")) as nacos:
+        app = await build_app(
+            config,
+            nacos,
+            engine=storage.engine,
+            owns_client=False,
+            sandbox_client_factory=TestSandboxClient,
         )
-        assert workspace.sandbox_id.startswith("instance-")
+        manager = app.state.egis_kit.workspace
+        async with manager:
+            workspace = await manager.get_workspace(
+                "alice", "agent", "session", project_id="project"
+            )
+            assert workspace.sandbox_id.startswith("instance-")
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 """Shared publication moves once for every stable recipient grant."""
 
 import pytest
+from sqlalchemy import select
 from test_domain import COMPANY, agent_changes, expert, identities
 
 from egis_agentkit.errors import Conflict, Forbidden
@@ -8,6 +9,8 @@ from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.service.agent._agent_manager import AgentManager
+from egis_agentkit.service.resource._catalog import ResourceService
+from egis_agentkit.storage import tables as t
 from egis_agentkit.storage.model import Grant
 
 
@@ -195,3 +198,74 @@ async def test_revoking_last_recipient_cancels_pending_update(storage):
         bob, "agent", value.id, "shared"
     )
     assert decision.resource_version == third["resource_version"]
+
+
+@pytest.mark.asyncio
+async def test_skill_publication_advances_owner_and_shared_versions_independently(
+    storage, tmp_path
+):
+    _, admin, alice, bob = await identities(storage)
+    resources = ResourceService(storage, tmp_path)
+    shares, grants = ShareService(storage), GrantService(storage)
+    skill_id = "quarterly-report"
+    first, second, third = "3.2.0", "4.1.0", "4.2.0"
+
+    async def publish(version, base=None):
+        return await resources.save_skill(
+            alice,
+            {
+                "resource_id": skill_id,
+                "resource_version": version,
+                "base_version": base,
+                "markdown": f"# Report {version}",
+            },
+        )
+
+    await publish(first)
+    initial = await shares.submit(alice, "skill", skill_id, target=COMPANY)
+    await shares.decide(admin, initial["review_id"], True, "")
+    await resources.install(bob, "skill", skill_id)
+    before = await grants.list_grants(admin)
+    await publish(second, first)
+    update = await shares.submit(alice, "skill", skill_id)
+    await publish(third, second)
+
+    (owned,) = await resources.list(alice, "skill")
+    (shared,) = await resources.list(bob, "skill")
+    assert owned["resource_version"] == third
+    assert shared["resource_version"] == first
+    assert owned["version_label"] == "1.2"
+    assert shared["version_label"] == "1.0"
+    with pytest.raises(Forbidden):
+        await resources.detail(bob, "skill", skill_id, second)
+
+    await shares.decide(admin, update["review_id"], True, "")
+    selected = await resources.selected_for_personal(bob, "skill", enabled_only=True)
+    assert selected[skill_id]["resource_version"] == second
+    (visible,) = await resources.list_asset_versions(bob, "skill", skill_id)
+    assert visible["resource_version"] == second
+    assert await grants.list_grants(admin) == before
+
+    await resources.set_asset_enabled(alice, "skill", skill_id, third, False)
+    (owned,) = await resources.list(alice, "skill")
+    assert owned["resource_version"] == third and not owned["is_available"]
+    (shared,) = await resources.list(bob, "skill")
+    assert shared["resource_version"] == second and shared["is_usable"]
+    assert await grants.list_grants(admin) == before
+
+    async with storage.engine.connect() as conn:
+        summary = (await conn.execute(select(t.skill_summary))).mappings().one()
+        details = (
+            await conn.execute(
+                select(t.skill_detail).order_by(t.skill_detail.c.version)
+            )
+        ).mappings().all()
+        assert await conn.scalar(
+            select(t.assets.c.resource_id).where(t.assets.c.resource_type == "skill")
+        ) is None
+    assert (summary["owner_version"], summary["shared_version"]) == (3, 2)
+    assert summary["source_user_id"] == alice.user_id
+    assert [
+        (row["version"], row["resource_version"], row["created_by"]) for row in details
+    ] == [(1, first, alice.user_id), (2, second, alice.user_id), (3, third, alice.user_id)]
+    assert all(row["checksum_sha256"] and row["files"] for row in details)

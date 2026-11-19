@@ -185,7 +185,14 @@ class RemoteAgentMiddlewareImpl(MiddlewareBase):
                     ).model_dump(mode="json"),
                 )
             except Exception:
-                logger.warning("Remote expert progress could not be published")
+                logger.warning(
+                    "Remote expert progress could not be published",
+                    extra={
+                        "component": "RemoteAgentMiddlewareImpl",
+                        "context": {"run_id": self._request.run_id},
+                    },
+                    exc_info=True,
+                )
 
         result = await self.runtime.send_request(self.remote, self._request, progress)
         if result.status == "timed_out":

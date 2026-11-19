@@ -12,6 +12,7 @@ from contextlib import AsyncExitStack, aclosing, asynccontextmanager, nullcontex
 from agentscope.app.message_bus import MessageBusKeys
 from agentscope.event import EventType, ReplyFinishedReason
 
+from egis_agentkit.client._logging import log_session
 from egis_agentkit.client._tracing import mark_runtime_error, trace_phase
 from egis_agentkit.core.message_bus import EgisMessageBus
 from egis_agentkit.core.session._context import (
@@ -24,7 +25,7 @@ from egis_agentkit.service.session._preparation import SessionPreparationService
 
 
 class SessionMessageBus(EgisMessageBus):
-    """Delegate native bus primitives; add only the session-lock scope."""
+    """在原生消息总线上接入执行上下文和会话事件。"""
 
     coordinator: SessionPreparationService | None = None
     steering = None
@@ -35,7 +36,7 @@ class SessionMessageBus(EgisMessageBus):
         self.tracing = tracing
 
     async def publish(self, key, payload):
-        """观察原生失败终态；异常被 ChatService 捕获时，运行根仍保留错误状态。"""
+        """观察原生失败终态和引导回执。"""
         if (
             self.steering is not None
             and key.startswith(MessageBusKeys.session_events(""))
@@ -74,16 +75,17 @@ class SessionMessageBus(EgisMessageBus):
     async def acquire_lock(self, key, ttl_secs=600):
         prefix = MessageBusKeys.session_lock("")
         scoped = key.startswith(prefix) and self.coordinator is not None
+        session_id = key[len(prefix) :] if scoped else None
         observation = (
             self.tracing.span(
                 "session.operation",
                 root=True,
-                attributes={"session.id": key[len(prefix) :]},
+                attributes={"session.id": session_id},
             )
             if scoped and self.tracing is not None
             else nullcontext()
         )
-        with observation:
+        with observation, log_session(session_id):
             # 1. 独立计时等待锁；取得锁后才加载会话，保留原生并发边界。
             async with AsyncExitStack() as lifetime:
                 with trace_phase("session.lock.wait"):

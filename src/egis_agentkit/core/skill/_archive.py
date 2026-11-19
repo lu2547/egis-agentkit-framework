@@ -10,6 +10,7 @@ from egis_agentkit.client.nacos._settings import (
     DEFAULT_SKILL_ARCHIVE_MAX_BYTES,
     SkillArchiveConfig,
 )
+from egis_agentkit.errors import BadRequest
 
 
 def read_archive_files(
@@ -21,12 +22,12 @@ def read_archive_files(
         else SkillArchiveConfig(max_bytes=maximum)
     )
     if len(archive) > limits.max_bytes:
-        raise ValueError("Skill archive exceeds upload limit")
+        raise BadRequest("Skill archive exceeds upload limit")
     try:
         with zipfile.ZipFile(io.BytesIO(archive)) as z:
             entries = z.infolist()
             if sum(e.file_size for e in entries) > limits.expanded_bytes_limit:
-                raise ValueError("Expanded Skill archive exceeds limit")
+                raise BadRequest("Expanded Skill archive exceeds limit")
             files = {}
             for entry in entries:
                 path = PurePosixPath(entry.filename)
@@ -36,23 +37,23 @@ def read_archive_files(
                     or "\\" in entry.filename
                     or stat.S_ISLNK(entry.external_attr >> 16)
                 ):
-                    raise ValueError("Unsafe Skill archive path")
+                    raise BadRequest("Unsafe Skill archive path")
                 if entry.is_dir():
                     continue
                 if not path.parts or ":" in path.parts[0] or path.as_posix() in files:
-                    raise ValueError("Invalid or duplicate Skill archive path")
+                    raise BadRequest("Invalid or duplicate Skill archive path")
                 files[path.as_posix()] = z.read(entry)
             manifests = [
                 name for name in files if PurePosixPath(name).name == "SKILL.md"
             ]
             if len(manifests) != 1:
-                raise ValueError("Exactly one SKILL.md is required")
+                raise BadRequest("Exactly one SKILL.md is required")
             prefix = PurePosixPath(manifests[0]).parent
             if prefix != PurePosixPath("."):
                 if any(
                     not PurePosixPath(name).is_relative_to(prefix) for name in files
                 ):
-                    raise ValueError(
+                    raise BadRequest(
                         "All Skill files must belong to the manifest directory"
                     )
                 files = {
@@ -61,7 +62,7 @@ def read_archive_files(
                 }
             return files
     except (zipfile.BadZipFile, RuntimeError, UnicodeError):
-        raise ValueError("Invalid Skill ZIP archive") from None
+        raise BadRequest("Invalid Skill ZIP archive") from None
 
 
 def calculate_files_digest(files: dict[str, bytes]) -> str:

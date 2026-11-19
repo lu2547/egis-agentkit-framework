@@ -61,7 +61,7 @@ async def test_removing_personal_selection_preserves_resource_grants_and_other_u
         assert (
             await connection.execute(select(t.resource_permission))
         ).mappings().all() == grants_before
-        assert await connection.scalar(select(t.assets.c.resource_id)) == "report"
+        assert await connection.scalar(select(t.skill_summary.c.skill_id)) == "report"
     await resources.install(alice, "skill", "report")
     assert (await resources.personal.list_resources(alice, "skill"))["report"][
         "is_enabled"

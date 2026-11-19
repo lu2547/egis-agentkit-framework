@@ -12,15 +12,19 @@ from agentscope.message import Msg
 from agentscope.permission import PermissionBehavior, PermissionDecision, PermissionMode
 from agentscope.tool import Read, Toolkit
 from agentscope.workspace import WorkspaceBase
+from egis_agentkit_app.bootstrap._skill_assistant import provision_skill_assistant
 from runtime_helpers import session_middlewares
 from test_app_http import app_snapshot
 from test_domain import expert, identities
+from test_resources import archive
 
 from egis_agentkit.bootstrap._middlewares import (
     build_team_prompt_middleware,
     build_tool_access_middleware,
 )
+from egis_agentkit.bootstrap._skill_tools import deploy_skill_tools
 from egis_agentkit.client.nacos._settings import AccessConfig
+from egis_agentkit.core.skill._assistant import SKILL_ASSISTANT_ID
 from egis_agentkit.errors import CollaborationSessionBusy, Conflict, Forbidden
 from egis_agentkit.middleware import ToolAccessMiddleware
 from egis_agentkit.service._user import UserService
@@ -29,11 +33,15 @@ from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.agent._personal_manager import PersonalManager
 from egis_agentkit.service.project._file_manager import ProjectFileManager
+from egis_agentkit.service.resource._catalog import ResourceService
+from egis_agentkit.service.resource._skill_import import SkillImportService
 from egis_agentkit.service.session._preparation import SessionPreparationService
 from egis_agentkit.service.session._session import SessionService
 from egis_agentkit.service.team._collaboration import TeamCollaborationService
 from egis_agentkit.service.team._definition import TeamDefinition
+from egis_agentkit.service.team._tool_callbacks import tool_access_callbacks
 from egis_agentkit.storage._session_execution import SessionExecutionStorage
+from egis_agentkit.storage.project._files import ProjectFileStorage
 
 
 async def setup_task(storage, tmp_path, *, project_name=None):
@@ -59,6 +67,79 @@ def ref(writer):
         "resource_view_type": "private",
         "resource_version": writer["resource_version"],
     }
+
+
+@pytest.mark.asyncio
+async def test_explicit_skill_install_dispatches_once_to_the_authorized_expert(
+    storage, tmp_path
+):
+    alice, _, _, task = await setup_task(storage, tmp_path)
+    resources = ResourceService(storage, tmp_path)
+    files = ProjectFileStorage(tmp_path)
+    deploy_skill_tools(resources.tool_registry, SkillImportService(storage, resources))
+    await resources.seed_builtin_tools()
+    await provision_skill_assistant(storage, None, None)
+
+    def message(text, *paths):
+        return Msg(
+            name="user",
+            role="user",
+            content=[{
+                "type": "text",
+                "text": text + "\n\n已上传的项目资料（工作空间根目录）：\n"
+                + "\n".join("- " + path for path in paths),
+            }],
+        )
+
+    async with (
+        InMemoryMessageBus() as bus,
+        SessionPreparationService(storage, tmp_path).bind(task["session_id"]) as scope,
+    ):
+        for path in ("format-report.zip", "other.zip"):
+            files.write(alice.user_id, scope.project_id, path, archive(), area="uploads")
+        native = TeamCreate(
+            storage, bus, SimpleNamespace(), "alice", task["session_id"], task["agent_id"]
+        )
+        agent = SimpleNamespace(
+            state=scope.session_record.state,
+            toolkit=SimpleNamespace(get_tool=AsyncMock(return_value=native)),
+        )
+        _, _, prepare = tool_access_callbacks(
+            alice, scope, PermissionService(storage), files=files
+        )
+        for ambiguous in (
+            message("", "format-report.zip"),
+            message("不要安装这个技能", "format-report.zip"),
+            message("帮我安装这个技能", "format-report.zip", "other.zip"),
+            message("帮我安装这个技能", "absent.zip"),
+            message("想做一个周报skills"),
+            message("新建个日报skills"),
+        ):
+            await prepare(agent, ambiguous)
+            assert scope.session_record.team_id is None
+        assert await build_team_prompt_middleware(scope).on_system_prompt(
+            agent, "个人助理提示词"
+        ) == "个人助理提示词"
+
+        explicit = message("帮我安装这个技能", "format-report.zip")
+        await prepare(agent, explicit)
+        team = await storage.get_team(alice.user_id, scope.session_record.team_id)
+        (member,) = team.data.members
+        definition = scope.collaborator_definitions[member.agent_id]
+        assert definition["id"] == SKILL_ASSISTANT_ID
+        key = MessageBusKeys.inbox(member.session_id)
+        assert "format-report.zip" in str(await bus.queue_drain(key))
+        async with SessionPreparationService(storage, tmp_path).bind(member.session_id) as worker:
+            install, _ = await resources.tool_registry.resolve(alice, worker)
+            assert await resources.tool_registry.authorize(alice, worker, None, install)
+            await install.call(path="format-report.zip")
+        (installed,) = await resources.list(alice, "skill")
+        assert installed["is_installed"] and installed["is_enabled"]
+
+        await prepare(agent, explicit)
+        assert await bus.queue_drain(key) == []
+        await prepare(agent, message("安装 other.zip", "format-report.zip", "other.zip"))
+        assert "other.zip" in str(await bus.queue_drain(key))
 
 
 @pytest.mark.asyncio

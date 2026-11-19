@@ -273,18 +273,15 @@ class AgentDefinitionStorage:
                 ).scalars()
             ]
 
-    async def page_visible_definitions(
-        self,
+    @staticmethod
+    def _select_visible_definitions(
         user: User,
         types: Sequence[AgentType],
         *,
-        after: tuple[datetime, str] | str | None,
-        limit: int,
-        query: str = "",
-        policies: AccessConfig | LivePolicies | None = None,
-        order_by_id: bool = False,
-    ) -> list[dict[str, Any]]:
-        """先过滤访问范围和选中版本，再返回一页卡片；多条授权不会产生重复行。"""
+        editable_only: bool = False,
+        owner_only: bool = False,
+    ):
+        """为目录卡片、分类和管理页选出可见版本。"""
         summary, detail, access = (
             t.agent_definition_summary,
             t.agent_definition_detail,
@@ -338,21 +335,17 @@ class AgentDefinitionStorage:
             .limit(1)
             .scalar_subquery()
         )
-        card = func.jsonb_build_object(
-            *[
-                value
-                for key in (
-                    "description",
-                    "category",
-                    "tags",
-                    "avatar",
-                    "starter_prompts",
-                    "model_key",
-                )
-                for value in (key, detail.c.payload[key])
-            ]
-        ).label("payload")
-        statement = (
+        fields = ("description", "category", "tags", "avatar", "starter_prompts", "model_key")
+        card = [value for key in fields for value in (key, detail.c.payload[key])]
+        if editable_only:
+            card.extend((
+                "remote_config",
+                func.jsonb_build_object(
+                    "transport", detail.c.payload["remote_config"]["transport"]
+                ),
+            ))
+        visible = own if owner_only else or_(own, system if editable_only else direct)
+        return (
             select(
                 summary.c.id,
                 summary.c.owner_type,
@@ -366,7 +359,7 @@ class AgentDefinitionStorage:
                 detail.c.version,
                 detail.c.agent_name,
                 detail.c.agent_display_name,
-                card,
+                func.jsonb_build_object(*card).label("payload"),
                 view.label("resource_view_type"),
                 own.label("is_owner"),
                 direct.label("has_access"),
@@ -385,9 +378,47 @@ class AgentDefinitionStorage:
             .where(
                 summary.c.deleted_at.is_(None),
                 summary.c.agent_type.in_(types),
-                or_(own, direct),
+                visible,
             )
         )
+
+    async def list_visible_categories(
+        self, user: User, types: Sequence[AgentType]
+    ) -> list[str]:
+        """分类只来自该用户可见的定义版本。"""
+        category = t.agent_definition_detail.c.payload["category"].astext
+        statement = (
+            self._select_visible_definitions(user, types)
+            .with_only_columns(category)
+            .where(category != "")
+            .distinct()
+            .order_by(category)
+        )
+        async with self.engine.connect() as connection:
+            return list((await connection.scalars(statement)).all())
+
+    async def page_visible_definitions(
+        self,
+        user: User,
+        types: Sequence[AgentType],
+        *,
+        after: tuple[datetime, str] | str | None,
+        limit: int,
+        query: str = "",
+        category: str = "",
+        owner_only: bool = False,
+        policies: AccessConfig | LivePolicies | None = None,
+        order_by_id: bool = False,
+        offset: int = 0,
+        editable_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """先过滤权限、分类和搜索结果，再返回一页卡片。"""
+        summary, detail = t.agent_definition_summary, t.agent_definition_detail
+        statement = self._select_visible_definitions(
+            user, types, editable_only=editable_only, owner_only=owner_only
+        )
+        if category:
+            statement = statement.where(detail.c.payload["category"].astext == category)
         if after is not None:
             statement = (
                 statement.where(summary.c.id > after)
@@ -407,6 +438,7 @@ class AgentDefinitionStorage:
                     detail.c.agent_name.ilike(term, escape="\\"),
                     detail.c.agent_display_name.ilike(term, escape="\\"),
                     detail.c.payload["description"].astext.ilike(term, escape="\\"),
+                    detail.c.payload["tags"].astext.ilike(term, escape="\\"),
                 )
             )
         statement = (
@@ -414,7 +446,7 @@ class AgentDefinitionStorage:
             if order_by_id
             else statement.order_by(summary.c.created_at.desc(), summary.c.id.desc())
         )
-        statement = statement.limit(limit)
+        statement = statement.offset(offset).limit(limit)
         async with self.engine.connect() as connection:
             rows = (await connection.execute(statement)).mappings().all()
         result = []
@@ -458,3 +490,28 @@ class AgentDefinitionStorage:
                 }
             )
         return result
+
+    async def current_bindings(self, references):
+        """按一页资源的引用筛选当前 Agent 版本，只读取摘要与绑定。"""
+        if not references:
+            return []
+        summary, detail = t.agent_definition_summary, t.agent_definition_detail
+        statement = (
+            select(summary.c.id, detail.c.agent_display_name, detail.c.payload["bindings"].label("bindings"))
+            .select_from(
+                summary.join(
+                    detail,
+                    and_(
+                        summary.c.id == detail.c.definition_id,
+                        summary.c.owner_version == detail.c.version,
+                    ),
+                )
+            )
+            .where(
+                summary.c.deleted_at.is_(None),
+                or_(*(detail.c.payload.contains({"bindings": [ref]}) for ref in references)),
+            )
+            .order_by(summary.c.created_at.desc(), summary.c.id)
+        )
+        async with self.engine.connect() as conn:
+            return [dict(row) for row in (await conn.execute(statement)).mappings()]
