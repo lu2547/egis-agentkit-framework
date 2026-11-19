@@ -202,6 +202,22 @@ Index(
     agent_personal_resources.c.resource_type,
 )
 
+agent_invite_candidates = Table(
+    "ak_agent_invite_candidates",
+    metadata,
+    Column(
+        "user_id", String(128), ForeignKey("ak_users.user_id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "definition_id", String(64),
+        ForeignKey("ak_agent_definition_summary.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("resource_view_type", String(16), primary_key=True),
+    CheckConstraint("resource_view_type IN ('private','system','shared')"),
+)
+
 team_definition_summary = Table(
     "ak_team_definition_summary",
     metadata,

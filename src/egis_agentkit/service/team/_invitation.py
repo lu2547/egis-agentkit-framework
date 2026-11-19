@@ -9,6 +9,7 @@ from agentscope.app._tool._team_create import TeamCreate
 from agentscope.app._tool._team_say import TeamSay
 from agentscope.message import Msg, ToolResultState
 
+from egis_agentkit.client.nacos._settings import TeamInviteConfig
 from egis_agentkit.core.agent._definition_base import AgentDefinitionBase
 from egis_agentkit.errors import Conflict, Forbidden
 from egis_agentkit.service.project._project_manager import purge_session_bus
@@ -18,6 +19,7 @@ from egis_agentkit.service.team._collaboration import (
     validate_collaborators,
 )
 from egis_agentkit.storage.model import new_id
+from egis_agentkit.storage.model._definition import build_definition_reference
 
 
 class InvitationStorage:
@@ -126,10 +128,93 @@ def _check(result):
         )
 
 
-async def apply_invitations(user, scope, state, native_create, inputs, permissions):
+async def invite_candidate(
+    user, scope, state, native_create, definition, prompt, permissions
+):
+    """在当前会话锁内登记模型选中的候选，并执行一次原生邀请。"""
+    if not collaboration_allowed(scope.session_record, scope.root_definition):
+        raise Forbidden("只有个人助理对话可以邀请专家协作")
+    selected = build_definition_reference(definition)
+    reference = {
+        key: selected[key]
+        for key in ("definition_id", "resource_view_type", "resource_version")
+    }
+    binding = state.middle_context["egis_agentkit"]
+    journal = binding.setdefault("collaboration", {"requests": [], "members": []})
+    members = collaborators(binding)
+    member = next(
+        (
+            item
+            for item in members
+            if item["definition_id"] == selected["definition_id"]
+            and item["resource_view_type"] == selected["resource_view_type"]
+        ),
+        None,
+    )
+    if member is not None:
+        if member["status"] == "joined":
+            handle = _display_name(definition["agent_name"], member["native_agent_id"])
+            return f"{handle} 已在当前会话中。"
+        if member["resource_version"] != selected["resource_version"]:
+            raise Conflict("等待邀请的专家版本已变化")
+    else:
+        limits = (
+            scope.configuration.team.invite
+            if scope.configuration
+            else TeamInviteConfig()
+        )
+        if len(members) >= limits.max_members:
+            raise Conflict(f"当前对话最多邀请 {limits.max_members} 位专家")
+        member = {
+            **selected,
+            "display_name": definition["agent_display_name"],
+            "avatar": definition["payload"].get("avatar"),
+            "native_agent_id": new_id(),
+            "status": "pending",
+        }
+        journal["members"].append(member)
+    request_id = next(
+        (
+            record["request_id"]
+            for record in journal["requests"]
+            if record.get("source") == "agent_invite"
+            and not record["completed"]
+            and record["experts"] == [reference]
+        ),
+        None,
+    )
+    if request_id is None:
+        request_id = f"agent-invite:{new_id()}"
+        journal["requests"].append({
+            "request_id": request_id,
+            "experts": [reference],
+            "completed": False,
+            "source": "agent_invite",
+            "prompt": prompt,
+        })
+    await apply_invitations(
+        user,
+        scope,
+        state,
+        native_create,
+        None,
+        permissions,
+        automatic_request_id=request_id,
+    )
+    if member["status"] != "joined":
+        raise Conflict("专家尚未完成邀请")
+    handle = _display_name(definition["agent_name"], member["native_agent_id"])
+    return f"{handle} 已加入协作，任务已发送。"
+
+
+async def apply_invitations(
+    user, scope, state, native_create, inputs, permissions, *, automatic_request_id=None
+):
     """在会话锁内完成原生入团、任务投递和进度提交，再响应取消。"""
     operation = asyncio.create_task(
-        _apply_invitations(user, scope, state, native_create, inputs, permissions)
+        _apply_invitations(
+            user, scope, state, native_create, inputs, permissions, automatic_request_id
+        )
     )
     try:
         await asyncio.shield(operation)
@@ -141,11 +226,22 @@ async def apply_invitations(user, scope, state, native_create, inputs, permissio
         raise
 
 
-async def _apply_invitations(user, scope, state, native_create, inputs, permissions):
+async def _apply_invitations(
+    user, scope, state, native_create, inputs, permissions, automatic_request_id
+):
     """完成待处理邀请，保证重试使用原专家版本和原用户任务。"""
     binding = state.middle_context["egis_agentkit"]
     journal = binding.get("collaboration", {})
-    requests = [r for r in journal.get("requests", []) if not r.get("completed")]
+    requests = [
+        request
+        for request in journal.get("requests", [])
+        if not request.get("completed")
+        and (
+            request["request_id"] == automatic_request_id
+            if automatic_request_id is not None
+            else request.get("source") != "agent_invite"
+        )
+    ]
     messages = (
         [inputs]
         if isinstance(inputs, Msg)
@@ -155,7 +251,7 @@ async def _apply_invitations(user, scope, state, native_create, inputs, permissi
     )
     messages = [m for m in messages if isinstance(m, Msg) and m.role == "user"]
     # 只有真实用户输入能消费邀请，Inbox 唤醒和工具确认恢复不会触发。
-    if not requests or not messages:
+    if not requests or (automatic_request_id is None and not messages):
         return
     if not collaboration_allowed(scope.session_record, scope.root_definition):
         raise Forbidden("只有个人智能体主对话可以邀请专家协作")
@@ -238,11 +334,16 @@ async def _apply_invitations(user, scope, state, native_create, inputs, permissi
                 adapter.member = member
                 adapter.created_sessions = []
                 try:
+                    first_task = prompt
+                    if request.get("source") != "agent_invite":
+                        first_task = (
+                            "你已受用户明确邀请，和个人智能体在同一项目工作目录协作。请完成与你专长有关的工作，并用 TeamSay 向组长汇报。当前用户输入：\n"
+                            + prompt
+                        )
                     _check(
                         await AgentInvite(**deps, invitable_pool=[record])(
                             target=_display_name(record.data.name, record.id),
-                            prompt="你已受用户明确邀请，和个人智能体在同一项目工作目录协作。请完成与你专长有关的工作，并用 TeamSay 向组长汇报。当前用户输入：\n"
-                            + prompt,
+                            prompt=first_task,
                         )
                     )
                 except BaseException:
@@ -262,5 +363,8 @@ async def _apply_invitations(user, scope, state, native_create, inputs, permissi
                 )
             request.setdefault("delivered", []).append(key)
             await _save(storage, scope, state)
+            progress = getattr(native_create._message_bus, "collaborator_progress", None)
+            if progress is not None:
+                await progress.dispatched(scope.session_id, member)
         request["completed"] = True
         await _save(storage, scope, state)

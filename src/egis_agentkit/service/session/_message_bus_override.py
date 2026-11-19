@@ -7,6 +7,7 @@
 - publish 记录用户引导的原生接收确认，供消息历史恢复状态。
 """
 
+import logging
 from contextlib import AsyncExitStack, aclosing, asynccontextmanager, nullcontext
 
 from agentscope.app.message_bus import MessageBusKeys
@@ -16,12 +17,17 @@ from egis_agentkit.client._logging import log_session
 from egis_agentkit.client._tracing import mark_runtime_error, trace_phase
 from egis_agentkit.core.message_bus import EgisMessageBus
 from egis_agentkit.core.session._context import (
+    session_execution_context,
     session_setup_error,
     stream_subscription_ready,
 )
 from egis_agentkit.core.session._steering import STEERING_SOURCE
 from egis_agentkit.errors import AgentKitError
 from egis_agentkit.service.session._preparation import SessionPreparationService
+from egis_agentkit.service.team._collaboration import collaborators
+from egis_agentkit.service.team._progress import OBSERVED_EVENTS, CollaboratorProgress
+
+logger = logging.getLogger(__name__)
 
 
 class SessionMessageBus(EgisMessageBus):
@@ -34,6 +40,20 @@ class SessionMessageBus(EgisMessageBus):
         """复用原生总线构造；Tracing 只观察锁及运行，不改变消息或租约协议。"""
         super().__init__(**kwargs)
         self.tracing = tracing
+        self.collaborator_progress = CollaboratorProgress(self)
+
+    async def queue_push(self, key, payload, *, ttl_secs=None):
+        result = await super().queue_push(key, payload, ttl_secs=ttl_secs)
+        scope = session_execution_context.get()
+        if scope is not None and key.startswith(MessageBusKeys.inbox("")):
+            for member in collaborators(scope.binding):
+                worker = member.get("worker_session_id")
+                if worker and key == MessageBusKeys.inbox(worker):
+                    await self.collaborator_progress.dispatched(
+                        scope.session_id, member, repeat=True
+                    )
+                    break
+        return result
 
     async def publish(self, key, payload):
         """观察原生失败终态和引导回执。"""
@@ -54,7 +74,42 @@ class SessionMessageBus(EgisMessageBus):
             and payload.get("finished_reason") == ReplyFinishedReason.ERROR
         ):
             mark_runtime_error("ReplyError", session_id=payload.get("session_id"))
-        return await super().publish(key, payload)
+        result = await super().publish(key, payload)
+        prefix = MessageBusKeys.session_events("")
+        if (
+            key.startswith(prefix)
+            and isinstance(payload, dict)
+            and payload.get("type") in OBSERVED_EVENTS
+        ):
+            await self._observe_collaborator(key[len(prefix) :], payload)
+        return result
+
+    async def _observe_collaborator(self, session_id, event):
+        try:
+            scope = session_execution_context.get()
+            if scope is not None and scope.session_id == session_id:
+                parent = scope.binding.get("collaboration_parent_session_id")
+                if parent:
+                    await self.collaborator_progress.observe(
+                        parent, session_id, scope.agent_id,
+                        scope.definition["agent_display_name"], event,
+                    )
+            elif (
+                event["type"] == EventType.REPLY_END
+                and session_setup_error.get() is not None
+                and isinstance(self.coordinator, SessionPreparationService)
+            ):
+                target = await self.coordinator.collaboration_progress_target(session_id)
+                if target is not None:
+                    parent, agent_id, name = target
+                    await self.collaborator_progress.observe(
+                        parent, session_id, agent_id, name, event
+                    )
+        except Exception:
+            logger.exception(
+                "Failed to project collaborator progress",
+                extra={"context": {"worker_session_id": session_id}},
+            )
 
     async def subscribe(self, key, *, on_ready=None):
         ready = stream_subscription_ready.get()

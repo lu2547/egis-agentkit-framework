@@ -501,6 +501,14 @@ CREATE TABLE ak_agent_personal_resources (
 
 CREATE INDEX ix_ak_agent_personal_resources_user_type ON ak_agent_personal_resources (user_id, resource_type);
 
+CREATE TABLE ak_agent_invite_candidates (
+    user_id VARCHAR(128) NOT NULL REFERENCES ak_users (user_id) ON DELETE CASCADE,
+    definition_id VARCHAR(64) NOT NULL REFERENCES ak_agent_definition_summary (id) ON DELETE CASCADE,
+    resource_view_type VARCHAR(16) NOT NULL,
+    PRIMARY KEY (user_id, definition_id, resource_view_type),
+    CHECK (resource_view_type IN ('private','system','shared'))
+);
+
 CREATE TABLE ak_project_reply_artifacts (
     project_id VARCHAR(128) NOT NULL,
     session_id VARCHAR(128) NOT NULL,

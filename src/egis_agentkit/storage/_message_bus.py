@@ -303,10 +303,16 @@ class PostgresPrimitives:
         self, namespace, field, value, *, expected, ttl_secs=None
     ):
         self._ttl(ttl_secs)
+        statement = (
+            """INSERT INTO ak_bus_registry(key,field,value)
+            VALUES (:key,:field,:value) ON CONFLICT(key,field) DO NOTHING RETURNING field"""
+            if expected is None
+            else """UPDATE ak_bus_registry SET value=:value
+            WHERE key=:key AND field=:field AND value=:expected RETURNING field"""
+        )
         async with self._key("registry", namespace) as (conn, _):
             result = await conn.execute(
-                text("""UPDATE ak_bus_registry SET value=:value
-                WHERE key=:key AND field=:field AND value=:expected RETURNING field"""),
+                text(statement),
                 {
                     "key": namespace,
                     "field": field,

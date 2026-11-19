@@ -70,6 +70,111 @@ def ref(writer):
 
 
 @pytest.mark.asyncio
+async def test_candidate_checkbox_scopes_model_invitation_to_current_user(storage, tmp_path):
+    import httpx
+    from agentscope.app._tool import TeamSay
+    from egis_agentkit_app.controller.agent._agent import router
+    from egis_agentkit_app.controller.base import current_user
+    from egis_agentkit_app.controller.base._exception import register_exception_handlers
+    from fastapi import FastAPI
+
+    from egis_agentkit.service.session._message_bus_override import SessionMessageBus
+
+    alice, writer, tasks, task = await setup_task(storage, tmp_path)
+    _, _, _, bob = await identities(storage)
+    agents = AgentManager(storage)
+    app = FastAPI()
+    register_exception_handlers(app)
+    app.include_router(router, prefix="/manager")
+    app.state.egis_services = SimpleNamespace(agents=agents)
+    app.dependency_overrides[current_user] = lambda: alice
+    url = f"/manager/agents/{writer['id']}/invite-candidate?view=private"
+    async with (
+        SessionMessageBus(deployment_mode="standalone") as bus,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client,
+    ):
+        app.dependency_overrides[current_user] = lambda: bob
+        assert (await client.put(url)).status_code in (403, 404)
+        app.dependency_overrides[current_user] = lambda: alice
+        assert (await client.put(url)).status_code == 204
+        assert not await storage.expert_candidates.list(bob.user_id)
+        catalog = await client.get("/manager/agents", params={"catalog": True})
+        assert catalog.json()["items"][0]["is_invite_candidate"] is True
+
+        resources = ResourceService(storage, tmp_path)
+        await resources.seed_builtin_tools()
+        async with SessionPreparationService(storage, tmp_path).bind(
+            task["session_id"]
+        ) as scope:
+            toolkit = Toolkit(tools=[
+                TeamCreate(storage, bus, SimpleNamespace(), alice.user_id, scope.session_id, scope.agent_id),
+                TeamSay(storage, bus, SimpleNamespace(), alice.user_id, scope.session_id, scope.agent_id),
+            ])
+            agent = SimpleNamespace(toolkit=toolkit, state=scope.session_record.state)
+
+            async def authorize(agent, tool, parameters=None):
+                return await resources.tool_registry.authorize(
+                    alice, scope, agent, tool, parameters
+                )
+
+            middleware = build_tool_access_middleware(
+                alice, scope, agents.permissions, authorize_tool=authorize,
+            )
+            message = Msg(name="user", role="user", content=[{"type": "text", "text": "准备材料"}])
+
+            async def downstream(**kwargs):
+                yield "native reply"
+
+            assert [
+                item async for item in middleware.on_reply(
+                    agent, {"inputs": message}, downstream
+                )
+            ] == ["native reply"]
+            invite = await toolkit.get_tool("AgentInvite")
+            assert invite is not None
+            assert writer["payload"]["description"] in invite.description
+            async def model_tool_names():
+                call = await middleware.on_model_call(
+                    agent,
+                    {"tools": await toolkit.get_tool_schemas()},
+                    AsyncMock(side_effect=lambda **params: params),
+                )
+                return {tool["function"]["name"] for tool in call["tools"]}
+
+            assert await model_tool_names() == {"AgentInvite"}
+            assert await build_team_prompt_middleware(scope).on_system_prompt(
+                agent, "base"
+            ) == "base"
+            (target,) = invite.input_schema["properties"]["target"]["enum"]
+            assert await authorize(agent, invite, {"target": target, "prompt": "请整理材料"})
+            assert await toolkit.get_tool("TeamCreate") is None
+            assert scope.session_record.team_id is None
+            assert (await client.delete(url)).status_code == 204
+            with pytest.raises(Forbidden):
+                await invite(target=target, prompt="请整理材料")
+            assert scope.session_record.team_id is None
+            assert (await client.put(url)).status_code == 204
+            result = await invite(target=target, prompt="请整理材料")
+            assert result.state == "success"
+            assert await model_tool_names() == {"AgentInvite", "TeamSay"}
+            assert "可通过 AgentInvite 邀请已勾选的候选专家" in (
+                await build_team_prompt_middleware(scope).on_system_prompt(
+                    agent, "base"
+                )
+            )
+            team = await storage.get_team(alice.user_id, scope.session_record.team_id)
+            (member,) = team.data.members
+            (projected,) = await bus.collaborator_progress.list(scope.session_id)
+            assert projected["worker_session_id"] == member.session_id
+            assert projected["status"] == "queued"
+            assert "请整理材料" in str(await bus.queue_drain(MessageBusKeys.inbox(member.session_id)))
+            assert (await invite(target=target, prompt="请整理材料")).state == "success"
+            assert await bus.queue_drain(MessageBusKeys.inbox(member.session_id)) == []
+
+
+@pytest.mark.asyncio
 async def test_explicit_skill_install_dispatches_once_to_the_authorized_expert(
     storage, tmp_path
 ):

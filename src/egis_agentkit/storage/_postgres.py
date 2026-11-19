@@ -19,6 +19,7 @@ from ._session_steering import SessionSteeringStorage
 from ._skill_import import SkillImportStorage
 from ._user import UserStorage
 from ._virtual_user import VirtualUserStorage
+from .agent._invite_candidates import ExpertCandidateStorage
 from .agent._resource import PersonalResourceStorage
 from .project._file_records import ProjectFileRecordStorage, lock_project_files
 from .project._project import ProjectStorage
@@ -64,6 +65,7 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
         self.engine = engine
         self.users = UserStorage(engine)
         self.personal_resources = PersonalResourceStorage(engine)
+        self.expert_candidates = ExpertCandidateStorage(engine)
         self.definitions = DefinitionStorage(engine)
         self.agents = self.definitions.agents
         self.access = AccessStorage(engine)

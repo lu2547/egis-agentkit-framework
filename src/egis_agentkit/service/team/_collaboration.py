@@ -210,6 +210,9 @@ class TeamCollaborationService:
                     await TeamCollaborationService._clear_confirmations(
                         bus, session_id, worker_id
                     )
+                    progress = getattr(bus, "collaborator_progress", None)
+                    if progress is not None:
+                        await progress.forget(session_id, worker_id)
             except CollaborationSessionBusy:
                 # The leader can be stopped while its invited worker is still running.
                 await bus.publish(
@@ -268,9 +271,9 @@ class TeamCollaborationService:
 def collaboration_allowed(session, root):
     """只有以个人智能体为根的主会话可以选择临时专家。"""
     return (
-        session.origin.type == "user"
-        and root.get("definition_type") == "agent"
+        root.get("definition_type") == "agent"
         and root.get("agent_type") == "personal"
+        and getattr(getattr(session, "origin", None), "type", None) == "user"
     )
 
 
@@ -303,7 +306,7 @@ def pending_request_id(binding):
         (
             r["request_id"]
             for r in binding.get("collaboration", {}).get("requests", [])
-            if not r.get("completed")
+            if not r.get("completed") and r.get("source") != "agent_invite"
         ),
         None,
     )

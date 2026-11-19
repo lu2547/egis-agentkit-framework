@@ -11,7 +11,7 @@ PG_SQL = Path(__file__).resolve().parents[1] / "scripts/init/pg.sql"
 CLUSTER_TABLES = {
     "agents", "credentials", "messages", "schedules", "sessions", "teams",
     "ak_users", "ak_groups", "ak_agent_definition_summary",
-    "ak_agent_definition_detail", "ak_agent_personal_resources",
+    "ak_agent_definition_detail", "ak_agent_personal_resources", "ak_agent_invite_candidates",
     "ak_agent_remote_runs", "ak_team_definition_summary",
     "ak_team_definition_detail", "ak_resource_assets", "ak_resource_permission",
     "ak_approve", "ak_skill_imports", "ak_skill_summary", "ak_skill_detail",

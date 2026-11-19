@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Mapping, Protocol
 from agentscope.middleware import MiddlewareBase
 from agentscope.permission import PermissionBehavior, PermissionDecision
 
+from egis_agentkit.core.agent._invite_tool import ExpertInvite
 from egis_agentkit.errors import AgentKitError, Forbidden
 
 if TYPE_CHECKING:
@@ -55,7 +56,9 @@ class ToolAccessMiddleware(MiddlewareBase):
         *,
         validate_access: Callable[[], Awaitable[None]],
         may_send_team_message: Callable[[], bool],
-        prepare_collaboration: Callable[[Agent, object], Awaitable[None]] | None = None,
+        prepare_collaboration: Callable[
+            [Agent, object], Awaitable[ExpertInvite | None]
+        ] | None = None,
         skills: SkillAccess | None = None,
         authorize_tool: Callable[..., Awaitable[None]] | None = None,
         resolve_sandbox_path: Callable[[str], Awaitable[PurePosixPath]] | None = None,
@@ -69,10 +72,16 @@ class ToolAccessMiddleware(MiddlewareBase):
         self.resolve_sandbox_path = resolve_sandbox_path
 
     async def on_reply(self, agent, input_kwargs, next_handler):
+        invite = None
         if self.prepare_collaboration is not None:
-            await self.prepare_collaboration(agent, input_kwargs.get("inputs"))
+            invite = await self.prepare_collaboration(agent, input_kwargs.get("inputs"))
+        if invite is not None and self.authorize_tool is not None:
+            try:
+                await self.authorize_tool(agent, invite)
+            except AgentKitError:
+                invite = None
         disabled = list(DYNAMIC_TOOLS)
-        if not self.may_send_team_message():
+        if invite is None and not self.may_send_team_message():
             disabled.append("TeamSay")
         if self.authorize_tool is not None:
             for group in agent.toolkit.tool_groups:
@@ -84,11 +93,13 @@ class ToolAccessMiddleware(MiddlewareBase):
                     except AgentKitError:
                         disabled.append(tool.name)
         await agent.toolkit.remove_tool(disabled)
+        if invite is not None:
+            await agent.toolkit.add_tool(invite)
         async for event in next_handler(**input_kwargs):
             yield event
 
     async def on_model_call(self, agent, input_kwargs, next_handler):
-        if self.authorize_tool is None or not input_kwargs.get("tools"):
+        if not input_kwargs.get("tools"):
             return await next_handler(**input_kwargs)
         # Native toolkit adds certain tools while preparing model input, after
         # on_reply. Check those and active MCP tools against the same policy.
@@ -98,18 +109,20 @@ class ToolAccessMiddleware(MiddlewareBase):
         allowed = []
         for schema in input_kwargs["tools"]:
             registered = selected.get(schema.get("function", {}).get("name"))
-            if registered is None or self._team_restricted(registered.tool.name):
+            if registered is None or self._team_restricted(registered.tool):
                 continue
             try:
-                await self.authorize_tool(agent, registered.tool)
+                if self.authorize_tool is not None:
+                    await self.authorize_tool(agent, registered.tool)
             except AgentKitError:
                 continue
             allowed.append(schema)
         return await next_handler(**{**input_kwargs, "tools": allowed})
 
-    def _team_restricted(self, name):
+    def _team_restricted(self, tool):
+        name = tool.name
         return (
-            name in DYNAMIC_TOOLS
+            (name in DYNAMIC_TOOLS and type(tool) is not ExpertInvite)
             or name == "TeamSay"
             and not self.may_send_team_message()
         )
@@ -152,7 +165,7 @@ class ToolAccessMiddleware(MiddlewareBase):
         tool = input_kwargs["tool"]
         try:
             await self.validate_access()
-            if self._team_restricted(tool.name):
+            if self._team_restricted(tool):
                 raise Forbidden("当前角色不能动态创建或调整专家团")
             if self.skills is not None:
                 await self.skills.bind_state(agent.state)

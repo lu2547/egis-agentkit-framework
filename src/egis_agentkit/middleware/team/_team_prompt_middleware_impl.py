@@ -4,6 +4,8 @@ from collections.abc import Callable, Sequence
 
 from agentscope.middleware import MiddlewareBase
 
+from egis_agentkit.core.agent._invite_tool import ExpertInvite
+
 
 class TeamPromptMiddleware(MiddlewareBase):
     """Describe a verified roster without changing native membership."""
@@ -22,10 +24,17 @@ class TeamPromptMiddleware(MiddlewareBase):
     async def on_system_prompt(self, agent, current_prompt):
         invited = self.invited_members() if self.invited_members else None
         if invited is not None:
+            toolkit = getattr(agent, "toolkit", None)
+            invite = await toolkit.get_tool("AgentInvite") if toolkit else None
+            instruction = (
+                "可通过 AgentInvite 邀请已勾选的候选专家"
+                if type(invite) is ExpertInvite
+                else "不得创建或邀请额外成员"
+            )
             return (
                 current_prompt
                 + "\n用户已明确邀请以下专家在同一项目协作。成员只能通过 TeamSay 通信；"
-                + "使用以下完整收件人名称分工、汇总成果，不得创建或邀请额外成员："
+                + f"使用以下完整收件人名称分工、汇总成果，{instruction}："
                 + ", ".join(invited)
             )
         if self.invited_member:

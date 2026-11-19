@@ -44,6 +44,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
 from egis_agentkit.client.nacos import NacosConfigProvider
+from egis_agentkit.core.agent._invite_tool import ExpertInvite
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
 from egis_agentkit.service.access._permission import is_system_default_tool
 from egis_agentkit.storage.model import (
@@ -272,7 +273,10 @@ class FunctionToolRegistry(_LocalRegistry):
 
     async def authorize(self, user, scope, agent, tool, parameters=None):
         """调用前校验登记来源、当前专家绑定及工具参数。"""
-        key = self.native.get(type(tool))
+        managed_invite = type(tool) is ExpertInvite
+        if managed_invite and scope.definition.get("agent_type") != "personal":
+            raise Forbidden("只有个人助理可使用自动邀请")
+        key = self.native.get(AgentInvite if managed_invite else type(tool))
         if tool is getattr(agent, "_compression_tool", None):
             key = ("CompressContext", "1.0.0")
         registered = getattr(tool, "_egis_tool_registration", None)
@@ -289,7 +293,7 @@ class FunctionToolRegistry(_LocalRegistry):
             asset = await self.resources._asset("tool", *key)
         except NotFound:
             raise Forbidden("工具未在平台注册") from None
-        exposure = expected.payload["exposure"]
+        exposure = "team" if managed_invite else expected.payload["exposure"]
         if (
             asset["checksum_sha256"] != expected.checksum_sha256
             or exposure not in ("model", "team")

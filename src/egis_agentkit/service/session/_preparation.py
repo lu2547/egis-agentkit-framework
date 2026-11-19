@@ -133,6 +133,10 @@ class SessionPreparationService:
         parent_id = binding.get("collaboration_parent_session_id")
         if parent_id is None:
             return
+        parent, _ = await self._collaboration_parent(session, binding, user_id, parent_id)
+        session.state.permission_context.mode = parent.state.permission_context.mode
+
+    async def _collaboration_parent(self, session, binding, user_id, parent_id):
         locator = await self.storage.locate_session(parent_id)
         if locator is None or locator[0] != user_id or session.origin.type != "team":
             raise Forbidden("专家协作关系已失效")
@@ -145,12 +149,32 @@ class SessionPreparationService:
         ):
             raise Forbidden("专家协作关系已失效")
         host = parent.state.middle_context["egis_agentkit"]
-        if host["project_id"] != binding["project_id"] or not any(
-            member["native_agent_id"] == session.agent_id
-            for member in collaborators(host)
-        ):
+        member = next(
+            (item for item in collaborators(host) if item["native_agent_id"] == session.agent_id),
+            None,
+        )
+        if host["project_id"] != binding["project_id"] or member is None:
             raise Forbidden("专家协作关系已失效")
-        session.state.permission_context.mode = parent.state.permission_context.mode
+        return parent, member
+
+    async def collaboration_progress_target(self, session_id):
+        """会话准备失败时，从数据库核对组长和受邀成员的关系。"""
+        locator = await self.storage.locate_session(session_id)
+        if locator is None:
+            return None
+        user_id, agent_id = locator
+        session = await self.storage.read_session_unscoped(user_id, agent_id, session_id)
+        if session is None:
+            return None
+        binding = session.state.middle_context.get("egis_agentkit", {})
+        parent_id = binding.get("collaboration_parent_session_id")
+        if parent_id is None:
+            return None
+        try:
+            _, member = await self._collaboration_parent(session, binding, user_id, parent_id)
+        except Forbidden:
+            return None
+        return parent_id, agent_id, member["display_name"]
 
     @asynccontextmanager
     async def bind(self, session_id):
