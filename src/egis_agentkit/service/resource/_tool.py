@@ -45,11 +45,13 @@ from jsonschema.exceptions import ValidationError
 
 from egis_agentkit.client.nacos import NacosConfigProvider
 from egis_agentkit.core.agent._invite_tool import ExpertInvite
+from egis_agentkit.core.session._context import get_verified_chat_token
 from egis_agentkit.errors import Conflict, Forbidden, NotFound
 from egis_agentkit.service.access._permission import is_system_default_tool
 from egis_agentkit.storage.model import (
     Asset,
 )
+from egis_agentkit.tool._knowledgebase_tool import KnowledgeBaseSearch
 
 from ._registry import _LocalRegistry
 
@@ -75,6 +77,7 @@ class FunctionToolRegistry(_LocalRegistry):
             self._native(cls, "toolkit")
         for cls in (SubmitHandover, SubmitVerdict, ScheduleList, ScheduleView):
             self._native(cls, "toolkit")
+        self._native(KnowledgeBaseSearch, "toolkit")
         self._native(TeamSay, "toolkit", exposure="team")
         for cls in (
             TeamCreate,
@@ -127,6 +130,10 @@ class FunctionToolRegistry(_LocalRegistry):
         configuration = getattr(scope, "configuration", None)
         if configuration is None and self.resources.config is not None:
             configuration = self.resources.config.snapshot
+        if asset["resource_id"] == KnowledgeBaseSearch.name and (
+            configuration is None or configuration.tool.knowledge_base.query_url is None
+        ):
+            return False
         if configuration is None:
             return True
         allowed_ids = configuration.tool.defaults.registered_ids
@@ -241,16 +248,27 @@ class FunctionToolRegistry(_LocalRegistry):
         )
 
     async def resolve(self, user, scope):
-        """装配当前专家绑定并通过执行权限校验的工具。"""
+        """装配已开放的平台工具及当前专家绑定的工具。"""
         resources = self.resources
+        tools = []
+        configuration = getattr(scope, "configuration", None)
+        if configuration is not None:
+            settings = configuration.tool.knowledge_base
+            if settings.query_url is not None:
+                key = self.native[KnowledgeBaseSearch]
+                asset = await resources._asset("tool", *key)
+                if await resources._usable(user, asset, scope):
+                    access_token = get_verified_chat_token(
+                        scope.user_id, scope.agent_id, scope.session_id
+                    )
+                    tools.append(KnowledgeBaseSearch(settings, access_token=access_token))
         if scope.definition["agent_type"] != "expert":
-            return []
+            return tools
         keys = [
             (ref["resource_id"], ref["resource_version"])
             for ref in scope.definition["payload"].get("bindings", [])
             if ref["resource_type"] == "tool"
         ]
-        tools = []
         for key in keys:
             factory = self.deployed.get(key)
             if factory is None:

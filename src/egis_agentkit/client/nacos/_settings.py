@@ -316,9 +316,32 @@ class ToolDefaultsConfig(ConfigModel):
     registered_ids: list[NonEmptyString] | None = None
 
 
+class KnowledgeBaseToolConfig(ConfigModel):
+    query_url: NonEmptyString | None = None
+    timeout_seconds: Seconds = 1800
+
+    @field_validator("query_url")
+    @classmethod
+    def check_query_url(cls, value: str | None) -> str | None:
+        if value is not None:
+            url = urlsplit(value)
+            if (
+                url.scheme not in ("http", "https")
+                or not url.hostname
+                or url.username is not None
+                or url.query
+                or url.fragment
+            ):
+                raise ValueError(
+                    "queryUrl must be an HTTP URL without credentials, query or fragment"
+                )
+        return value
+
+
 class ToolConfig(ConfigModel):
     catalog: CatalogPaginationConfig = Field(default_factory=CatalogPaginationConfig)
     defaults: ToolDefaultsConfig = Field(default_factory=ToolDefaultsConfig)
+    knowledge_base: KnowledgeBaseToolConfig = Field(default_factory=KnowledgeBaseToolConfig)
 
 
 class AccessConfig(ConfigModel):

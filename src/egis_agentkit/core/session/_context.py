@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
 from agentscope.app.storage import AgentRecord, SessionRecord
+from pydantic import SecretStr
 
 from egis_agentkit.client.nacos._settings import AccessConfig, AgentKitConfig
 from egis_agentkit.core.agent._definition_base import AgentDefinitionBase
@@ -42,6 +43,35 @@ class SessionExecutionContext:
 session_execution_context: ContextVar[SessionExecutionContext | None] = ContextVar(
     "egis_execution_scope", default=None
 )
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedChatAuthorization:
+    """已验签且通过会话访问校验的聊天请求凭据。"""
+
+    user_id: str
+    agent_id: str
+    session_id: str
+    access_token: SecretStr
+
+
+verified_chat_authorization: ContextVar[VerifiedChatAuthorization | None] = ContextVar(
+    "egis_verified_chat_authorization", default=None
+)
+
+
+def get_verified_chat_token(
+    user_id: str, agent_id: str, session_id: str
+) -> SecretStr | None:
+    authorization = verified_chat_authorization.get()
+    if authorization and (
+        authorization.user_id,
+        authorization.agent_id,
+        authorization.session_id,
+    ) == (user_id, agent_id, session_id):
+        return authorization.access_token
+    return None
+
 
 session_setup_error: ContextVar[AgentKitError | None] = ContextVar(
     "egis_execution_setup_error", default=None

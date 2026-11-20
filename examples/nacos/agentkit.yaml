@@ -121,6 +121,10 @@ agentkit:
       maxCursorLength: 2048
     defaults:
       registeredIds: null
+    knowledgeBase:
+      # 配置知识库的完整 SSE POST /query 地址后开放检索工具。
+      queryUrl: null
+      timeoutSeconds: 1800.0
   access:
     companyGroupId: company
     companyGroupName: 公司组

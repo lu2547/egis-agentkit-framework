@@ -5,7 +5,13 @@ import json
 import logging
 from urllib.parse import parse_qs
 
+from pydantic import SecretStr
+
 from egis_agentkit.client.remote_agent._base import CALLBACK_RESULT_PATH
+from egis_agentkit.core.session._context import (
+    VerifiedChatAuthorization,
+    verified_chat_authorization,
+)
 from egis_agentkit.errors import AgentKitError, Forbidden
 from egis_agentkit.middleware.http._request_logging import log_http_error
 from egis_agentkit.service._virtual_user import VIRTUAL_TOKEN_PREFIX, VirtualUserService
@@ -34,6 +40,7 @@ class IdentityGuard:
         ):
             return await self.app(scope, receive, send)
         body_events = []
+        chat_authorization = None
         try:
             headers = {
                 k.decode("latin-1").lower(): v.decode("latin-1")
@@ -54,7 +61,7 @@ class IdentityGuard:
                 if not VirtualUserService.allows_request(method, path):
                     raise Forbidden("虚拟用户只能使用技能导入接口")
             else:
-                await self._authenticate_user(
+                chat_authorization = await self._authenticate_user(
                     scope, method, path, token, receive, body_events
                 )
         except AgentKitError as exc:
@@ -73,7 +80,11 @@ class IdentityGuard:
                 return body_events.pop(0)
             return await receive()
 
-        return await self.app(scope, replay if body_events else receive, send)
+        marker = verified_chat_authorization.set(chat_authorization)
+        try:
+            return await self.app(scope, replay if body_events else receive, send)
+        finally:
+            verified_chat_authorization.reset(marker)
 
     async def _authenticate_user(
         self, scope, method, path, token, receive, body_events
@@ -107,8 +118,11 @@ class IdentityGuard:
                 raise AgentKitError("无效聊天请求", 400) from exc
             if not isinstance(data, dict):
                 raise AgentKitError("聊天请求必须是对象", 400)
-            await self.services.sessions.get_session_record(
+            session = await self.services.sessions.get_session_record(
                 user, data.get("session_id", ""), agent_id=data.get("agent_id", "")
+            )
+            return VerifiedChatAuthorization(
+                user.user_id, session.agent_id, session.id, SecretStr(token)
             )
         elif path.startswith("/sessions/"):
             parts = path.strip("/").split("/")
