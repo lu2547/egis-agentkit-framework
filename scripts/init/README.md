@@ -60,11 +60,11 @@ bash scripts/init/nas.sh
 psql -X -v ON_ERROR_STOP=1 -f scripts/init/pg.sql
 ```
 
-连接参数来自标准 `PGHOST/PGPORT/PGDATABASE/PGUSER` 及平台认证设置。SQL 为当前企业 cluster 形态：原生 6 表、AgentKit 21 表、PG 消息总线 5 表，共 32 表；包含当前模型的约束、索引与 `sessions.project_id` 生成列。
+连接参数来自标准 `PGHOST/PGPORT/PGDATABASE/PGUSER` 及平台认证设置。SQL 为当前企业 cluster 形态：原生 6 表、AgentKit 23 表、PG 消息总线 5 表，共 34 表；包含当前模型的约束、索引与 `sessions.project_id` 生成列。
 
 本文件只用于首次空 schema：`BEGIN/COMMIT` 保证整批执行，同名表已存在会报错并回滚，不覆盖、不删除原数据。它不创建数据库或角色，不插入默认用户和示例资源；平台默认工具由应用启动流程登记。
 
-已有部署先停止旧版本服务，再通过 App 的 `upgrade-db --database <目标库>` 预览，追加 `--apply` 执行。技能升级会在同一事务内迁移已有版本和共享指针，保留语义版本、授权和 NAS 路径。更早版本的授权结构会先升级；无法确认发布顺序或归属时，升级回滚并保留原记录。
+后续数据库变更由部署流程执行经审核的 SQL 脚本，不重复运行首次初始化脚本。应用 CLI 不提供数据库初始化、升级、清理或重置命令。
 
 `ak_skill_summary` 保存技能归属、首次上传人和 `owner_version`、`shared_version`。两列引用 `ak_skill_detail` 的数字发布序号；明细里的 `resource_version` 保存技能包版本，用于定位 NAS 文件。经审批发布的系统技能（含虚拟用户提交）存入 `NAS_ROOT/common/skills/<skill_id>/<resource_version>/`，个人技能存入 `NAS_ROOT/user/<user_id>/skills/<skill_id>/<resource_version>/`。
 

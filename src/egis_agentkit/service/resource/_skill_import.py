@@ -88,7 +88,6 @@ class SkillImportService:
             resource_id=resource_id,
             import_job_id=f"chat-{digest}",
             owner_type="user",
-            allow_unversioned=True,
         )
         return await self.resources.install(user, "skill", resource_id)
 
@@ -245,9 +244,7 @@ class SkillImportService:
 
     def _validate_submission(self, archive):
         files = read_archive_files(archive, self.resources.archive_limits)
-        return self.resources._skill_data(
-            decode_skill_markdown(files["SKILL.md"]), {}, require_version=True
-        )
+        return self.resources._skill_data(decode_skill_markdown(files["SKILL.md"]), {})
 
     async def claim(self, *, settings=None):
         settings = settings or self._settings()

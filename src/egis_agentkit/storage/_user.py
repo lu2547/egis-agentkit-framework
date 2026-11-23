@@ -40,13 +40,13 @@ class UserStorage:
         )
         return dict(row) if row is not None else None
 
-    async def upsert_identity(self, identity: User) -> None:
+    async def upsert_identity(self, identity: User) -> dict:
         conn = transaction_connection(self.engine, None)
         # Login never updates roles, membership or enablement.
         statement = insert(t.users).values(
             **identity.model_dump(), created_by="identity", updated_by="identity"
         )
-        await conn.execute(
+        result = await conn.execute(
             statement.on_conflict_do_update(
                 index_elements=[t.users.c.user_id],
                 set_={
@@ -54,8 +54,9 @@ class UserStorage:
                     "updated_at": utcnow(),
                     "updated_by": "identity",
                 },
-            )
+            ).returning(t.users)
         )
+        return dict(result.mappings().one())
 
     async def set_admin(self, user_id: str, *, actor: str) -> bool:
         conn = transaction_connection(self.engine, None)

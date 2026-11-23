@@ -9,7 +9,12 @@ from agentscope.app._service._session_projection import SessionProjection
 from agentscope.app._tool._team_create import TeamCreate
 from agentscope.app.message_bus import InMemoryMessageBus, MessageBusKeys
 from agentscope.message import Msg
-from agentscope.permission import PermissionBehavior, PermissionDecision, PermissionMode
+from agentscope.permission import (
+    PermissionBehavior,
+    PermissionDecision,
+    PermissionEngine,
+    PermissionMode,
+)
 from agentscope.tool import Read, Toolkit
 from agentscope.workspace import WorkspaceBase
 from egis_agentkit_app.bootstrap._skill_assistant import provision_skill_assistant
@@ -70,7 +75,10 @@ def ref(writer):
 
 
 @pytest.mark.asyncio
-async def test_candidate_checkbox_scopes_model_invitation_to_current_user(storage, tmp_path):
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.BYPASS])
+async def test_candidate_checkbox_scopes_model_invitation_to_current_user(
+    storage, tmp_path, mode
+):
     import httpx
     from agentscope.app._tool import TeamSay
     from egis_agentkit_app.controller.agent._agent import router
@@ -156,6 +164,23 @@ async def test_candidate_checkbox_scopes_model_invitation_to_current_user(storag
                 await invite(target=target, prompt="请整理材料")
             assert scope.session_record.team_id is None
             assert (await client.put(url)).status_code == 204
+            agent.state.permission_context.mode = mode
+            engine = PermissionEngine(agent.state.permission_context)
+
+            async def native_permission(**kwargs):
+                return await engine.check_permission(
+                    kwargs["tool"], kwargs["tool_input"]
+                )
+
+            decision = await middleware.on_check_permission(
+                agent,
+                {
+                    "tool": invite,
+                    "tool_input": {"target": target, "prompt": "请整理材料"},
+                },
+                native_permission,
+            )
+            assert decision.behavior == PermissionBehavior.ALLOW
             result = await invite(target=target, prompt="请整理材料")
             assert result.state == "success"
             assert await model_tool_names() == {"AgentInvite", "TeamSay"}

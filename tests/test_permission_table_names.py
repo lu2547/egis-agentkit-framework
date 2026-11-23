@@ -79,7 +79,7 @@ async def test_permission_names_upgrade_preserves_approved_access(storage, previ
             text(f'ALTER TABLE ak_resource_permission RENAME TO "{previous}"')
         )
         await conn.execute(text("ALTER TABLE ak_approve RENAME TO ak_share_reviews"))
-    with pytest.raises(ValueError, match="upgrade-db"):
+    with pytest.raises(ValueError, match="部署 SQL 脚本"):
         await storage.init_schema()
     preview = await upgrade_schema(storage.engine)
     assert preview.tables[previous] == "pending"

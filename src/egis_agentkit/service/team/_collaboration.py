@@ -15,10 +15,10 @@ from egis_agentkit.errors import (
     NotFound,
 )
 from egis_agentkit.service.access._permission import PermissionService
-from egis_agentkit.service.agent._agent_manager import get_definition_for_execution
 from egis_agentkit.storage.model import new_id
 from egis_agentkit.storage.model._definition import (
     EXPERT_TYPES,
+    build_definition_options,
     build_definition_reference,
 )
 
@@ -47,22 +47,35 @@ class TeamCollaborationService:
             async with TeamCollaborationService._lock(
                 bus, session_id, session.agent_id
             ):
-                session = await tasks.get_session_record(
-                    user, session_id, check_collaborators=False
+                user, session, _ = await tasks._read_session(
+                    user, session_id, require_use=False
                 )
                 binding = session.state.middle_context["egis_agentkit"]
-                root = await tasks.storage.definitions.get_definition_by_reference(
-                    binding
+                permissions = PermissionService(
+                    tasks.storage,
+                    tasks.config.snapshot.access if tasks.config else None,
                 )
+                references = [
+                    binding,
+                    *collaborators(binding),
+                    *[{**item, "root_resource_type": "agent"} for item in experts],
+                ]
+                snapshot = await permissions.read_snapshot(
+                    user, references, refresh_user=False
+                )
+                await snapshot.require(
+                    binding["root_resource_type"],
+                    binding["definition_id"],
+                    binding["resource_view_type"],
+                    **build_definition_options(binding),
+                )
+                root = await snapshot.definition_view(binding)
                 if not collaboration_allowed(session, root):
                     raise Forbidden(
                         "只有个人智能体主对话可以邀请专家协作；专家不能担任组长，固定专家团不能调整成员"
                     )
                 config = tasks.config.snapshot if tasks.config else None
                 limits = config.team.invite if config else TeamInviteConfig()
-                permissions = PermissionService(
-                    tasks.storage, config.access if config else None
-                )
                 requested = {}
                 for item in experts:
                     identity = item["definition_id"], item["resource_view_type"]
@@ -88,7 +101,7 @@ class TeamCollaborationService:
                         for identity, version in requested.items()
                     ):
                         raise Conflict("邀请请求编号已用于不同的专家选择")
-                    return await tasks.get_session(user, session_id)
+                    return await tasks._view_loaded(session, snapshot)
                 if (
                     not request_id
                     or len(request_id) > limits.max_request_id_length
@@ -112,21 +125,21 @@ class TeamCollaborationService:
                         identity not in requested or not matches_version
                     ):
                         continue
-                    definition = (
-                        await tasks.storage.definitions.get_definition_by_reference(
-                            member
-                        )
-                    )
-                    await permissions.require_execution(
-                        user, definition, allow_pinned=True
-                    )
+                    definition = await snapshot.definition_view(member)
+                    await snapshot.require_execution(definition, allow_pinned=True)
                     retained[identity] = member
                 for (identifier, view), version in sorted(requested.items()):
                     if (identifier, view) in retained:
                         continue
-                    root = await get_definition_for_execution(
-                        permissions, user, "agent", identifier, view, version=version
+                    root = await snapshot.definition_view(
+                        {
+                            "root_resource_type": "agent",
+                            "definition_id": identifier,
+                            "resource_view_type": view,
+                            "resource_version": version,
+                        }
                     )
+                    await snapshot.require_execution(root)
                     if (
                         root["definition_type"] != "agent"
                         or root["agent_type"] not in EXPERT_TYPES
@@ -169,10 +182,8 @@ class TeamCollaborationService:
                         completed=not selection,
                     )
                 )
-                await tasks.storage.update_session_state(
-                    user.user_id, session.agent_id, session.id, session.state
-                )
-        return await tasks.get_session(user, session_id)
+                await tasks.storage.sessions.save_state(session)
+                return await tasks._view_loaded(session, snapshot)
 
     @staticmethod
     async def remove_collaborator(tasks, user, session_id, worker_id, bus):
@@ -183,9 +194,17 @@ class TeamCollaborationService:
             tasks.projects.guard(user, project_id),
             TeamCollaborationService._lock(bus, session_id, parent.agent_id),
         ):
-            parent = await tasks.get_session_record(user, session_id, require_use=False)
+            user, parent, _ = await tasks._read_session(
+                user, session_id, require_use=False
+            )
             binding = parent.state.middle_context["egis_agentkit"]
-            root = await tasks.storage.definitions.get_definition_by_reference(binding)
+            permissions = PermissionService(
+                tasks.storage, tasks.config.snapshot.access if tasks.config else None
+            )
+            snapshot = await permissions.read_snapshot(
+                user, [binding], refresh_user=False
+            )
+            root = await snapshot.definition_view(binding)
             if not collaboration_allowed(parent, root):
                 raise Forbidden("只有个人助理对话可以调整协作专家")
             member = next(
@@ -220,7 +239,13 @@ class TeamCollaborationService:
                     {"session_id": worker_id},
                 )
                 raise
-        return await tasks.get_session(user, session_id)
+            await snapshot.require(
+                binding["root_resource_type"],
+                binding["definition_id"],
+                binding["resource_view_type"],
+                **build_definition_options(binding),
+            )
+            return await tasks._view_loaded(parent, snapshot)
 
     @staticmethod
     async def _detach(tasks, user, parent, binding, member):
@@ -312,13 +337,15 @@ def pending_request_id(binding):
     )
 
 
-async def validate_collaborators(permissions, user, binding):
-    """读取并校验会话实际引用的临时协作专家。"""
+async def validate_collaborators(permissions, user, binding, *, snapshot=None):
+    """在当前边界批读会话引用的专家及执行依赖，仍校验实时授权。"""
+    selected = collaborators(binding)
+    if not selected:
+        return {}
+    snapshot = snapshot or await permissions.read_snapshot(user, selected)
     definitions = {}
-    for member in collaborators(binding):
-        definition = await permissions.storage.definitions.get_definition_by_reference(
-            member
-        )
-        await permissions.require_execution(user, definition, allow_pinned=True)
+    for member in selected:
+        definition = await snapshot.definition_view(member)
+        await snapshot.require_execution(definition, allow_pinned=True)
         definitions[member["native_agent_id"]] = definition
     return definitions

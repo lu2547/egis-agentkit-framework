@@ -290,6 +290,7 @@ async def test_system_default_workspace_tools_load_without_installation_or_grant
 ):
     from types import SimpleNamespace
 
+    from agentscope import __version__ as sdk_version
     from agentscope.tool import Bash, Read, Toolkit
     from runtime_helpers import sandbox_manager
     from test_read_tool_guard import execute
@@ -338,13 +339,13 @@ async def test_system_default_workspace_tools_load_without_installation_or_grant
         binary.write_bytes(b"PK\0binary")
         assert (await execute(toolkit, binary))[-1].state == "error"
 
-        view = await resources.detail(alice, "tool", "Read", "1.0.0")
+        view = await resources.detail(alice, "tool", "Read", sdk_version)
         assert view["is_system_default"] and view["is_installed"] and view["is_enabled"]
         with pytest.raises(Forbidden):
             await resources.update_installation(alice, "tool", "Read", False)
         with pytest.raises(Conflict):
             await resources.set_asset_enabled(
-                admin, "tool", "Read", "1.0.0", False, admin=True
+                admin, "tool", "Read", sdk_version, False, admin=True
             )
     finally:
         session_execution_context.reset(token)

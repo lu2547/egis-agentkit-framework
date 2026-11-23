@@ -4,7 +4,7 @@ AgentScope 的配置管理与企业增强框架。首版已实现，不修改 Ag
 
 首次环境初始化见 [scripts/init](scripts/init/README.md)：面向企业已提供的 NAS、Nacos、Redis、Kafka、PG，包含目录初始化、配置发布、Topic 创建和业务建表 SQL；脚本不安装或启动基础设施。
 
-已有环境的增量发布见 [scripts/releases](scripts/releases/README.md)。按版本归档 SQL、Nacos 和镜像变更及执行顺序；[1.0.2](scripts/releases/1.0.2/README.md) 包含本次 3 个新索引、2 个冗余索引移除及 AgentScope 2.0.12 配套操作。
+已有环境的增量发布见 [scripts/releases](scripts/releases/README.md)。按版本归档 SQL、Nacos 和镜像变更及执行顺序；[1.0.3](scripts/releases/1.0.3/README.md) 包含当前数据库增量、配置核对、SDK 补丁及部署顺序，功能清单见 [Release Notes](scripts/releases/1.0.3/release-notes.md)。
 
 数据库支持 Nacos `agentkit.client.postgres.connection.mode: key | cyberark`：key 使用 password 字段，cyberark 使用 CCP REST 获取新建连接所需密码。日志配置位于 `agentkit.logging`；Phoenix 导出位于 `agentkit.client.tracing`，启动后由原生 TracingMiddleware 记录回复、模型和工具调用，Framework 管理导出和关闭。配置示例及运维步骤见上述初始化说明。
 
@@ -27,9 +27,21 @@ App CLI 使用 Python `logging.config.dictConfig` 统一配置 AgentKit、AgentS
 
 App 通过具名 `AgentKitServices` 调用业务服务。聊天循环、团队通信、消息事件、HITL、SSE 和模型调用继续使用 AgentScope。
 
-运行中引导复用 `POST /chat/`：请求带 `delivery: "steer"`，`input` 接收一条原生用户 Msg 或有序的 Msg 数组。每条 Msg 使用稳定的 `id`，重试时复用同一 ID 和内容；冲突复用返回 409。普通聊天省略 delivery，审批事件沿用原协议。引导不取消当前模型或工具调用；原生 InboxMiddleware 在下一次 reasoning 前接收，等待审批时先保留，恢复后接收。SSE `HINT_BLOCK.block_id` 对应引导消息 ID，表示已加入模型上下文。
+AgentScope 运行时最低版本为 2.0.12。原生内置工具使用 SDK 版本登记，升级不会覆盖已登记的不可变工具记录；部署业务工具继续使用自己的版本。普通消息和运行中补充都通过 `POST /chat/` 进入原生 FIFO，返回 `status: "queued"` 与 `queue_item_id`。省略自定义 delivery 字段，审批及继续执行仍沿用原生控制事件。运行中快捷键只入队；点击引导按钮才把指定队列项关联到当前 `reply_id`。原生 SteeringMiddleware 在模型推理边界注入，不取消正在进行的模型或工具调用。
 
-集群模式使用现有 `messages` 和 PG Inbox，在同一事务内保存用户记录与队列内容；没有新增表或 Topic。`agentkit.session.steering` 配置 `maxBatchSize`、`maxMessageBytes`、`maxTextLength`、`wakeupRetrySeconds`，输入区通过 `/manager/runtime-options` 读取。standalone 继续使用原生内存总线，其队列不跨进程重启保留。
+队列接口统一校验 JWT、会话归属、项目状态和当前资源权限；读写均需 `agent_id`、`session_id`，重复查询标识会被拒绝。
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /chat/queue` | 恢复待发消息及状态 |
+| `PATCH /chat/queue/order` | 以完整 `item_ids` 列表调整顺序 |
+| `PATCH /chat/queue/{item_id}` | 更新尚未注入的消息 |
+| `DELETE /chat/queue/{item_id}` | 删除尚未注入的消息 |
+| `POST /chat/queue/{item_id}/steer` | 用 `reply_id` 指定本轮引导目标 |
+
+SSE `chat_queue_changed` 同步队列快照，`chat_input_injected` 表示实际接收，`chat_input_steer_failed` 保留失败项供修改重试。本轮未消费的引导退回普通待发队列；`chat_input_started` 表示队列消息开始下一轮执行。消息 ID、文件引用和批注通过展示投影保留在原生消息历史和事件回放中，不增加第二条投递链路。
+
+集群模式使用 PostgreSQL 消息总线保存队列，支持跨实例和刷新恢复，没有新增表或 Kafka Topic。`agentkit.session.steering` 配置 `maxBatchSize`、`maxMessageBytes`、`maxTextLength`，输入区通过 `/manager/runtime-options` 读取。standalone 使用原生内存总线，队列不会跨服务重启保留。
 
 长回复重放：企业消息总线保留尚未被消息检查点覆盖的完整事件，下一条回复开始时清理已落库的前缀。不能按固定 1000 条裁掉正在生成的回复开头。当前同时依赖仓库内 AgentScope 会话 SSE 路由的分页修复（`app/_router/_session.py`），重放读完所有页后才切到实时订阅；发布时需一并构建这份依赖，不能替换成未包含修复的同名发行包。通过 `tests/test_session_replay.py` 验证超过单页长度的重放与 PostgreSQL 保留规则。
 
@@ -51,18 +63,11 @@ Agent 当前实现见 [Agent 管理与定义](./docs/Agent管理与定义.md)，
 
 系统技能正式文件保存在 `{workspaceRoot}/common/skills/{skill_id}/{version}/`，个人技能保存在 `{workspaceRoot}/user/{owner_id}/skills/{skill_id}/{version}/`。私人技能获准共享后仍从原作者目录加载。数据库记录资源版本、内容摘要、实际上传人和使用授权。运行时按获准使用的版本加载，下载时从正式文件生成 ZIP。
 
-普通用户、管理员和经授权的外部系统使用 `POST /manager/skills/imports` 提交 ZIP。管理员在用户管理签发虚拟用户 Bearer 凭证，外部系统可先用 `GET /manager/skills/imports` 验证凭证。系统技能通过导入审核后发布，实际上传人和审核人分别记录。上传 ZIP 暂存在 Nacos 的 `agentkit.skill.storage.root` 下，任务成功或审核拒绝后删除。
+普通用户和管理员使用 `POST /manager/skills/imports` 提交 ZIP。外部系统使用管理员签发的虚拟用户 Bearer 凭证，通过 `POST /integrations/skills/imports` 提交 ZIP，可先用同一路径的 GET 验证凭证。系统技能通过导入审核后发布，实际上传人和审核人分别记录。上传 ZIP 暂存在 Nacos 的 `agentkit.skill.storage.root` 下，任务成功或审核拒绝后删除。
 
-已有开发库可使用 App 的显式重置命令。先停止 API 和导入 Worker，将 `DB_NAME` 设为 Nacos 配置中的当前开发库名，预览目标库及目录后再执行：
+首次部署由部署流程或 DBA 执行 [PG 初始化脚本](scripts/init/pg.sql)。数据库结构变更、数据清理和技能目录维护统一由部署脚本负责；应用 CLI 仅保留服务启动与指定用户的管理员授权。
 
-```bash
-python -m egis_agentkit_app reset-skills --database "$DB_NAME"
-python -m egis_agentkit_app reset-skills --database "$DB_NAME" --apply
-```
-
-重置清理技能记录、授权、导入文件和 Agent 定义中的技能绑定，重建导入表。新部署直接执行 `init-db`。
-
-启动和真实联调见 [App](../egis-agentkit-app/README.md) 与 [实施记录](../egis-agentkit-app/docs/实施记录.md)。产品包版本为 1.0.2，配套本地 AgentScope 2.0.12 源码及会话 SSE 重放分页修复；API 与沙箱镜像使用同一份 SDK 制品。发布配置基线及操作步骤见 [1.0.2 发布说明](scripts/releases/1.0.2/README.md)。
+启动和真实联调见 [App](../egis-agentkit-app/README.md) 与 [实施记录](../egis-agentkit-app/docs/实施记录.md)。产品包版本为 1.0.3，配套本地 AgentScope 2.0.12 源码及会话 SSE 重放分页修复；API 与沙箱镜像使用同一份 SDK 制品。发布配置基线及操作步骤见 [1.0.3 发布说明](scripts/releases/1.0.3/README.md)。
 
 项目共享工作空间与删除规则见 [文件生命周期](docs/session-files.md)。
 

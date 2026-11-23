@@ -4,7 +4,6 @@
 - acquire_lock 在原生锁内调用会话准备 Service，失败交原生运行错误处理。
 - subscribe 传递订阅就绪通知，不缓存或重排 SSE 事件。
 - publish 观察原生失败终态，保持原消息及传输方式不变。
-- publish 记录用户引导的原生接收确认，供消息历史恢复状态。
 """
 
 import logging
@@ -21,9 +20,10 @@ from egis_agentkit.core.session._context import (
     session_setup_error,
     stream_subscription_ready,
 )
-from egis_agentkit.core.session._steering import STEERING_SOURCE
 from egis_agentkit.errors import AgentKitError
+from egis_agentkit.service.session._authorization import ChatAuthorizationStore
 from egis_agentkit.service.session._preparation import SessionPreparationService
+from egis_agentkit.service.session._steering_projection import SteeringPresentation
 from egis_agentkit.service.team._collaboration import collaborators
 from egis_agentkit.service.team._progress import OBSERVED_EVENTS, CollaboratorProgress
 
@@ -34,13 +34,53 @@ class SessionMessageBus(EgisMessageBus):
     """在原生消息总线上接入执行上下文和会话事件。"""
 
     coordinator: SessionPreparationService | None = None
-    steering = None
 
-    def __init__(self, *, tracing=None, **kwargs):
+    def __init__(self, *, tracing=None, presentation_storage=None, **kwargs):
         """复用原生总线构造；Tracing 只观察锁及运行，不改变消息或租约协议。"""
         super().__init__(**kwargs)
+        self.steering_presentation = (
+            SteeringPresentation(self, presentation_storage)
+            if presentation_storage is not None
+            else None
+        )
         self.tracing = tracing
         self.collaborator_progress = CollaboratorProgress(self)
+
+    async def purge_sessions(self, session_ids, *, extra_registry_namespaces=()):
+        session_ids = tuple(session_ids)
+        return await super().purge_sessions(
+            session_ids,
+            extra_registry_namespaces=(
+                *extra_registry_namespaces,
+                *(ChatAuthorizationStore.namespace(sid) for sid in session_ids),
+            ),
+        )
+
+    async def queue_remove_if(self, key, matches):
+        staged = (
+            await self.steering_presentation.stage(key, matches)
+            if self.steering_presentation
+            else []
+        )
+        removed = await super().queue_remove_if(key, matches)
+        if not removed and staged:
+            await self.steering_presentation.discard(
+                key[len(MessageBusKeys.chat_inputs("")) :], staged
+            )
+        return removed
+
+    async def log_append(self, key, payload, *, ttl_secs=None, max_len=None):
+        prefix = MessageBusKeys.session_events("")
+        if (
+            self.steering_presentation is not None
+            and key.startswith(prefix)
+            and payload.get("type") == EventType.HINT_BLOCK
+            and payload.get("source") == "chat_input_steering"
+        ):
+            await self.steering_presentation.project(key[len(prefix) :], payload)
+        return await super().log_append(
+            key, payload, ttl_secs=ttl_secs, max_len=max_len
+        )
 
     async def queue_push(self, key, payload, *, ttl_secs=None):
         result = await super().queue_push(key, payload, ttl_secs=ttl_secs)
@@ -56,17 +96,7 @@ class SessionMessageBus(EgisMessageBus):
         return result
 
     async def publish(self, key, payload):
-        """观察原生失败终态和引导回执。"""
-        if (
-            self.steering is not None
-            and key.startswith(MessageBusKeys.session_events(""))
-            and isinstance(payload, dict)
-            and payload.get("type") == EventType.HINT_BLOCK
-            and payload.get("source") == STEERING_SOURCE
-        ):
-            await self.steering.received(
-                key[len(MessageBusKeys.session_events("")) :], payload["block_id"]
-            )
+        """观察原生失败终态和协作进度。"""
         if (
             key.startswith(MessageBusKeys.session_events(""))
             and isinstance(payload, dict)
@@ -91,15 +121,20 @@ class SessionMessageBus(EgisMessageBus):
                 parent = scope.binding.get("collaboration_parent_session_id")
                 if parent:
                     await self.collaborator_progress.observe(
-                        parent, session_id, scope.agent_id,
-                        scope.definition["agent_display_name"], event,
+                        parent,
+                        session_id,
+                        scope.agent_id,
+                        scope.definition["agent_display_name"],
+                        event,
                     )
             elif (
                 event["type"] == EventType.REPLY_END
                 and session_setup_error.get() is not None
                 and isinstance(self.coordinator, SessionPreparationService)
             ):
-                target = await self.coordinator.collaboration_progress_target(session_id)
+                target = await self.coordinator.collaboration_progress_target(
+                    session_id
+                )
                 if target is not None:
                     parent, agent_id, name = target
                     await self.collaborator_progress.observe(

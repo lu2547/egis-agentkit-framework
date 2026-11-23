@@ -65,7 +65,7 @@ async def test_project_upgrade_retains_records_and_backfills_user_workspace(
             ),
             {"pid": pid, "sid": sid},
         )
-    with pytest.raises(ValueError, match="upgrade-db"):
+    with pytest.raises(ValueError, match="部署 SQL 脚本"):
         await storage.init_schema()
     preview = await upgrade_schema(storage.engine)
     assert preview.tables["Session Workspace 身份"] == "pending"
@@ -102,6 +102,13 @@ async def test_upgrade_consolidates_equivalent_indexes_from_both_previous_names(
 ):
     """两次历史改名留下的重复索引，不能在最终统一命名时相互冲突。"""
     async with storage.engine.begin() as conn:
+        # Current provisioning replaces this prefix index with the page index;
+        # reproduce the historical schema explicitly for this migration test.
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_ak_project_file_changes_project_id ON ak_project_file_changes(project_id)"
+            )
+        )
         await conn.execute(
             text(
                 "ALTER TABLE ak_project_file_changes RENAME TO ak_workspace_file_changes"
@@ -142,6 +149,11 @@ async def test_upgrade_consolidates_equivalent_indexes_from_both_previous_names(
 @pytest.mark.asyncio
 async def test_upgrade_rejects_same_named_index_with_different_definition(storage):
     async with storage.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_ak_project_file_changes_project_id ON ak_project_file_changes(project_id)"
+            )
+        )
         await conn.execute(
             text(
                 "ALTER TABLE ak_project_file_changes RENAME TO ak_workspace_file_changes"

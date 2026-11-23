@@ -1,0 +1,34 @@
+diff --git a/src/agentscope/app/_router/_session.py b/src/agentscope/app/_router/_session.py
+index 9ed7f1aa..4dfc6fd6 100644
+--- a/src/agentscope/app/_router/_session.py
++++ b/src/agentscope/app/_router/_session.py
+@@ -928,13 +928,22 @@ async def stream_session_events(
+                 timeout=_SUBSCRIBE_TIMEOUT_SECS,
+             )
+             seen_entry_ids: set[str] = set()
+-            for entry_id, event in await message_bus.log_read(
+-                events_key,
+-                since=after,
+-                max_count=MessageBusKeys.SESSION_REPLAY_MAX_LEN,
+-            ):
+-                seen_entry_ids.add(str(entry_id))
+-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
++            # The bus may retain an entire uncheckpointed reply, which can
++            # exceed one read page. Drain every page before consuming live
++            # events, retaining seam deduplication across the whole replay.
++            replay_cursor = after
++            while True:
++                entries = await message_bus.log_read(
++                    events_key,
++                    since=replay_cursor,
++                    max_count=MessageBusKeys.SESSION_REPLAY_MAX_LEN,
++                )
++                for entry_id, event in entries:
++                    seen_entry_ids.add(str(entry_id))
++                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
++                if len(entries) < MessageBusKeys.SESSION_REPLAY_MAX_LEN:
++                    break
++                replay_cursor = str(entries[-1][0])
+
+             # Inject pending subagent HITL cards projected onto this
+             # session as a team leader. These live in a durable registry,

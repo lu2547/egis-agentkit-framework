@@ -206,7 +206,16 @@ async def test_unmodified_native_dispatchers_spawn_and_cancel_across_nodes(kafka
         def __init__(self, bus):
             self.bus = bus
 
-        async def run(self, *, user_id, session_id, agent_id, input_msg):
+        async def run(
+            self,
+            *,
+            user_id,
+            session_id,
+            agent_id,
+            input_msg,
+            client_external_tools=None,
+            client_builtin_tools=None,
+        ):
             async with self.bus.acquire_lock(MessageBusKeys.session_lock(session_id)):
                 started.append(session_id)
                 try:

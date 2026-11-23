@@ -8,7 +8,7 @@
 
 from collections.abc import Collection
 
-from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy import and_, func, or_, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -35,6 +35,203 @@ class AccessStorage:
 
     def __init__(self, engine: AsyncEngine | PostgresTransaction):
         self.engine = engine
+
+    async def definition_listing_grants(self, user_id, group_ids, resources, grant_ids):
+        """列表一次读取用户可用的直接授权，以及会话明确引用的授权状态。"""
+        if not resources:
+            return []
+        grants = t.resource_permission
+        enabled_groups = select(t.groups.c.group_id).where(
+            t.groups.c.group_id.in_(group_ids), t.groups.c.is_enabled
+        )
+        recipient = or_(
+            and_(grants.c.principal_type == "user", grants.c.principal_id == user_id),
+            and_(
+                grants.c.principal_type == "group",
+                grants.c.principal_id.in_(enabled_groups),
+            ),
+        )
+        query = (
+            select(grants, recipient.label("is_for_user"))
+            .where(
+                grants.c.revoked_at.is_(None),
+                grants.c.root_grant_id.is_(None),
+                tuple_(grants.c.resource_type, grants.c.resource_id).in_(resources),
+                or_(recipient, grants.c.id.in_(grant_ids)),
+            )
+            .order_by(grants.c.granted_at.desc(), grants.c.id)
+        )
+        async with self.engine.connect() as conn:
+            return [dict(row) for row in (await conn.execute(query)).mappings()]
+
+    async def active_root_grants(self, grant_ids):
+        if not grant_ids:
+            return []
+        grants = t.resource_permission
+        async with self.engine.connect() as conn:
+            return [
+                dict(row)
+                for row in (
+                    await conn.execute(
+                        select(grants).where(
+                            grants.c.id.in_(grant_ids),
+                            grants.c.root_grant_id.is_(None),
+                            grants.c.revoked_at.is_(None),
+                        )
+                    )
+                ).mappings()
+            ]
+
+    async def authorization_grants(
+        self, user_id, group_ids, resources, *, grant_ids=()
+    ):
+        """One scoped grant set, including dependencies and explicitly pinned sources."""
+        if not resources:
+            return []
+        grants = t.resource_permission
+        enabled_groups = select(t.groups.c.group_id).where(
+            t.groups.c.group_id.in_(group_ids), t.groups.c.is_enabled
+        )
+        recipient = or_(
+            and_(grants.c.principal_type == "user", grants.c.principal_id == user_id),
+            and_(
+                grants.c.principal_type == "group",
+                grants.c.principal_id.in_(enabled_groups),
+            ),
+        )
+        query = (
+            select(grants, recipient.label("is_for_user"))
+            .where(
+                grants.c.revoked_at.is_(None),
+                tuple_(grants.c.resource_type, grants.c.resource_id).in_(resources),
+                or_(recipient, grants.c.id.in_(grant_ids)),
+            )
+            .order_by(grants.c.granted_at.desc(), grants.c.id)
+        )
+        async with self.engine.connect() as conn:
+            return [dict(row) for row in (await conn.execute(query)).mappings()]
+
+    async def pending_updates(self, resources):
+        if not resources:
+            return set()
+        reviews = t.approvals
+        query = (
+            select(reviews.c.resource_type, reviews.c.resource_id)
+            .where(
+                tuple_(reviews.c.resource_type, reviews.c.resource_id).in_(resources),
+                reviews.c.review_type == "update",
+                reviews.c.review_status_type == "pending",
+            )
+            .distinct()
+        )
+        async with self.engine.connect() as conn:
+            return set((await conn.execute(query)).all())
+
+    async def approved_reviews(self, review_ids):
+        """批量核对没有授权 ID 的显式审核引用。"""
+        if not review_ids:
+            return {}
+        async with self.engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    select(t.approvals).where(
+                        t.approvals.c.review_id.in_(review_ids),
+                        t.approvals.c.is_current,
+                        t.approvals.c.review_status_type == "approved",
+                    )
+                )
+            ).mappings()
+            return {row["review_id"]: dict(row) for row in rows}
+
+    async def skill_write_state(
+        self,
+        identifier,
+        *,
+        target=None,
+        version=None,
+        owner_version=False,
+        owner_id=None,
+    ):
+        """Join this locked item's version, recipient and sharing predicates."""
+        from .skill._definition import _asset_record, _definition_query
+
+        summary, detail = t.skill_summary, t.skill_detail
+        shared = detail.alias("shared_skill")
+        query = (
+            _definition_query()
+            .outerjoin(
+                shared,
+                and_(
+                    shared.c.skill_id == summary.c.skill_id,
+                    shared.c.version == summary.c.shared_version,
+                ),
+            )
+            .add_columns(shared.c.resource_version.label("_shared_resource_version"))
+        )
+        query = query.where(summary.c.skill_id == identifier)
+        if version is not None:
+            query = query.where(detail.c.resource_version == str(version))
+        else:
+            selected = (
+                summary.c.owner_version
+                if owner_version
+                else func.coalesce(summary.c.shared_version, summary.c.owner_version)
+            )
+            query = query.where(detail.c.version == selected)
+        if target is not None:
+            principal = t.users if target.principal_type == "user" else t.groups
+            key = (
+                principal.c.user_id
+                if target.principal_type == "user"
+                else principal.c.group_id
+            )
+            recipient = (
+                select(key)
+                .where(key == target.principal_id, principal.c.is_enabled)
+                .exists()
+            )
+            grants = t.resource_permission
+            direct = (
+                select(grants.c.id)
+                .where(
+                    grants.c.resource_type == "skill",
+                    grants.c.resource_id == identifier,
+                    grants.c.grant_source_type == "share",
+                    grants.c.revoked_at.is_(None),
+                    grants.c.principal_type == target.principal_type,
+                    grants.c.principal_id == target.principal_id,
+                )
+                .exists()
+            )
+            query = query.add_columns(
+                recipient.label("_recipient_enabled"),
+                direct.label("_has_share_recipient"),
+            )
+        pending = (
+            select(t.approvals.c.review_id)
+            .where(
+                t.approvals.c.resource_type == "skill",
+                t.approvals.c.resource_id == identifier,
+                t.approvals.c.review_type == "update",
+                t.approvals.c.review_status_type == "pending",
+            )
+            .exists()
+        )
+        query = query.add_columns(pending.label("_has_pending_update"))
+        if owner_id is not None:
+            query = query.add_columns(
+                select(t.users.c.user_id)
+                .where(t.users.c.user_id == owner_id)
+                .exists()
+                .label("_owner_exists"),
+                select(t.users.c.user_id)
+                .where(t.users.c.user_id == owner_id, t.users.c.is_enabled)
+                .exists()
+                .label("_owner_enabled"),
+            )
+        async with self.engine.connect() as conn:
+            row = (await conn.execute(query)).mappings().first()
+            return _asset_record(row) if row is not None else None
 
     async def lock_writes(self, *, conn=None):
         conn = transaction_connection(self.engine, conn)
@@ -97,7 +294,9 @@ class AccessStorage:
             rows = await conn.execute(statement)
             return [dict(row) for row in rows.mappings()]
 
-    async def direct_grants(self, kind, identifier, *, include_revoked=False, conn=None):
+    async def direct_grants(
+        self, kind, identifier, *, include_revoked=False, conn=None
+    ):
         """查询同一资源当前有效的所有直接授权。"""
         if conn is None:
             async with self.engine.connect() as connection:
@@ -271,12 +470,16 @@ class AccessStorage:
                     ),
                 ),
             )
-            .order_by(t.resource_permission.c.granted_at.desc(), t.resource_permission.c.id)
+            .order_by(
+                t.resource_permission.c.granted_at.desc(), t.resource_permission.c.id
+            )
         )
         if kind is not None:
             statement = statement.where(t.resource_permission.c.resource_type == kind)
         if resource_id is not None:
-            statement = statement.where(t.resource_permission.c.resource_id == resource_id)
+            statement = statement.where(
+                t.resource_permission.c.resource_id == resource_id
+            )
         rows = await conn.execute(statement)
         return [dict(row) for row in rows.mappings()]
 
@@ -295,6 +498,49 @@ class AccessStorage:
             ).returning(t.resource_permission)
         )
         return dict(result.mappings().one())
+
+    async def upsert_grants(self, values, *, actor, conn=None):
+        """Deduplicate a bounded grant layer and preserve existing source IDs."""
+        conn = transaction_connection(self.engine, conn)
+        unique = {tuple(value.get(key) for key in GRANT_KEY): value for value in values}
+        if not unique:
+            return []
+        now = utcnow()
+        rows = list(unique.values())
+        result = []
+        # asyncpg caps one statement at 32767 arguments. Each grant has at
+        # most 19 columns; cap layers independently of the number of roots.
+        for offset in range(0, len(rows), 1000):
+            statement = insert(t.resource_permission).values(
+                [
+                    {**value, "granted_by": actor, "granted_at": now}
+                    for value in rows[offset : offset + 1000]
+                ]
+            )
+            batch = await conn.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[t.resource_permission.c[key] for key in GRANT_KEY],
+                    index_where=t.resource_permission.c.revoked_at.is_(None),
+                    set_={"origin_key": statement.excluded.origin_key},
+                ).returning(t.resource_permission)
+            )
+            result.extend(dict(row) for row in batch.mappings())
+        return result
+
+    async def revoke_dependencies_many(self, retained, *, actor, conn=None):
+        conn = transaction_connection(self.engine, conn)
+        if not retained:
+            return
+        grants = t.resource_permission
+        predicates = [
+            and_(grants.c.root_grant_id == root_id, grants.c.id.not_in(ids))
+            for root_id, ids in retained.items()
+        ]
+        await conn.execute(
+            update(grants)
+            .where(grants.c.revoked_at.is_(None), or_(*predicates))
+            .values(revoked_at=utcnow(), revoked_by=actor)
+        )
 
     async def active_grant(self, grant_id, resource_id, *, conn=None):
         if conn is None:
@@ -339,7 +585,9 @@ class AccessStorage:
                     select(t.resource_permission)
                     .where(
                         t.resource_permission.c.id == grant_id,
-                        t.resource_permission.c.grant_source_type.in_(("manual", "share")),
+                        t.resource_permission.c.grant_source_type.in_(
+                            ("manual", "share")
+                        ),
                         t.resource_permission.c.root_grant_id.is_(None),
                     )
                     .with_for_update()
@@ -500,6 +748,28 @@ class AccessStorage:
             statement = (
                 statement.order_by(t.approvals.c.review_id).offset(offset).limit(limit)
             )
+        selected = statement.subquery("review_page")
+        detail = t.skill_detail
+        statement = (
+            select(selected, detail.c.version.label("_publication_revision"))
+            .select_from(selected)
+            .outerjoin(
+                detail,
+                and_(
+                    selected.c.resource_type == "skill",
+                    selected.c.resource_id == detail.c.skill_id,
+                    selected.c.resource_version == detail.c.resource_version,
+                    select(t.skill_summary.c.skill_id)
+                    .where(
+                        t.skill_summary.c.skill_id == detail.c.skill_id,
+                        t.skill_summary.c.is_enabled,
+                    )
+                    .correlate(detail)
+                    .exists(),
+                ),
+            )
+            .order_by(selected.c.submitted_at.desc(), selected.c.review_id)
+        )
         async with self.engine.connect() as conn:
             rows = await conn.execute(statement)
             return [dict(row) for row in rows.mappings()]
@@ -511,9 +781,29 @@ class AccessStorage:
         row = (
             (
                 await conn.execute(
-                    select(t.approvals)
+                    select(
+                        t.approvals,
+                        t.skill_detail.c.version.label("_publication_revision"),
+                    )
+                    .select_from(t.approvals)
+                    .outerjoin(
+                        t.skill_detail,
+                        and_(
+                            t.approvals.c.resource_type == "skill",
+                            t.approvals.c.resource_id == t.skill_detail.c.skill_id,
+                            t.approvals.c.resource_version
+                            == t.skill_detail.c.resource_version,
+                            select(t.skill_summary.c.skill_id)
+                            .where(
+                                t.skill_summary.c.skill_id == t.skill_detail.c.skill_id,
+                                t.skill_summary.c.is_enabled,
+                            )
+                            .correlate(t.skill_detail)
+                            .exists(),
+                        ),
+                    )
                     .where(t.approvals.c.review_id == review_id)
-                    .with_for_update()
+                    .with_for_update(of=t.approvals)
                 )
             )
             .mappings()

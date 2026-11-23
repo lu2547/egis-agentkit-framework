@@ -1,10 +1,12 @@
 """读写项目记录并管理项目生命周期锁。"""
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from sqlalchemy import delete, func, insert, select, text, update
 
 from egis_agentkit.client._postgres import PostgresTransaction
+from egis_agentkit.storage._schedule import ScheduleStorage
 from egis_agentkit.storage.model import _tables as t
 
 _PROJECT_FIELDS = tuple(
@@ -62,6 +64,21 @@ class ProjectStorage:
             t.projects.c.owner_id == user_id, t.projects.c.id == project_id
         )
 
+    async def get_many(self, user_id, project_ids):
+        """按所有者批量读取项目；不把其他用户的项目带入结果。"""
+        if not project_ids:
+            return {}
+        async with self.engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    select(*_PROJECT_FIELDS).where(
+                        t.projects.c.owner_id == user_id,
+                        t.projects.c.id.in_(project_ids),
+                    )
+                )
+            ).mappings()
+            return {row["id"]: dict(row) for row in rows}
+
     async def get_default(self, user_id):
         """读取用户的默认项目。"""
         return await self._get(
@@ -94,11 +111,14 @@ class ProjectStorage:
     async def rename(self, user_id, project_id, name):
         """在生命周期锁内更新所属项目的名称。"""
         async with self.engine.connect() as conn:
-            await conn.execute(
+            row = await conn.execute(
                 update(t.projects)
                 .where(t.projects.c.id == project_id, t.projects.c.owner_id == user_id)
                 .values(project_name=name, updated_by=user_id, updated_at=func.now())
+                .returning(*_PROJECT_FIELDS)
             )
+            result = row.mappings().first()
+            return dict(result) if result is not None else None
 
     async def list(self, user_id):
         """按创建时间列出用户的项目。"""
@@ -115,11 +135,15 @@ class ProjectStorage:
     async def mark_deleting(self, user_id, project_id):
         """提交可供重试识别的删除状态。"""
         async with self.engine.begin() as conn:
-            await conn.execute(
+            result = await conn.execute(
                 update(t.projects)
                 .where(t.projects.c.id == project_id, t.projects.c.owner_id == user_id)
                 .values(status_type="deleting")
             )
+            if result.rowcount:
+                await ScheduleStorage(PostgresTransaction(conn)).disable_project(
+                    user_id, project_id, datetime.now(timezone.utc)
+                )
 
     async def delete(self, user_id, project_id):
         """在清理事务内删除所属项目。"""

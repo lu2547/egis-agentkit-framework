@@ -1,6 +1,6 @@
 """保存 Agent 和 Team 的当前状态，并按版本读取不可变配置。"""
 
-from sqlalchemy import and_, func, select, text, update
+from sqlalchemy import and_, func, or_, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -117,6 +117,59 @@ def _validate_version_number(version):
     return int(value)
 
 
+def definition_view_selection(
+    row,
+    view,
+    *,
+    version=None,
+    grant_id=None,
+    review_id=None,
+    grant=None,
+    review=None,
+    allow_pinned=False,
+    dependency=False,
+):
+    """单条和批量读取共用的定义视图、固定版本和来源检查。"""
+    if not resource_available(row):
+        raise Forbidden("资源已停用")
+    if (view == "system") != (row["owner_type"] == "system"):
+        raise Forbidden("资源视图不匹配")
+    metadata = {}
+    selected = version
+    if grant_id is not None:
+        if grant is None or (
+            grant["resource_id"],
+            grant["resource_type"],
+            grant["resource_view_type"],
+        ) != (row["id"], row["definition_type"], view):
+            raise Forbidden("授权已撤销或视图不匹配")
+        if review_id is not None and review_id != grant["source_review_id"]:
+            raise Forbidden("共享审核与授权不匹配")
+        metadata["access_grant_id"] = grant_id
+        if grant["source_review_id"] is not None:
+            metadata["shared_review_id"] = grant["source_review_id"]
+    elif review_id is not None:
+        if view != "shared":
+            raise Forbidden("资源视图不匹配")
+        if review is None or (review["resource_id"], review["resource_type"]) != (
+            row["id"],
+            row["definition_type"],
+        ):
+            raise Forbidden("资源尚未通过共享审核")
+        metadata["shared_review_id"] = review_id
+    if view == "shared" and not dependency:
+        shared = row["shared_version"]
+        if shared is None:
+            raise Forbidden("资源尚未共享")
+        if not (allow_pinned and grant_id is not None and version is not None):
+            selected = shared
+    if view == "system" and grant_id is not None and not allow_pinned:
+        selected = row["owner_version"]
+    if version is not None and str(version) != str(selected):
+        raise Forbidden("资源版本与授权不匹配")
+    return selected, metadata
+
+
 class DefinitionStorage:
     """持久化定义和版本，调用方负责鉴权和管理写事务。"""
 
@@ -136,22 +189,56 @@ class DefinitionStorage:
         return dict(row) if row is not None else None
 
     async def get_definition(
-        self, definition_id: str, *, version: int | str | None = None, conn=None
+        self,
+        definition_id: str,
+        *,
+        version: int | str | None = None,
+        conn=None,
+        definition_type=None,
     ) -> dict:
         """查询当前或指定版本定义，包含当前启停状态。"""
         if conn is None:
             async with self.engine.connect() as connection:
                 return await self.get_definition(
-                    definition_id, version=version, conn=connection
+                    definition_id,
+                    version=version,
+                    conn=connection,
+                    definition_type=definition_type,
                 )
         row = await self._find_definition(
             definition_id,
             version=_validate_version_number(version) if version is not None else None,
             conn=conn,
+            definition_type=definition_type,
         )
         if row is None:
             raise NotFound()
         return row
+
+    async def get_many(self, references):
+        """按类型和固定版本批量读取，汇总表仍提供当前生命周期状态。"""
+        grouped = {kind: set() for kind in ("agent", "team")}
+        for kind, identifier, version in references:
+            if kind not in grouped:
+                continue
+            try:
+                grouped[kind].add((identifier, _validate_version_number(version)))
+            except NotFound:
+                continue
+        result = {}
+        async with self.engine.connect() as conn:
+            for kind, identities in grouped.items():
+                if not identities:
+                    continue
+                table = _get_definition_table(kind)
+                detail = _get_version_table(table)
+                query = _build_definition_query(table, detail.c.version).where(
+                    tuple_(table.c.id, detail.c.version).in_(identities)
+                )
+                for row in (await conn.execute(query)).mappings():
+                    value = _build_definition_record(table, row)
+                    result[kind, row["id"], str(row["version"])] = value
+        return result
 
     async def get_locked_definition(
         self, definition_id: str, *, conn: AsyncConnection | None = None
@@ -175,10 +262,15 @@ class DefinitionStorage:
         return row
 
     async def _find_definition(
-        self, definition_id, *, conn, version=None, locked=False
+        self, definition_id, *, conn, version=None, locked=False, definition_type=None
     ):
         """跨两张主表查找定义，写入时只锁定主记录。"""
-        for table in (t.agent_definition_summary, t.team_definition_summary):
+        tables = (
+            (_get_definition_table(definition_type),)
+            if definition_type
+            else (t.agent_definition_summary, t.team_definition_summary)
+        )
+        for table in tables:
             query = _build_definition_query(table, version).where(
                 table.c.id == definition_id
             )
@@ -231,66 +323,53 @@ class DefinitionStorage:
                     conn=connection,
                 )
         row = await self.get_definition(definition_id, conn=conn)
-        if not resource_available(row):
-            raise Forbidden("资源已停用")
-        if (view == "system") != (row["owner_type"] == "system"):
-            raise Forbidden("资源视图不匹配")
-        # 普通共享入口解析唯一当前版本，已持久化引用可读取原版本。
         access = AccessStorage(self.engine)
-        metadata = {}
-        selected = version
-        if grant_id is not None:
-            grant = await access.active_grant(grant_id, definition_id, conn=conn)
-            if grant is None or (
-                grant["resource_type"],
-                grant["resource_view_type"],
-            ) != (row["definition_type"], view):
-                raise Forbidden("授权已撤销或视图不匹配")
-            metadata["access_grant_id"] = grant_id
-            source_review_id = grant["source_review_id"]
-            if review_id is not None and review_id != source_review_id:
-                raise Forbidden("共享审核与授权不匹配")
-            if source_review_id is not None:
-                metadata["shared_review_id"] = source_review_id
-        elif review_id is not None:
-            if view != "shared":
-                raise Forbidden("资源视图不匹配")
-            review = await access.get_approved_review(
+        grant = (
+            await access.active_grant(grant_id, definition_id, conn=conn)
+            if grant_id is not None
+            else None
+        )
+        review = (
+            await access.get_approved_review(
                 definition_id,
                 resource_type=row["definition_type"],
                 review_id=review_id,
                 conn=conn,
             )
-            if review is None:
-                raise Forbidden("资源尚未通过共享审核")
-            metadata["shared_review_id"] = review["review_id"]
-        if view == "shared" and not dependency:
-            shared = await access.shared_version(
-                row["definition_type"], definition_id, conn=conn
-            )
-            if shared is None:
-                raise Forbidden("资源尚未共享")
-            if not (allow_pinned and grant_id is not None and version is not None):
-                selected = shared
-        if view == "system" and grant_id is not None and not allow_pinned:
-            selected = row["resource_version"]
-        if version is not None and str(version) != str(selected):
-            raise Forbidden("资源版本与授权不匹配")
+            if review_id is not None and grant_id is None
+            else None
+        )
+        selected, metadata = definition_view_selection(
+            row,
+            view,
+            version=version,
+            grant_id=grant_id,
+            review_id=review_id,
+            grant=grant,
+            review=review,
+            allow_pinned=allow_pinned,
+            dependency=dependency,
+        )
         if selected is not None and str(row["resource_version"]) != str(selected):
             row = await self.get_definition(definition_id, version=selected, conn=conn)
         if not resource_available(row):
             raise Forbidden("资源已停用")
         return {**build_definition_data(row), "resource_view_type": view, **metadata}
 
-    async def list_versions(self, definition_id: str, *, conn=None) -> list[str]:
+    async def list_versions(
+        self, definition_id: str, *, conn=None, definition_type=None
+    ) -> list[str]:
         """按版本从新到旧列出定义的版本号，调用方决定可见范围。"""
         if conn is None:
             async with self.engine.connect() as connection:
-                return await self.list_versions(definition_id, conn=connection)
-        definition = await self.get_definition(definition_id, conn=conn)
-        versions = _get_version_table(
-            _get_definition_table(definition["definition_type"])
-        )
+                return await self.list_versions(
+                    definition_id, conn=connection, definition_type=definition_type
+                )
+        if definition_type is None:
+            definition_type = (await self.get_definition(definition_id, conn=conn))[
+                "definition_type"
+            ]
+        versions = _get_version_table(_get_definition_table(definition_type))
         number = versions.c.version
         rows = await conn.execute(
             select(number)
@@ -318,21 +397,48 @@ class DefinitionStorage:
             return [_build_definition_record(identity, row) for row in rows]
 
     async def list_definitions_and_reviews(
-        self, definition_type="agent", *, conn=None
+        self, definition_type="agent", *, conn=None, user=None
     ) -> tuple[list[dict], dict[tuple[str, str], str]]:
         """读取当前定义及目录候选的各版本审核状态。"""
         if conn is None:
             async with self.engine.connect() as connection:
                 return await self.list_definitions_and_reviews(
-                    definition_type, conn=connection
+                    definition_type, conn=connection, user=user
                 )
         table = _get_definition_table(definition_type)
+        query = _build_definition_query(table)
+        if user is not None:
+            query = query.where(table.c.deleted_at.is_(None))
+            if user.role_type != "admin":
+                grants = t.resource_permission
+                groups = select(t.groups.c.group_id).where(
+                    t.groups.c.group_id.in_(user.group_ids), t.groups.c.is_enabled
+                )
+                owned = select(table.c.id).where(
+                    table.c.owner_type == "user", table.c.owner_id == user.user_id
+                )
+                granted = select(grants.c.resource_id.label("id")).where(
+                    grants.c.resource_type == definition_type,
+                    grants.c.revoked_at.is_(None),
+                    grants.c.root_grant_id.is_(None),
+                    grants.c.grant_source_type.in_(("manual", "share")),
+                    or_(
+                        and_(
+                            grants.c.principal_type == "user",
+                            grants.c.principal_id == user.user_id,
+                        ),
+                        and_(
+                            grants.c.principal_type == "group",
+                            grants.c.principal_id.in_(groups),
+                        ),
+                    ),
+                )
+                eligible = owned.union(granted).cte("visible_definition_ids")
+                query = query.join(eligible, eligible.c.id == table.c.id)
         rows = [
             _build_definition_record(table, row)
             for row in (
-                await conn.execute(
-                    _build_definition_query(table).order_by(table.c.created_at.desc())
-                )
+                await conn.execute(query.order_by(table.c.created_at.desc()))
             ).mappings()
         ]
         states = await self._get_review_states(definition_type, rows, conn=conn)

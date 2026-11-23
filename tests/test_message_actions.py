@@ -235,18 +235,29 @@ async def test_fixed_team_branch_creates_new_team_and_fresh_member_sessions(
     assert worker.state.context == []
     assert worker.state.middle_context["egis_agentkit"]["is_initialized"]
     from agentscope.app.storage._sql._tables import TeamRow
-    from sqlalchemy import select
+    from sqlalchemy import event, select
 
-    async def fail_binding(*_):
-        raise RuntimeError("team binding failed")
+    def fail_binding(_conn, _cursor, statement, _params, _context, _many):
+        if statement.startswith("INSERT INTO teams"):
+            raise RuntimeError("team binding failed")
 
-    monkeypatch.setattr(storage, "set_session_team_id", fail_binding)
-    async with InMemoryMessageBus() as bus:
-        with pytest.raises(RuntimeError, match="team binding failed"):
-            await service.add_session_branch(alice, source.id, msg.id, bus)
+    event.listen(storage.engine.sync_engine, "before_cursor_execute", fail_binding)
+    try:
+        async with InMemoryMessageBus() as bus:
+            with pytest.raises(RuntimeError, match="team binding failed"):
+                await service.add_session_branch(alice, source.id, msg.id, bus)
+    finally:
+        event.remove(storage.engine.sync_engine, "before_cursor_execute", fail_binding)
     async with storage.engine.connect() as conn:
         team_ids = set((await conn.scalars(select(TeamRow.id))).all())
     assert team_ids == {source.team_id, record.team_id}
+    surviving = await storage.sessions.in_project(alice.user_id, task["project_id"])
+    assert {row.id for row in surviving} == {
+        source.id,
+        record.id,
+        old_team.data.members[0].session_id,
+        member.session_id,
+    }
 
 
 async def test_branch_failure_cleans_new_records_and_preserves_source(
@@ -400,14 +411,13 @@ async def test_branch_failure_after_copy_removes_new_artifact_links(
                 digest="a" * 64,
             )
         )
-    original_get = sessions.get_session
+    original_copy = storage.sessions.save_branch_history
 
-    async def fail_new(user, sid):
-        if sid != task["session_id"]:
-            raise RuntimeError("metadata failed")
-        return await original_get(user, sid)
+    async def fail_after_copy(*args, **kwargs):
+        await original_copy(*args, **kwargs)
+        raise RuntimeError("metadata failed")
 
-    monkeypatch.setattr(sessions, "get_session", fail_new)
+    monkeypatch.setattr(storage.sessions, "save_branch_history", fail_after_copy)
     async with InMemoryMessageBus() as bus:
         with pytest.raises(RuntimeError, match="metadata failed"):
             await sessions.add_session_branch(

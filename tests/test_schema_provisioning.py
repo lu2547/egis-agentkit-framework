@@ -120,7 +120,7 @@ async def test_project_schema_upgrade_preserves_workspace_data_and_checks_legacy
             {"sid": sid},
         )
 
-    with pytest.raises(ValueError, match="upgrade-db"):
+    with pytest.raises(ValueError, match="部署 SQL 脚本"):
         await storage.init_schema()
     preview = await upgrade_schema(storage.engine)
     assert preview.tables["ak_file_changes"] == "pending"

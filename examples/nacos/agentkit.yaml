@@ -121,7 +121,7 @@ agentkit:
     defaults:
       registeredIds: null
     knowledgeBase:
-      # 配置知识库的完整 SSE POST /query 地址后开放检索工具。
+      # 完整 SSE POST /query 地址；配置后可在工具目录选用，个人助理勾选后装配。
       queryUrl: null
       timeoutSeconds: 1800.0
   access:

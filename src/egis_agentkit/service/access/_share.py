@@ -74,21 +74,43 @@ class ShareService:
         if not user.is_enabled:
             raise Forbidden()
         async with self.storage.definition_write() as write:
-            shared = await write.access.shared_version(resource_type, resource_id)
-            resource = await self.grants.read_version(
-                resource_type, resource_id, shared if target else None, write=write
-            )
+            if resource_type == "skill":
+                resource = await write.access.skill_write_state(
+                    resource_id, target=target, owner_version=target is None
+                )
+                shared = (
+                    resource["_shared_resource_version"]
+                    if resource is not None
+                    else None
+                )
+            else:
+                shared = await write.access.shared_version(resource_type, resource_id)
+                resource = await self.grants.read_version(
+                    resource_type, resource_id, shared if target else None, write=write
+                )
             self._validate_resource(user, resource)
             version = resource["resource_version"]
             if target:
-                await self.grants.require_recipient(target, write=write)
-                await self._check_new_recipient(
-                    resource_type, resource_id, target, write=write
-                )
+                if "_recipient_enabled" in resource:
+                    self.grants.require_loaded_recipient(
+                        target, resource["_recipient_enabled"]
+                    )
+                    if resource["_has_share_recipient"]:
+                        raise Conflict("该接收方已有共享授权")
+                else:
+                    await self.grants.require_recipient(target, write=write)
+                    await self._check_new_recipient(
+                        resource_type, resource_id, target, write=write
+                    )
             else:
                 if not shared or shared == version:
                     raise Conflict("没有可提交的共享新版本")
-                if await write.access.has_pending_update(resource_type, resource_id):
+                pending = resource.get("_has_pending_update")
+                if pending is None:
+                    pending = await write.access.has_pending_update(
+                        resource_type, resource_id
+                    )
+                if pending:
                     raise Conflict("已有待审核的共享版本")
             await self._authorize_dependencies(
                 user, resource_type, resource, write=write
@@ -104,7 +126,9 @@ class ShareService:
                 submitted_by=user.user_id,
             )
             row = await write.access.insert_review(review.model_dump())
-            return await self._with_publication_label(row, storage=write)
+            return await self._with_publication_label(
+                row, storage=write, resource=resource
+            )
 
     @staticmethod
     async def _check_new_recipient(kind, identifier, target, *, write):
@@ -160,15 +184,25 @@ class ShareService:
         return response
 
     @staticmethod
-    async def _with_publication_label(row, *, storage):
+    async def _with_publication_label(row, *, storage, resource=None):
         kind, version = row["resource_type"], row["resource_version"]
         if kind in DEFINITION_KINDS:
             revision = int(version)
+        elif "_publication_revision" in row:
+            revision = row["_publication_revision"]
         else:
-            asset = await storage.assets.get(kind, row["resource_id"], version)
+            asset = (
+                resource
+                if resource is not None
+                else await storage.assets.get(kind, row["resource_id"], version)
+            )
             revision = asset["publication_revision"] if asset is not None else None
         return {
-            **row,
+            **{
+                key: value
+                for key, value in row.items()
+                if key != "_publication_revision"
+            },
             "version_label": publication_label(revision) if revision else version,
         }
 
@@ -196,10 +230,14 @@ class ShareService:
                     "is_current": is_approved,
                 },
             )
+            if "_publication_revision" in review:
+                updated["_publication_revision"] = review["_publication_revision"]
             return await self._with_publication_label(updated, storage=write)
 
     async def _issue_approved_grant(self, admin, review, *, write):
         """重新校验申请版本，原子更新共享入口及其依赖。"""
+        if review["resource_type"] == "skill":
+            return await self._issue_approved_skill(admin, review, write=write)
         owner = await UserService(write).get(review["owner_id"])
         kind, identifier, version = (
             review["resource_type"],
@@ -235,6 +273,54 @@ class ShareService:
             Grant(
                 **target.model_dump(),
                 resource_type=kind,
+                resource_id=identifier,
+                resource_view_type="shared",
+                resource_owner_type="user",
+                resource_owner_id=review["owner_id"],
+                grant_source_type="share",
+                source_review_id=review["review_id"],
+            ),
+            resource,
+            write=write,
+        )
+
+    async def _issue_approved_skill(self, admin, review, *, write):
+        identifier, version = review["resource_id"], review["resource_version"]
+        target = (
+            ShareTarget(
+                principal_type=review["share_scope_type"],
+                principal_id=review["principal_id"],
+            )
+            if review["review_type"] == "share"
+            else None
+        )
+        resource = await write.access.skill_write_state(
+            identifier, version=version, target=target, owner_id=review["owner_id"]
+        )
+        if resource is None:
+            await UserService(write).get(review["owner_id"])
+            raise NotFound()
+        if not resource["_owner_exists"]:
+            raise NotFound("用户不存在")
+        if not resource["_owner_enabled"]:
+            raise Forbidden("用户已停用")
+        owner = User(user_id=review["owner_id"], username=review["owner_id"])
+        self._validate_resource(owner, resource)
+        shared = resource["_shared_resource_version"]
+        if review["review_type"] == "update":
+            if not shared or shared == version:
+                raise Conflict("没有可更新的共享版本")
+            await write.access.set_shared_version("skill", identifier, version)
+            return
+        if shared is not None and shared != version:
+            raise Conflict("共享版本已变更，请重新申请")
+        if resource["_has_share_recipient"]:
+            raise Conflict("该接收方已有共享授权")
+        await self.grants.issue(
+            admin,
+            Grant(
+                **target.model_dump(),
+                resource_type="skill",
                 resource_id=identifier,
                 resource_view_type="shared",
                 resource_owner_type="user",

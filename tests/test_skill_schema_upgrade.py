@@ -171,7 +171,7 @@ async def test_skill_upgrade_runs_after_legacy_access_upgrade(
         """)
         )
 
-    with pytest.raises(ValueError, match="upgrade-db"):
+    with pytest.raises(ValueError, match="部署 SQL 脚本"):
         await storage.init_schema()
     preview = await upgrade_schema(storage.engine)
     assert preview.tables["授权和共享版本"] == "pending"

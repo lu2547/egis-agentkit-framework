@@ -6,6 +6,7 @@
 - build_agent_record 复用 Core 定义规则装配原生记录，不读取 Service 或数据库。
 """
 
+import asyncio
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -53,6 +54,9 @@ class VerifiedChatAuthorization:
     agent_id: str
     session_id: str
     access_token: SecretStr
+    session_record: SessionRecord | None = None
+    request_task: asyncio.Task | None = None
+    expires_at: float | None = None
 
 
 verified_chat_authorization: ContextVar[VerifiedChatAuthorization | None] = ContextVar(

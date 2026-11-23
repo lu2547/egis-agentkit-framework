@@ -53,7 +53,7 @@ async def migrate_skills(connection, schema, *, apply=False, access_pending=Fals
         if state == "inconsistent":
             if apply:
                 raise ValueError(
-                    "技能版本指针无法安全迁移，请通过 upgrade-db 预览并核对历史版本"
+                    "技能版本指针无法安全迁移，请在部署 SQL 脚本中核对历史版本"
                 )
             return state
     if not has_legacy_rows and len(present) == len(SKILL_TABLES):

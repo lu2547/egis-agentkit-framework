@@ -149,7 +149,7 @@ async def migrate_personal_resources(
     if not apply:
         return "pending" if pending else "current"
     if actual is not None and actual != target:
-        raise ValueError("个人资源表名需要先通过 upgrade-db 改名")
+        raise ValueError("个人资源表名需要通过部署 SQL 脚本更新")
     await connection.run_sync(
         lambda conn: t.agent_personal_resources.create(conn, checkfirst=True)
     )

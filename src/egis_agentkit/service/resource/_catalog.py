@@ -76,7 +76,7 @@ from ._tool import FunctionToolRegistry
 __all__ = ["SkillActivation"]
 logger = logging.getLogger(__name__)
 
-TOOL_CATEGORIES = ("系统默认", "专家工具")
+TOOL_CATEGORIES = ("系统默认", "可选工具", "专家工具")
 
 
 EXPERT_ICON_NAMES = (
@@ -158,7 +158,9 @@ class ResourceService:
         self.config = config
         self.permissions = PermissionService(storage, policies)
         self.grants = GrantService(storage, policies)
-        self.skill_versions = SkillVersionStorage(workspace_root, config_provider=config)
+        self.skill_versions = SkillVersionStorage(
+            workspace_root, config_provider=config
+        )
         self.workspace_root = self.skill_versions.root
         self.skill_registry = LocalSkillRegistry(storage.assets, self.skill_versions)
         self.mcp_registry = LocalMCPRegistry(storage.assets)
@@ -190,29 +192,30 @@ class ResourceService:
             raise Forbidden("资源装配缺少一致的会话上下文")
         if user.user_id != scope.user_id:
             raise Forbidden("资源装配用户与会话不一致")
+        user = await UserService(self.storage).get(user.user_id)
         # 1. 个人助理使用当前安装项，专家使用定义中的固定绑定。
         refs = scope.definition["payload"].get("bindings", [])
+        installations = None
         if scope.definition["agent_type"] == "personal":
-            selected = await self.selected_for_personal(user, "mcp", enabled_only=True)
+            installations = await self.personal.list_resources(user, "mcp")
             refs = [
-                {
-                    key: row[key]
-                    for key in ("resource_type", "resource_id")
-                }
-                for row in selected.values()
+                {"resource_type": "mcp", "resource_id": rid}
+                for rid, row in installations.items()
+                if row["is_enabled"]
             ]
         # 2. 重新解析连接器授权和凭据；不可用连接器不进入本轮工具集。
         mcps = await self.mcps_for_refs(
-            user, refs, authorization_scope=scope, skip_unavailable=True
+            user,
+            refs,
+            authorization_scope=scope,
+            skip_unavailable=True,
+            installations=installations,
+            refresh_user=False,
         )
         # 3. 筛选默认工具后交给 Core 装载，Core 不承担权限查询。
-        tools = []
-        for tool in await workspace.get_builtin_tools():
-            try:
-                await self.tool_registry.authorize(user, scope, None, tool)
-            except AgentKitError:
-                continue
-            tools.append(tool)
+        tools = await self.tool_registry.authorize_many(
+            user, scope, await workspace.get_builtin_tools()
+        )
         workspace.configure_workspace_resources(tools=tools, mcps=mcps)
         await workspace.list_mcps(agent_id=scope.agent_id, session_id=scope.session_id)
 
@@ -238,38 +241,57 @@ class ResourceService:
             usable_only=True,
         )
 
-    async def _personal_asset(self, user, kind, identifier):
-        """安装入口按资源身份定位当前可独立使用的版本。"""
-        if kind not in ("skill", "mcp"):
-            raise Forbidden("工具由平台默认配置或专家绑定提供")
+    async def _personal_asset(self, user, kind, identifier, *, require_available=True):
+        """Resolve and authorize the selected version once for this operation."""
+        if kind not in ("skill", "mcp", "tool"):
+            raise Forbidden("此资源不能由个人助理选择")
         versions = await self._current_versions(kind, resource_ids=[identifier])
-        selected = await self._latest_visible_assets(user, kind, versions)
+        if kind == "tool":
+            versions = [
+                asset for asset in versions if self.tool_registry.is_optional_tool(asset)
+            ]
+        snapshot = await self._read_snapshot(user, versions)
+        selected = await self._latest_visible_assets(
+            snapshot.user, kind, versions, usable_only=True, snapshot=snapshot
+        )
         asset = selected.get(identifier)
         if asset is None:
             raise Forbidden("未获得此资源的独立使用权限")
-        await self._require(user, asset)
-        return asset
+        if (
+            kind == "tool"
+            and require_available
+            and not await self._usable(snapshot.user, asset, snapshot=snapshot)
+        ):
+            raise Forbidden("可选工具尚未开放或配置不完整")
+        return asset, snapshot
 
     async def install(self, user, kind, identifier):
         """安装由资源管理协调，只保存个人启用开关，不复制原生安装记录。"""
-        asset = await self._personal_asset(user, kind, identifier)
+        asset, snapshot = await self._personal_asset(user, kind, identifier)
+        user = snapshot.user
         if kind == "mcp":
             self._verified_mcp_card(asset)
             await self.mcp_authorization.headers(user, asset)
-        await self.personal.add_resource(user, kind, identifier)
-        return await self._view(user, asset)
+        installation = await self.personal.add_resource(user, kind, identifier)
+        return await self._view(
+            user, asset, snapshot=snapshot, installations={identifier: installation}
+        )
 
     async def update_installation(self, user, kind, identifier, enabled):
         """调整已有个人选择，组授权及其他用户的开关保持独立。"""
-        asset = await self._personal_asset(user, kind, identifier)
-        existing = await self.personal.list_resources(user, kind)
-        if identifier not in existing:
-            raise NotFound("资源尚未安装")
+        asset, snapshot = await self._personal_asset(
+            user, kind, identifier, require_available=enabled
+        )
+        user = snapshot.user
         if kind == "mcp" and enabled:
             self._verified_mcp_card(asset)
             await self.mcp_authorization.headers(user, asset)
-        await self.personal.update_resource_enabled(user, kind, identifier, enabled)
-        return await self._view(user, asset)
+        installation = await self.personal.update_resource_enabled(
+            user, kind, identifier, enabled
+        )
+        return await self._view(
+            user, asset, snapshot=snapshot, installations={identifier: installation}
+        )
 
     async def remove_installation(self, user: User, kind: str, identifier: str) -> None:
         """取消个人选用；即使资源授权已经撤销，也允许清理自己的关联。"""
@@ -287,7 +309,11 @@ class ResourceService:
 
     async def _versions(self, kind, **kwargs):
         rows = await self._registry(kind).list(**kwargs)
-        return [row for row in rows if is_managed_connector(row)] if kind == "mcp" else rows
+        return (
+            [row for row in rows if is_managed_connector(row)]
+            if kind == "mcp"
+            else rows
+        )
 
     async def _current_versions(self, kind, *, resource_ids=None):
         """只读取技能的所有者和共享版本，供目录及个人装配选择。"""
@@ -370,8 +396,28 @@ class ResourceService:
             else await self._view(user, updated)
         )
 
-    async def _admin_view(self, user, asset, *, bindings=None, grants=None):
-        view = await self._view(user, asset, admin=True, source=asset["resource_type"] == "mcp")
+    async def _admin_view(
+        self,
+        user,
+        asset,
+        *,
+        bindings=None,
+        grants=None,
+        snapshot=None,
+        installations=None,
+        owner_names=None,
+        credential_rows=None,
+    ):
+        view = await self._view(
+            user,
+            asset,
+            admin=True,
+            source=asset["resource_type"] == "mcp",
+            snapshot=snapshot,
+            installations=installations,
+            owner_names=owner_names,
+            credential_rows=credential_rows,
+        )
         return {
             **view,
             "entrypoint": asset["entrypoint"],
@@ -380,6 +426,7 @@ class ResourceService:
         }
 
     async def admin_list(self, user, kind, *, page=None):
+        user = await UserService(self.storage).get(user.user_id)
         require_admin(user)
         self._kind(kind)
         if page is None:
@@ -397,6 +444,8 @@ class ResourceService:
         return items if page is None else {**result, "items": items}
 
     async def _admin_assets(self, user, kind, rows):
+        snapshot = await self._read_snapshot(user, rows, refresh_user=False)
+        installations, owners, credentials = await self._presentation(user, rows)
         identifiers = {row["resource_id"] for row in rows}
         references = [
             {
@@ -411,8 +460,12 @@ class ResourceService:
             for row in rows
         ]
         agents = await self.storage.definitions.agents.current_bindings(references)
-        grants = [] if kind == "tool" else await self.storage.access.active_grants_for_resources(
-            kind, identifiers
+        grants = (
+            []
+            if kind == "tool"
+            else await self.storage.access.active_grants_for_resources(
+                kind, identifiers
+            )
         )
         grants_by_resource = {}
         for grant in grants:
@@ -430,6 +483,10 @@ class ResourceService:
                     )
                 ],
                 grants=grants_by_resource.get(row["resource_id"], []),
+                snapshot=snapshot,
+                installations=installations.get(kind),
+                owner_names=owners,
+                credential_rows=credentials,
             )
             for row in rows
         ]
@@ -445,17 +502,29 @@ class ResourceService:
             key=asset_version_order,
             reverse=True,
         )
-        if kind == "tool":
-            return [
-                await self._view(user, asset)
-                for asset in rows
-                if self._tool_card_visible(user, asset)
-            ]
-        return [
-            await self._view(user, asset)
-            for asset in rows
-            if self._editable(user, asset) or await self._usable(user, asset)
-        ]
+        snapshot = await self._read_snapshot(user, rows)
+        user = snapshot.user
+        installations, owners, credentials = await self._presentation(user, rows)
+        result = []
+        for asset in rows:
+            visible = (
+                self._tool_card_visible(user, asset)
+                if kind == "tool"
+                else self._editable(user, asset)
+                or await self._usable(user, asset, snapshot=snapshot)
+            )
+            if visible:
+                result.append(
+                    await self._view(
+                        user,
+                        asset,
+                        snapshot=snapshot,
+                        installations=installations.get(kind),
+                        owner_names=owners,
+                        credential_rows=credentials,
+                    )
+                )
+        return result
 
     @property
     def archive_limits(self) -> SkillArchiveConfig:
@@ -566,10 +635,22 @@ class ResourceService:
             for definition in (pinned, current)
         )
 
-    async def _usable(self, user, asset, scope=None):
+    async def _usable(self, user, asset, scope=None, *, snapshot=None):
         """按独立授权或当前执行图校验版本使用权。"""
         if not user.is_enabled or not asset["is_enabled"]:
             return False
+        if self.tool_registry.is_optional_tool(asset):
+            if not self.tool_registry.optional_tool_available(asset, scope):
+                return False
+            if scope is None:
+                return True
+            if (
+                scope.user_id != user.user_id
+                or scope.definition["agent_type"] != "personal"
+            ):
+                return False
+            selected = await self.personal.list_resources(user, "tool")
+            return bool(selected.get(asset["resource_id"], {}).get("is_enabled"))
         if is_system_default_tool(asset):
             return self.tool_registry.is_default_tool(asset, scope) and (
                 scope is None or getattr(scope, "user_id", None) == user.user_id
@@ -588,9 +669,14 @@ class ResourceService:
                 or not self._scope_allows(user, asset, scope)
             ):
                 return False
-            await self.permissions.require_execution(
-                user, scope.root_definition, allow_pinned=True
-            )
+            if snapshot is None:
+                await self.permissions.require_execution(
+                    user, scope.root_definition, allow_pinned=True
+                )
+            else:
+                await snapshot.require_execution(
+                    scope.root_definition, allow_pinned=True
+                )
             return True
         if scope is not None:
             if getattr(scope, "user_id", None) != user.user_id:
@@ -599,9 +685,14 @@ class ResourceService:
             if not personal:
                 if not self._scope_allows(user, asset, scope):
                     return False
-                await self.permissions.require_execution(
-                    user, scope.root_definition, allow_pinned=True
-                )
+                if snapshot is None:
+                    await self.permissions.require_execution(
+                        user, scope.root_definition, allow_pinned=True
+                    )
+                else:
+                    await snapshot.require_execution(
+                        scope.root_definition, allow_pinned=True
+                    )
                 if asset["resource_type"] != "mcp":
                     return True
             else:
@@ -623,6 +714,15 @@ class ResourceService:
             if asset["owner_type"] == "system"
             else "shared"
         )
+        if snapshot is not None:
+            return (
+                await snapshot.explain(
+                    asset["resource_type"],
+                    asset["resource_id"],
+                    view,
+                    version=asset["resource_version"],
+                )
+            ).is_allowed
         if view == "shared":
             return await self._shared_asset(user, asset)
         return (
@@ -636,7 +736,13 @@ class ResourceService:
         ).is_allowed
 
     async def _require(self, user, asset, scope=None):
-        if not await self._usable(user, asset, scope):
+        snapshot = (await self._read_snapshot(user, [asset])) if scope is None else None
+        if not await self._usable(
+            snapshot.user if snapshot is not None else user,
+            asset,
+            scope,
+            snapshot=snapshot,
+        ):
             raise Forbidden("未获得此资源版本的使用权限")
 
     @staticmethod
@@ -646,8 +752,93 @@ class ResourceService:
             or (asset["owner_type"] == "system" and user.role_type == "admin")
         )
 
-    async def _view(self, user, asset, *, source=False, admin=False, installations=None):
+    @staticmethod
+    def _asset_view(user, asset):
+        if asset["owner_type"] == "system":
+            return "system"
+        return "private" if asset["owner_id"] == user.user_id else "shared"
+
+    async def _read_snapshot(self, user, assets, *, refresh_user=True, scope=None):
+        references = [
+            {
+                "resource_type": asset["resource_type"],
+                "resource_id": asset["resource_id"],
+                "resource_view_type": self._asset_view(user, asset),
+                "resource_version": asset["resource_version"],
+            }
+            for asset in assets
+        ]
+        if scope is not None:
+            root = scope.root_definition
+            references.append(
+                {
+                    "resource_type": root["definition_type"],
+                    "resource_id": root["id"],
+                    "resource_view_type": root["resource_view_type"],
+                    "resource_version": root["resource_version"],
+                    "grant_id": root.get("access_grant_id"),
+                    "review_id": root.get("shared_review_id"),
+                    "allow_pinned": True,
+                }
+            )
+        return await self.permissions.read_snapshot(
+            user,
+            references,
+            loaded=[
+                row
+                for row in assets
+                if row["resource_type"] != "skill" or "owner_version" in row
+            ],
+            refresh_user=refresh_user,
+        )
+
+    async def _presentation(self, user, assets):
+        """Read only display data belonging to this already-selected asset set."""
+        kinds = {row["resource_type"] for row in assets}
+        installations = {}
+        for kind in kinds & {"skill", "mcp", "tool"}:
+            installations[kind] = await self.storage.personal_resources.list_resources(
+                user.user_id,
+                kind,
+                resource_ids={
+                    row["resource_id"] for row in assets if row["resource_type"] == kind
+                },
+            )
+        owner_ids = {
+            row["owner_id"]
+            for row in assets
+            if row["resource_type"] == "skill"
+            and row["owner_type"] == "user"
+            and row["owner_id"] != user.user_id
+        }
+        owners = await self.storage.assets.owner_display_names(owner_ids)
+        credentials = await self.storage.mcp_credentials.read_many(
+            user.user_id,
+            {
+                self.mcp_authorization._connection(row)
+                for row in assets
+                if row["resource_type"] == "mcp"
+                and row["payload"].get("config", {}).get("auth_type", "none") != "none"
+            },
+        )
+        return installations, owners, credentials
+
+    async def _view(
+        self,
+        user,
+        asset,
+        *,
+        source=False,
+        admin=False,
+        installations=None,
+        snapshot=None,
+        owner_names=None,
+        credential_rows=None,
+    ):
         """组装资源目录或详情的字段与权限标记。"""
+        if snapshot is None:
+            snapshot = await self._read_snapshot(user, [asset])
+        user = snapshot.user
         own = asset["owner_type"] == "user" and asset["owner_id"] == user.user_id
         view = (
             "private"
@@ -656,12 +847,24 @@ class ResourceService:
             if asset["owner_type"] == "system"
             else "shared"
         )
-        if view == "shared" and not admin and not await self._shared_asset(user, asset):
+        if (
+            view == "shared"
+            and not admin
+            and not (
+                await snapshot.explain(
+                    asset["resource_type"],
+                    asset["resource_id"],
+                    view,
+                    version=asset["resource_version"],
+                )
+            ).is_allowed
+        ):
             raise Forbidden("此资源版本尚未共享")
         system_default = self.tool_registry.is_default_tool(asset)
         agent_tool = self.tool_registry.is_agent_tool(asset)
+        optional_tool = self.tool_registry.is_optional_tool(asset)
         installation = None
-        if asset["resource_type"] in ("skill", "mcp"):
+        if asset["resource_type"] in ("skill", "mcp") or optional_tool:
             if installations is None:
                 installations = await self.personal.list_resources(
                     user, asset["resource_type"]
@@ -684,7 +887,7 @@ class ResourceService:
         }
         if asset["payload"].get("avatar_checksum"):
             payload["has_generated_avatar"] = True
-        usable = await self._usable(user, asset)
+        usable = await self._usable(user, asset, snapshot=snapshot)
         editable = self._editable(user, asset)
         if source:
             if not usable and not editable and not self._tool_card_visible(user, asset):
@@ -698,16 +901,31 @@ class ResourceService:
         revision = asset.get("publication_revision")
         is_connector = asset["resource_type"] == "mcp"
         authorized = (
-            (await self.mcp_authorization.status(user, asset))["authorized"]
+            (
+                await self.mcp_authorization.status(
+                    user,
+                    asset,
+                    **(
+                        {
+                            "credential_row": credential_rows.get(
+                                self.mcp_authorization._connection(asset)
+                            )
+                        }
+                        if credential_rows is not None
+                        else {}
+                    ),
+                )
+            )["authorized"]
             if is_connector and usable and not admin
             else False
         )
         connector_attributes = (
-            {"publication_revision": revision} if admin else {"is_authorized": authorized}
+            {"publication_revision": revision}
+            if admin
+            else {"is_authorized": authorized}
         )
         share = (
-            await self.permissions.share_availability(
-                user,
+            await snapshot.share_availability(
                 asset["resource_type"],
                 asset["resource_id"],
                 version=asset["resource_version"],
@@ -723,9 +941,12 @@ class ResourceService:
             elif own:
                 owner["owner_display_name"] = user.username
             else:
-                profile = await self.storage.get_user(asset["owner_id"])
-                owner["owner_display_name"] = (
-                    profile["username"] if profile is not None else asset["owner_id"]
+                if owner_names is None:
+                    owner_names = await self.storage.assets.owner_display_names(
+                        {asset["owner_id"]}
+                    )
+                owner["owner_display_name"] = owner_names.get(
+                    asset["owner_id"], asset["owner_id"]
                 )
         return {
             "resource_id": asset["resource_id"],
@@ -749,15 +970,16 @@ class ResourceService:
             "is_usable": usable,
             "is_editable": editable,
             "is_deletable": editable and own and asset["resource_type"] == "skill",
-            "is_available": asset["is_enabled"],
+            "is_available": asset["is_enabled"] and (not optional_tool or usable),
             "auth_type": asset["payload"].get("config", {}).get("auth_type", "none")
             if asset["resource_type"] == "mcp"
             else None,
             "is_system_default": system_default,
+            "is_optional_tool": optional_tool,
             "is_agent_tool": agent_tool,
             "is_installed": system_default or installation is not None,
             "is_enabled": asset["is_enabled"]
-            if asset["resource_type"] == "tool"
+            if asset["resource_type"] == "tool" and not optional_tool
             else bool(installation and installation["is_enabled"]),
             "payload": payload,
         }
@@ -765,17 +987,57 @@ class ResourceService:
     async def list(self, user, resource_type):
         """列出资源目录，工具目录只包含可见的平台和专家工具。"""
         self._kind(resource_type)
-        if not user.is_enabled:
-            raise Forbidden()
-        rows = await self._current_versions(resource_type)
-        selected = await self._latest_visible_assets(user, resource_type, rows)
+        users = UserService(self.storage, self.policies)
+        user = await users.get(user.user_id)
+        if resource_type == "skill":
+            rows = await self.storage.assets.skills.page_catalog(
+                user, after=None, limit=None, query="", category="", mine=False
+            )
+        elif resource_type == "mcp":
+            company_id = users.company_group().group_id
+            if company_id not in user.group_ids:
+                return []
+            rows = await self.storage.assets.page_connector_catalog(
+                company_group_id=company_id, after=None, limit=None, query=""
+            )
+        else:
+            rows = await self._current_versions(resource_type)
+        snapshot = await self._read_snapshot(user, rows, refresh_user=False)
+        selected = await self._latest_visible_assets(
+            user, resource_type, rows, snapshot=snapshot
+        )
+        assets = sorted(selected.values(), key=lambda a: a["resource_id"])
+        installations, owners, credentials = await self._presentation(user, assets)
         return [
-            await self._catalog_view(user, asset)
-            for asset in sorted(selected.values(), key=lambda a: a["resource_id"])
+            await self._catalog_view(
+                user,
+                asset,
+                installations=installations.get(resource_type),
+                snapshot=snapshot,
+                owner_names=owners,
+                credential_rows=credentials,
+            )
+            for asset in assets
         ]
 
-    async def _catalog_view(self, user, asset, *, installations=None):
-        item = await self._view(user, asset, installations=installations)
+    async def _catalog_view(
+        self,
+        user,
+        asset,
+        *,
+        installations=None,
+        snapshot=None,
+        owner_names=None,
+        credential_rows=None,
+    ):
+        item = await self._view(
+            user,
+            asset,
+            installations=installations,
+            snapshot=snapshot,
+            owner_names=owner_names,
+            credential_rows=credential_rows,
+        )
         if asset["resource_type"] == "skill" and item["is_usable"]:
             item["runtime_name"] = self._runtime_name(
                 user, "skill", asset["resource_id"], asset["resource_version"]
@@ -796,7 +1058,9 @@ class ResourceService:
         )
         size = pagination.default_page_size if limit is None else limit
         if not 1 <= size <= pagination.max_page_size:
-            raise InvalidRequest(f"分页大小必须介于 1 和 {pagination.max_page_size} 之间")
+            raise InvalidRequest(
+                f"分页大小必须介于 1 和 {pagination.max_page_size} 之间"
+            )
         if max(len(query), len(category)) > pagination.max_query_length:
             raise InvalidRequest(f"目录筛选最多 {pagination.max_query_length} 个字符")
         if "\0" in query or "\0" in category:
@@ -864,24 +1128,26 @@ class ResourceService:
             remaining = size - len(items)
             rows = await read_page(after=after, limit=remaining + 1)
             page, more = rows[:remaining], len(rows) > remaining
-            installations = (
-                await self.storage.personal_resources.list_resources(
-                    user.user_id,
-                    kind,
-                    resource_ids={asset["resource_id"] for asset in page},
-                )
-                if kind in ("skill", "mcp")
-                else None
-            )
+            snapshot = await self._read_snapshot(user, page, refresh_user=False)
+            installations, owners, credentials = await self._presentation(user, page)
             for asset in page:
                 try:
                     item = await self._catalog_view(
-                        user, asset, installations=installations
+                        user,
+                        asset,
+                        installations=installations.get(kind),
+                        snapshot=snapshot,
+                        owner_names=owners,
+                        credential_rows=credentials,
                     )
                 except Forbidden:
                     continue
                 if kind == "tool":
-                    visible = item["is_system_default"] or item["is_agent_tool"]
+                    visible = (
+                        item["is_system_default"]
+                        or item["is_optional_tool"]
+                        or item["is_agent_tool"]
+                    )
                 else:
                     visible = item["is_usable"] or (
                         kind == "skill" and item["is_editable"]
@@ -914,13 +1180,15 @@ class ResourceService:
     async def _page_tool_catalog(self, *, after, limit, query, category, default_ids):
         # Choose the latest eligible version before applying the card filters.
         def matches(asset):
-            platform, expert = TOOL_CATEGORIES
-            if is_system_default_tool(asset) and (
-                default_ids is None or asset["resource_id"] in default_ids
-            ):
+            platform, optional, expert = TOOL_CATEGORIES
+            if self.tool_registry.is_optional_tool(asset):
+                tool_category = optional
+            elif self.tool_registry.is_default_tool(asset):
                 tool_category = platform
-            else:
+            elif self.tool_registry.is_agent_tool(asset):
                 tool_category = expert
+            else:
+                return False
             payload = asset["payload"]
             name = payload.get("display_name", asset["resource_id"])
             description = payload.get("description", "")
@@ -930,7 +1198,7 @@ class ResourceService:
 
         deployed = [
             (rid, version, self.tool_registry.catalog[(rid, version)].checksum_sha256)
-            for rid, version in self.tool_registry.deployed
+            for rid, version in set(self.tool_registry.deployed) | self.tool_registry.optional
         ]
         versions = self.storage.assets.catalog_tool_versions(
             after=after, batch_size=limit, default_ids=default_ids, deployed=deployed
@@ -957,20 +1225,26 @@ class ResourceService:
         return result
 
     async def _latest_visible_assets(
-        self, user, resource_type, rows, *, usable_only=False
+        self, user, resource_type, rows, *, usable_only=False, snapshot=None
     ):
         """按各类资源的可见条件选择最新目录版本。"""
+        rows = list(rows)
+        if snapshot is None:
+            snapshot = await self._read_snapshot(user, rows)
+        user = snapshot.user
         selected = {}
         ranks = {}
         for asset in rows:
-            if resource_type == "skill" and not self._is_current_skill_view(user, asset):
+            if resource_type == "skill" and not self._is_current_skill_view(
+                user, asset
+            ):
                 continue
             usable = False
             if resource_type == "tool":
                 if not self._tool_card_visible(user, asset):
                     continue
             else:
-                usable = await self._usable(user, asset)
+                usable = await self._usable(user, asset, snapshot=snapshot)
                 if not usable and (
                     usable_only
                     or resource_type == "mcp"
@@ -1005,15 +1279,19 @@ class ResourceService:
             and asset["is_enabled"]
             and (
                 self.tool_registry.is_default_tool(asset)
+                or self.tool_registry.is_optional_tool(asset)
                 or self.tool_registry.is_agent_tool(asset)
             )
         )
 
     async def detail(self, user, resource_type, resource_id, version=None):
         asset = await self._asset(resource_type, resource_id, version)
-        if resource_type == "mcp":
-            await self._require(user, asset)
-        return await self._view(user, asset, source=True)
+        snapshot = await self._read_snapshot(user, [asset])
+        if resource_type == "mcp" and not await self._usable(
+            snapshot.user, asset, snapshot=snapshot
+        ):
+            raise Forbidden("未获得此资源版本的使用权限")
+        return await self._view(snapshot.user, asset, source=True, snapshot=snapshot)
 
     async def _owner_for_save(
         self, user, registry, rid, version, data, *, virtual_uploader=None
@@ -1041,10 +1319,15 @@ class ResourceService:
 
     @staticmethod
     def _require_virtual_skill_owner(asset, virtual_user_id):
-        if asset["owner_type"] != "system" or asset["source_user_id"] != virtual_user_id:
+        if (
+            asset["owner_type"] != "system"
+            or asset["source_user_id"] != virtual_user_id
+        ):
             raise Forbidden("虚拟用户只能更新自己提交的系统技能")
 
-    async def require_skill_upload_target(self, user, resource_id, *, owner_type, virtual):
+    async def require_skill_upload_target(
+        self, user, resource_id, *, owner_type, virtual
+    ):
         current = await self.skill_registry.find_current(resource_id)
         if current is None:
             raise NotFound("待更新的技能不存在")
@@ -1184,7 +1467,7 @@ class ResourceService:
         return await self._view(user, asset)
 
     @staticmethod
-    def _skill_data(markdown, data, *, require_version=False):
+    def _skill_data(markdown, data):
         front = _skill_front(markdown)
         metadata = front.get("metadata")
         nested_version = metadata.get("version") if isinstance(metadata, dict) else None
@@ -1200,8 +1483,6 @@ class ResourceService:
             version = str(version)
             if supplied and supplied != version:
                 raise BadRequest("Skill version must match SKILL.md front matter")
-        elif require_version:
-            raise BadRequest("SKILL.md front matter version is required")
         else:
             version = supplied or "1.0.0"
         return {
@@ -1259,7 +1540,6 @@ class ResourceService:
         owner_id=None,
         uploader_id=None,
         uploader_type=None,
-        allow_unversioned=False,
     ):
         limits = self.archive_limits
         files = await asyncio.to_thread(read_archive_files, archive, limits)
@@ -1275,7 +1555,6 @@ class ResourceService:
                 **({"owner_type": owner_type} if owner_type else {}),
                 **({"owner_id": owner_id} if owner_id else {}),
             },
-            require_version=version is None and not allow_unversioned,
         )
         kwargs = {
             "files": files,
@@ -1295,15 +1574,55 @@ class ResourceService:
         return await self._admin_view(user, asset)
 
     async def skill_descriptors(self, user, refs, authorization_scope=None):
+        refs = [
+            ref if isinstance(ref, ResourceRef) else ResourceRef.model_validate(ref)
+            for ref in refs
+        ]
+        refs = [ref for ref in refs if ref.resource_type == "skill"]
+        if not refs:
+            return []
+        rows = await self.storage.assets.get_many(
+            "skill", {(ref.resource_id, ref.resource_version) for ref in refs}
+        )
+        assets = {(row["resource_id"], row["resource_version"]): row for row in rows}
+        scope = authorization_scope
+        personal = (
+            scope is not None and scope.definition.get("agent_type") == "personal"
+        )
+        snapshot = await self._read_snapshot(
+            user, rows, scope=scope if scope is not None and not personal else None
+        )
+        user = snapshot.user
+        selected = None
+        if personal:
+            if scope.user_id != user.user_id:
+                raise Forbidden("资源装配用户与会话不一致")
+            settings = await self.storage.personal_resources.list_resources(
+                user.user_id, "skill", resource_ids={ref.resource_id for ref in refs}
+            )
+            selected = await self._latest_visible_assets(
+                user,
+                "skill",
+                [
+                    row
+                    for row in snapshot.rows.values()
+                    if row.get("resource_type") == "skill"
+                    and (settings.get(row["resource_id"]) or {}).get("is_enabled")
+                ],
+                usable_only=True,
+                snapshot=snapshot,
+            )
         result = []
         for ref in refs:
-            ref = (
-                ref if isinstance(ref, ResourceRef) else ResourceRef.model_validate(ref)
-            )
-            if ref.resource_type != "skill":
-                continue
-            asset = await self._asset("skill", ref.resource_id, ref.resource_version)
-            await self._require(user, asset, authorization_scope)
+            asset = assets.get((ref.resource_id, ref.resource_version))
+            if asset is None:
+                raise NotFound()
+            if selected is not None and ref.resource_id not in selected:
+                raise Forbidden("技能未启用或已不可用")
+            if not await self._usable(
+                user, asset, None if personal else scope, snapshot=snapshot
+            ):
+                raise Forbidden("未获得此资源版本的使用权限")
             result.append(
                 Skill(
                     name=self._runtime_name(
@@ -1410,18 +1729,71 @@ class ResourceService:
         return await self._runtime_skill(user, asset)
 
     async def mcps_for_refs(
-        self, user, refs, authorization_scope=None, *, skip_unavailable=False
+        self,
+        user,
+        refs,
+        authorization_scope=None,
+        *,
+        skip_unavailable=False,
+        installations=None,
+        refresh_user=True,
     ):
+        refs = [
+            ref if isinstance(ref, ResourceRef) else ResourceRef.model_validate(ref)
+            for ref in refs
+        ]
+        refs = [ref for ref in refs if ref.resource_type == "mcp"]
+        if not refs:
+            return []
+        rows = await self.storage.assets.get_many(
+            "mcp", {(ref.resource_id, MCP_STORAGE_VERSION) for ref in refs}
+        )
+        rows = [row for row in rows if is_managed_connector(row)]
+        assets = {row["resource_id"]: row for row in rows}
+        scope = authorization_scope
+        personal = (
+            scope is not None and scope.definition.get("agent_type") == "personal"
+        )
+        try:
+            if scope is not None and scope.user_id != user.user_id:
+                raise Forbidden("资源装配用户与会话不一致")
+            snapshot = await self._read_snapshot(
+                user,
+                rows,
+                refresh_user=refresh_user,
+                scope=scope if scope is not None and not personal else None,
+            )
+            user = snapshot.user
+            if scope is not None and not personal:
+                await snapshot.require_execution(
+                    scope.root_definition, allow_pinned=True
+                )
+            elif personal and installations is None:
+                installations = await self.storage.personal_resources.list_resources(
+                    user.user_id, "mcp", resource_ids=set(assets)
+                )
+        except AgentKitError:
+            if skip_unavailable:
+                return []
+            raise
         result = []
         for ref in refs:
-            ref = (
-                ref if isinstance(ref, ResourceRef) else ResourceRef.model_validate(ref)
-            )
-            if ref.resource_type != "mcp":
-                continue
             try:
-                asset = await self._asset("mcp", ref.resource_id, None)
-                await self._require(user, asset, authorization_scope)
+                asset = assets.get(ref.resource_id)
+                if asset is None:
+                    raise NotFound()
+                if personal and not (installations.get(ref.resource_id) or {}).get(
+                    "is_enabled"
+                ):
+                    raise Forbidden("连接器未启用")
+                if (
+                    scope is not None
+                    and not personal
+                    and not self._scope_allows(user, asset, scope)
+                ):
+                    raise Forbidden("连接器未绑定至当前会话")
+                if not await self._usable(user, asset, snapshot=snapshot):
+                    raise Forbidden("未获得此资源版本的使用权限")
                 client = await self._mcp_client(user, asset)
             except AgentKitError:
                 if not skip_unavailable:
@@ -1458,9 +1830,7 @@ class ResourceService:
         # 2. 连接器按受管来源验证，其余工具交给既有工具登记能力。
         if await self.authorize_mcp_tool(current_user, scope, tool):
             return
-        await self.tool_registry.authorize(
-            current_user, scope, agent, tool, parameters
-        )
+        await self.tool_registry.authorize(current_user, scope, agent, tool, parameters)
 
     async def authorize_mcp_tool(self, user, scope, tool):
         # 原生网关工具与本地 MCPTool 使用同一协议，二者并非同一具体类型。
@@ -1476,10 +1846,9 @@ class ResourceService:
                 continue
             await self._require(user, row, scope)
             current = await self._mcp_client(user, row)
-            if (
-                client.mcp_config != current.mcp_config
-                or credential_fingerprint(client) != credential_fingerprint(current)
-            ):
+            if client.mcp_config != current.mcp_config or credential_fingerprint(
+                client
+            ) != credential_fingerprint(current):
                 raise Forbidden("连接凭证已变化，请重新发起对话")
             return True
         raise Forbidden("当前会话没有此 MCP 连接")

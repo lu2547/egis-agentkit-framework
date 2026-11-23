@@ -78,7 +78,9 @@ class ComposerService:
         after = self._decode_cursor(cursor, scope) if cursor else None
         personal = can_invite = True
         if session_id:
-            session = await self.project_files.sessions.get_session_record(user, session_id)
+            session = await self.project_files.sessions.get_session_record(
+                user, session_id
+            )
             binding = session.state.middle_context["egis_agentkit"]
             root = await self.storage.definitions.get_definition_by_reference(binding)
             can_invite = collaboration_allowed(session, root)
@@ -147,33 +149,36 @@ class ComposerService:
         while len(result) < count:
             # Authorization can reject many candidates; keep each DB read bounded.
             rows = await self.storage.agents.page_visible_definitions(
-                user, EXPERT_TYPES, after=scanned or None, limit=batch_size, query=query,
-                policies=permissions.policies if permissions else None, order_by_id=True,
+                user,
+                EXPERT_TYPES,
+                after=scanned or None,
+                limit=batch_size,
+                query=query,
+                policies=permissions.policies if permissions else None,
+                order_by_id=True,
             )
             if not rows:
                 break
-            for row in rows:
+            verifier = (
+                self.resources.permissions if permissions is None else permissions
+            )
+            references = [
+                {
+                    "resource_type": "agent",
+                    "resource_id": row["id"],
+                    "resource_view_type": row["resource_view_type"],
+                }
+                for row in rows
+            ]
+            snapshot = await verifier.read_snapshot(user, references)
+            user = snapshot.user
+            for row, reference in zip(rows, references):
                 scanned = row["id"]
                 own = row["owner_type"] == "user" and row["owner_id"] == user.user_id
-                view = (
-                    "private"
-                    if own
-                    else "system"
-                    if row["owner_type"] == "system"
-                    else "shared"
-                )
+                view = reference["resource_view_type"]
                 try:
-                    value = await self.agent_query.get_definition_for_use(
-                        user, row["id"], view, permissions=permissions
-                    )
-                    verifier = (
-                        self.resources.permissions
-                        if permissions is None
-                        else permissions
-                    )
-                    await verifier.require_execution(
-                        user, {**value, "resource_view_type": view}
-                    )
+                    value = await snapshot.definition_view(reference)
+                    await snapshot.require_execution(value)
                 except (Conflict, Forbidden, NotFound):
                     continue
                 if value.get("agent_type") not in EXPERT_TYPES or not value.get(
@@ -219,8 +224,6 @@ class ComposerService:
                 scanned = identifier
                 asset = selected.get(identifier)
                 if asset is None or not asset["is_enabled"]:
-                    continue
-                if not await self.resources._usable(user, asset):
                     continue
                 name = asset["payload"].get("display_name") or asset["resource_id"]
                 detail = asset["payload"].get("description", "")

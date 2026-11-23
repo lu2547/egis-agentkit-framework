@@ -126,9 +126,9 @@ class PersonalManager:
 
     @staticmethod
     def _validate_resource_type(resource_type: str) -> None:
-        """个人资源选择仅包含技能和连接器。"""
-        if resource_type not in ("skill", "mcp"):
-            raise Forbidden("个人助理只能选择技能和连接器")
+        """个人助理选择技能、连接器及平台开放的可选工具。"""
+        if resource_type not in ("skill", "mcp", "tool"):
+            raise Forbidden("个人助理只能选择技能、连接器和可选工具")
 
     async def add_resource(
         self, user: User, resource_type: str, resource_id: str

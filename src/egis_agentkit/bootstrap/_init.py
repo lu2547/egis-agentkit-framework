@@ -55,8 +55,11 @@ from egis_agentkit.service.resource._hubs import (
     LocalSkillHub,
 )
 from egis_agentkit.service.resource._skill_import import SkillImportService
+from egis_agentkit.service.schedule._service import ScheduleService
+from egis_agentkit.service.schedule._worker import ScheduleWorker
 from egis_agentkit.service.session._message_bus_override import SessionMessageBus
 from egis_agentkit.service.session._preparation import SessionPreparationService
+from egis_agentkit.service.session._authorization import ChatAuthorizationStore
 from egis_agentkit.service.session._session import SessionService
 from egis_agentkit.service.team._definition import TeamDefinition
 from egis_agentkit.service.workspace._egis_sandbox_manager import (
@@ -87,6 +90,7 @@ class AgentKit:
     _config: NacosConfigProvider
     _owned_client: NacosClient | None
     _skill_imports: SkillImportService
+    _schedule_worker: ScheduleWorker
     _memory: ProjectMemoryService | None
     _owns_engine: bool
     _logging: LoggingClient | None
@@ -134,13 +138,18 @@ class AgentKit:
                 phase = "skill_imports"
                 stack.push_async_callback(self._skill_imports.close)
                 await self._skill_imports.start()
+                phase = "schedules"
+                stack.push_async_callback(self._schedule_worker.close)
+                await self._schedule_worker.start()
                 phase = "running"
                 logger.info("agentkit.ready", extra={"component": "AgentKit.lifespan"})
                 try:
                     yield
                 finally:
                     phase = "shutdown"
-                    logger.info("agentkit.stopping", extra={"component": "AgentKit.lifespan"})
+                    logger.info(
+                        "agentkit.stopping", extra={"component": "AgentKit.lifespan"}
+                    )
             logger.info("agentkit.stopped", extra={"component": "AgentKit.lifespan"})
         except Exception:
             if phase != "logging":
@@ -172,7 +181,9 @@ def init_agentkit(
     root = workspace.runtime.root
     files = ProjectFileStorage(root, config_provider=config)
     if files.uses_nas_api and snapshot.project.memory.is_enabled:
-        raise ValueError("HTTP 文件模式下，ReMe 项目记忆需要关闭 project.memory.isEnabled")
+        raise ValueError(
+            "HTTP 文件模式下，ReMe 项目记忆需要关闭 project.memory.isEnabled"
+        )
     # 具体沙箱通信只在装配点选择；公司实现可直接注入中立 Client 工厂。
     runtime = workspace.runtime
     sandbox_settings = runtime.sandbox
@@ -194,7 +205,12 @@ def init_agentkit(
     storage = AgentKitStorage(database_url, engine)
     native_storage = SessionExecutionStorage(database_url, engine)
     tracing = TracingClient(snapshot.client.tracing)
-    bus = SessionMessageBus(engine=engine, kafka=snapshot.client.kafka, tracing=tracing)
+    bus = SessionMessageBus(
+        engine=engine,
+        kafka=snapshot.client.kafka,
+        tracing=tracing,
+        presentation_storage=storage,
+    )
     remote_agents = RemoteAgentService(storage.remote_runs, bus, config=config)
     policies = LivePolicies(config)
     users = UserService(storage, policies)
@@ -236,10 +252,13 @@ def init_agentkit(
         workspaces=workspace_manager,
     )
     personal = resources.personal
+    authorizations = ChatAuthorizationStore(bus)
     tasks = SessionService(
-        storage, root, models, config, projects=projects, personal=personal
+        storage, root, models, config, projects=projects, personal=personal,
+        authorizations=authorizations,
     )
-    bus.steering = tasks.steering
+    schedules = ScheduleService(storage, users, tasks, projects, models, personal)
+    resources.tool_registry.schedule_service = schedules
     bus.coordinator = SessionPreparationService(
         storage,
         root,
@@ -248,6 +267,7 @@ def init_agentkit(
         projects=projects,
         users=users,
         personal=personal,
+        authorizations=authorizations,
     )
 
     deploy_demo_report_tools(resources.tool_registry, files)
@@ -278,6 +298,7 @@ def init_agentkit(
         resources=resources,
         skill_imports=skill_imports,
         sessions=tasks,
+        schedules=schedules,
         session_feedback=SessionFeedbackService(storage, tasks, config),
         project_files=project_files,
         presentations=ProjectPresentationManager(project_files),
@@ -309,6 +330,7 @@ def init_agentkit(
         _config=config,
         _owned_client=client if owns_client else None,
         _skill_imports=skill_imports,
+        _schedule_worker=ScheduleWorker(schedules, bus),
         _memory=memory,
         _owns_engine=owns_engine,
         _logging=(

@@ -119,9 +119,17 @@ async def test_configured_default_tools_are_filtered_in_catalog_and_execution(
     _, _, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path, config=config)
     await resources.seed_builtin_tools()
-    assert [tool["resource_id"] for tool in await resources.list(alice, "tool")] == [
+    cards = await resources.list(alice, "tool")
+    assert [tool["resource_id"] for tool in cards if tool["is_system_default"]] == [
         "Read"
     ]
+    optional = {tool["resource_id"]: tool for tool in cards if tool["is_optional_tool"]}
+    assert set(optional) == {
+        "InternetSearch", "KnowledgeBaseSearch",
+        "CreateScheduledTask", "RunScheduledTask", "DeleteScheduledTask",
+    }
+    assert not optional["KnowledgeBaseSearch"]["is_usable"]
+    assert not any(tool["is_enabled"] for tool in optional.values())
     scope = SimpleNamespace(user_id=alice.user_id, configuration=snapshot)
     assert await resources.tool_registry.authorize(alice, scope, None, Read())
     with pytest.raises(Forbidden):

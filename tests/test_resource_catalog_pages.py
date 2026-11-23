@@ -156,13 +156,16 @@ async def test_skill_catalog_refills_if_a_shared_grant_is_revoked_during_read(
     assert before["items"][0]["resource_version"] == "1.0.0"
     assert before["categories"] == ["共享", "我的"]
 
-    shared_asset = resources._shared_asset
+    read_page = resources.storage.assets.skills.page_catalog
 
-    async def revoke_before_render(user, asset):
+    async def revoke_before_render(*args, **kwargs):
+        rows = await read_page(*args, **kwargs)
         await grants.revoke(admin, grant["id"])
-        return await shared_asset(user, asset)
+        return rows
 
-    monkeypatch.setattr(resources, "_shared_asset", revoke_before_render)
+    monkeypatch.setattr(
+        resources.storage.assets.skills, "page_catalog", revoke_before_render
+    )
     page = await resources.catalog_page(alice, "skill", limit=1)
     assert identifiers(page) == ["second-own"]
     assert page["items"][0]["is_editable"] and not page["items"][0]["is_usable"]
@@ -225,7 +228,7 @@ async def test_tool_catalog_filters_after_selecting_latest_visible_version(
     first = await resources.catalog_page(alice, "tool", category="系统默认")
     assert len(first["items"]) == 10
     assert all(item["is_system_default"] for item in first["items"])
-    assert first["categories"] == ["系统默认", "专家工具"]
+    assert first["categories"] == ["系统默认", "可选工具", "专家工具"]
     last = await resources.catalog_page(
         alice, "tool", category="系统默认", cursor=first["next_cursor"]
     )

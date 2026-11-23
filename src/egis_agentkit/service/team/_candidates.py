@@ -31,10 +31,24 @@ class ExpertCandidates:
         await self.storage.remove(user.user_id, identifier, view)
 
     async def resolve(self, user) -> list[dict]:
+        selections = sorted(await self.selections(user))
+        references = [
+            {
+                "resource_type": "agent",
+                "resource_id": identifier,
+                "resource_view_type": view,
+            }
+            for identifier, view in selections
+        ]
+        snapshot = await self.permissions.read_snapshot(user, references)
         experts = []
-        for identifier, view in sorted(await self.selections(user)):
+        for reference in references:
             try:
-                experts.append(await self._expert(user, identifier, view))
+                expert = await snapshot.definition_view(reference)
+                if expert["agent_type"] not in EXPERT_TYPES:
+                    continue
+                await snapshot.require_execution(expert)
+                experts.append(expert)
             except (Forbidden, NotFound):
                 continue
         return experts

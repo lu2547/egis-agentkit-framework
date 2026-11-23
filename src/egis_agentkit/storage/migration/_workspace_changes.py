@@ -45,7 +45,12 @@ async def migrate_workspace_changes(
         )
     for index_name in sorted(missing_indexes):
         index_columns = ", ".join(
-            quote(column.name) for column in expected_indexes[index_name].columns
+            str(
+                expression.compile(
+                    dialect=connection.dialect, compile_kwargs={"include_table": False}
+                )
+            )
+            for expression in expected_indexes[index_name].expressions
         )
         await connection.execute(
             text(f"CREATE INDEX {quote(index_name)} ON {qualified} ({index_columns})")

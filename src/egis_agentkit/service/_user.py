@@ -33,6 +33,10 @@ class UserService:
     async def get(self, user_id: str) -> User:
         """重新读取数据库身份，使角色和组成员变更立即生效。"""
         row = await self.storage.get_user(user_id)
+        return self._active_user(row)
+
+    @staticmethod
+    def _active_user(row) -> User:
         if row is None:
             raise NotFound("用户不存在")
         user = User.model_validate({key: row[key] for key in User.model_fields})
@@ -44,12 +48,19 @@ class UserService:
         if user_id.startswith(VIRTUAL_USER_PREFIX):
             raise Forbidden("此身份标识保留给系统虚拟用户")
         company = self.company_group()
-        identity = User(user_id=user_id, username=username, group_ids=[company.group_id])
+        identity = User(
+            user_id=user_id, username=username, group_ids=[company.group_id]
+        )
         async with self.storage.users.write() as users:
-            if await users.get_user(user_id) is None:
+            row = await users.get_user(user_id)
+            if row is not None:
+                current = self._active_user(row)
+                if current.username == username:
+                    return current
+            else:
                 await users.ensure_group(company, actor="identity")
-            await users.upsert_identity(identity)
-        return await self.get(user_id)
+            row = await users.upsert_identity(identity)
+        return self._active_user(row)
 
     async def provision_admin(self, user_id: str, *, actor: str) -> None:
         """Explicit trusted CLI bootstrap; never exposed as a login operation."""
@@ -91,7 +102,9 @@ class UserService:
                 raise NotFound()
             return row
 
-    async def list_groups(self, admin: User, *, include_members: bool = True) -> list[dict]:
+    async def list_groups(
+        self, admin: User, *, include_members: bool = True
+    ) -> list[dict]:
         require_admin(admin)
         if not include_members:
             return await self.storage.users.list_group_options()

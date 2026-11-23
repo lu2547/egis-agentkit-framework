@@ -38,6 +38,16 @@ class GrantService:
         elif not await write.users.enabled_group_ids([target.principal_id]):
             raise NotFound("授权分组不存在或已停用")
 
+    @staticmethod
+    def require_loaded_recipient(target, enabled):
+        if not enabled:
+            message = (
+                "授权用户不存在或已停用"
+                if target.principal_type == "user"
+                else "授权分组不存在或已停用"
+            )
+            raise NotFound(message)
+
     async def list_grants(self, admin):
         """读取直接和派生授权的审计记录。"""
         require_admin(admin)
@@ -72,7 +82,9 @@ class GrantService:
             identifier = row["resource_id"]
             resources.append(
                 self._grantable_row(
-                    "skill", identifier, row,
+                    "skill",
+                    identifier,
+                    row,
                     row["payload"].get("display_name") or identifier,
                 )
             )
@@ -114,9 +126,15 @@ class GrantService:
             ):
                 raise Forbidden("MCP 只开放给公司组")
             await write.assets.lock_resource("mcp", data.resource_id)
-            resource = await write.assets.get("mcp", data.resource_id, MCP_STORAGE_VERSION)
+            resource = await write.assets.get(
+                "mcp", data.resource_id, MCP_STORAGE_VERSION
+            )
             if resource is None or not is_managed_connector(resource):
                 raise NotFound()
+        elif data.resource_type == "skill":
+            resource = await write.access.skill_write_state(
+                data.resource_id, target=data
+            )
         else:
             resource = await self.grant_version(
                 data.resource_type, data.resource_id, write=write
@@ -125,14 +143,23 @@ class GrantService:
 
     async def issue(self, admin, data, resource, *, write):
         """提交已选择的共享版本和该接收方的授权路径。"""
-        await self.require_recipient(data, write=write)
+        if resource is not None and "_recipient_enabled" in resource:
+            self.require_loaded_recipient(data, resource["_recipient_enabled"])
+        else:
+            await self.require_recipient(data, write=write)
         self._validate_grant_resource(data, resource)
         kind, identifier = data.resource_type, data.resource_id
         version = resource["resource_version"]
-        if (
-            data.resource_view_type == "shared"
-            and not await write.access.shared_version(kind, identifier)
-        ):
+        shared = (
+            (
+                resource["_shared_resource_version"]
+                if "_shared_resource_version" in resource
+                else await write.access.shared_version(kind, identifier)
+            )
+            if data.resource_view_type == "shared"
+            else None
+        )
+        if data.resource_view_type == "shared" and shared is None:
             await write.access.set_shared_version(kind, identifier, version)
         root = await self._record_direct(data, actor=admin.user_id, write=write)
         if kind in DEFINITION_KINDS:
@@ -196,101 +223,136 @@ class GrantService:
             raise Forbidden("该资源不能单独授权")
 
     async def _grant_dependencies(self, root, definition, *, actor, write):
-        from egis_agentkit.service.team._members import team_member_definitions
-
-        team_id = definition["id"] if definition["definition_type"] == "team" else None
-        members = (
-            (await team_member_definitions(write, definition)).values()
-            if team_id
-            else [definition]
+        await self._grant_dependencies_many(
+            [root], definition, actor=actor, write=write
         )
-        retained = set()
-        for member in members:
-            parent_id = root["id"]
-            agent_id = member["id"]
-            if team_id:
-                parent_id = await self._grant_dependency(
-                    root,
-                    "agent",
-                    agent_id,
-                    member["resource_view_type"],
-                    member,
-                    parent_id=parent_id,
-                    agent_id=agent_id,
-                    team_id=team_id,
-                    actor=actor,
-                    write=write,
-                )
-                retained.add(parent_id)
-            for binding in member["payload"].get("bindings", []):
-                kind = binding["resource_type"]
-                if kind != "skill":
-                    continue
-                identifier = binding["resource_id"]
-                asset = await write.assets.get(
-                    kind, identifier, binding["resource_version"]
-                )
-                if asset is None or not asset["is_enabled"]:
-                    raise NotFound("绑定资源指定版本不存在或已停用")
-                retained.add(
-                    await self._grant_dependency(
-                        root,
-                        kind,
-                        identifier,
-                        binding["resource_view_type"],
-                        asset,
-                        parent_id=parent_id,
-                        agent_id=agent_id,
-                        team_id=team_id,
-                        actor=actor,
-                        write=write,
-                    )
-                )
-        await write.access.revoke_dependencies(root["id"], retained, actor=actor)
 
     @staticmethod
-    async def _grant_dependency(
-        root,
-        kind,
-        identifier,
-        view,
-        data,
-        *,
-        parent_id,
-        agent_id,
-        team_id,
-        actor,
-        write,
+    def _dependency_values(
+        root, kind, identifier, view, data, *, parent_id, agent_id, team_id
     ):
-        dependency = await write.access.upsert_grant(
-            {
-                "id": new_id(),
-                "resource_type": kind,
-                "resource_id": identifier,
-                "resource_view_type": view,
-                "resource_owner_type": data["owner_type"],
-                "resource_owner_id": data["owner_id"],
-                "agent_id": agent_id,
-                "team_id": team_id,
-                "grant_source_type": "dependency",
-                "source_review_id": root["source_review_id"],
-                "root_grant_id": root["id"],
-                "parent_grant_id": parent_id,
-                "origin_key": parent_id,
-                "principal_type": root["principal_type"],
-                "principal_id": root["principal_id"],
-            },
-            actor=actor,
+        return {
+            "id": new_id(),
+            "resource_type": kind,
+            "resource_id": identifier,
+            "resource_view_type": view,
+            "resource_owner_type": data["owner_type"],
+            "resource_owner_id": data["owner_id"],
+            "agent_id": agent_id,
+            "team_id": team_id,
+            "grant_source_type": "dependency",
+            "source_review_id": root["source_review_id"],
+            "root_grant_id": root["id"],
+            "parent_grant_id": parent_id,
+            "origin_key": parent_id,
+            "principal_type": root["principal_type"],
+            "principal_id": root["principal_id"],
+        }
+
+    async def _grant_dependencies_many(self, roots, definition, *, actor, write):
+        from egis_agentkit.storage._authorization import resource_rows
+        from egis_agentkit.storage._definition import (
+            build_definition_data,
+            definition_view_selection,
         )
-        return dependency["id"]
+
+        if not roots:
+            return
+        team_id = definition["id"] if definition["definition_type"] == "team" else None
+        members = [definition]
+        if team_id:
+            refs = (
+                definition["payload"]["orchestrator"],
+                *definition["payload"]["members"],
+            )
+            loaded = await write.definitions.get_many(
+                {
+                    ("agent", ref["definition_id"], ref["resource_version"])
+                    for ref in refs
+                }
+            )
+            members = []
+            for ref in refs:
+                row = loaded.get(
+                    ("agent", ref["definition_id"], str(ref["resource_version"]))
+                )
+                if row is None:
+                    raise NotFound("绑定专家版本不存在")
+                definition_view_selection(
+                    row,
+                    ref["resource_view_type"],
+                    version=ref["resource_version"],
+                    dependency=True,
+                )
+                members.append(
+                    {
+                        **build_definition_data(row),
+                        "resource_view_type": ref["resource_view_type"],
+                    }
+                )
+        references = {
+            ("skill", ref["resource_id"], ref["resource_version"])
+            for member in members
+            for ref in member["payload"].get("bindings", [])
+            if ref["resource_type"] == "skill"
+        }
+        assets = {
+            (row["resource_id"], row["resource_version"]): row
+            for row in await resource_rows(write.engine, references)
+        }
+        retained = {root["id"]: set() for root in roots}
+        parents = {}
+        if team_id:
+            layer = [
+                self._dependency_values(
+                    root,
+                    "agent",
+                    member["id"],
+                    member["resource_view_type"],
+                    member,
+                    parent_id=root["id"],
+                    agent_id=member["id"],
+                    team_id=team_id,
+                )
+                for root in roots
+                for member in members
+            ]
+            for row in await write.access.upsert_grants(layer, actor=actor):
+                parents[row["root_grant_id"], row["agent_id"]] = row["id"]
+                retained[row["root_grant_id"]].add(row["id"])
+        layer = []
+        for root in roots:
+            for member in members:
+                parent_id = parents[root["id"], member["id"]] if team_id else root["id"]
+                for ref in member["payload"].get("bindings", []):
+                    if ref["resource_type"] != "skill":
+                        continue
+                    asset = assets.get((ref["resource_id"], ref["resource_version"]))
+                    if asset is None or not asset["is_enabled"]:
+                        raise NotFound("绑定资源指定版本不存在或已停用")
+                    layer.append(
+                        self._dependency_values(
+                            root,
+                            "skill",
+                            ref["resource_id"],
+                            ref["resource_view_type"],
+                            asset,
+                            parent_id=parent_id,
+                            agent_id=member["id"],
+                            team_id=team_id,
+                        )
+                    )
+        for row in await write.access.upsert_grants(layer, actor=actor):
+            retained[row["root_grant_id"]].add(row["id"])
+        await write.access.revoke_dependencies_many(retained, actor=actor)
 
     async def refresh_dependencies(self, definition, *, actor, write):
         """按现有根授权更新派生路径，保持接收方和入口 ID。"""
         kind = definition["definition_type"]
         if kind not in DEFINITION_KINDS:
             return
-        for root in await write.access.direct_grants(kind, definition["id"]):
-            await self._grant_dependencies(root, definition, actor=actor, write=write)
+        roots = await write.access.direct_grants(kind, definition["id"])
+        await self._grant_dependencies_many(roots, definition, actor=actor, write=write)
 
     async def record_owner(self, kind, identifier, resource, *, actor):
         """登记资源的个人归属授权。"""

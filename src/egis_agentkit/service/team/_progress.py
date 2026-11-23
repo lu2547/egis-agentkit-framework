@@ -2,6 +2,7 @@
 
 import json
 import logging
+from datetime import datetime, timezone
 
 from agentscope.app._service._session_projection import SessionProjection
 from agentscope.app.message_bus import MessageBusKeys
@@ -84,7 +85,11 @@ class CollaboratorProgress:
     def _transition(previous, event, repeat):
         if event is None:
             if previous is None or (repeat and previous["status"] in FINISHED):
-                return {"status": "queued", "activities": []}
+                return {
+                    "status": "queued",
+                    "activities": [],
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                }
             return None
         kind, reply_id = event["type"], event["reply_id"]
         matching = previous is not None and previous.get("reply_id") == reply_id
@@ -97,7 +102,14 @@ class CollaboratorProgress:
                     if previous["status"] == "waiting"
                     else None
                 )
-            return {"reply_id": reply_id, "status": "running", "activities": []}
+            return {
+                "reply_id": reply_id,
+                "status": "running",
+                "activities": [],
+                "started_at": previous.get("started_at", event["created_at"])
+                if previous and previous["status"] == "queued"
+                else event["created_at"],
+            }
         if kind == EventType.REPLY_END:
             status = {
                 ReplyFinishedReason.COMPLETED: "completed",
@@ -107,6 +119,10 @@ class CollaboratorProgress:
                 "reply_id": reply_id,
                 "status": status,
                 "activities": previous["activities"] if matching else [],
+                "started_at": previous.get("started_at", event["created_at"])
+                if matching
+                else event["created_at"],
+                "finished_at": event["created_at"],
             }
         if not matching:
             return None

@@ -14,10 +14,11 @@ from egis_agentkit.service.resource._skill import _skill_front
 
 def bundle(version="1.2.3"):
     output = io.BytesIO()
+    version_line = f"version: {version}\n" if version is not None else ""
     with zipfile.ZipFile(output, "w") as archive:
         archive.writestr(
             "demo/SKILL.md",
-            f"---\nname: demo\ndescription: Demo\nversion: {version}\nmetadata:\n  author: Demo\n  labels: [one, two]\ncustom: retain\n---\n# Original",
+            f"---\nname: demo\ndescription: Demo\n{version_line}metadata:\n  author: Demo\n  labels: [one, two]\ncustom: retain\n---\n# Original",
         )
         archive.writestr("demo/assets/logo.bin", b"attachment")
     return output.getvalue()
@@ -323,7 +324,7 @@ async def test_import_http_accepts_upload_metadata_and_routes_owner_only(
 
     import httpx
     from egis_agentkit_app.bootstrap._router import manager_router as router
-    from egis_agentkit_app.controller.base import current_user
+    from egis_agentkit_app.controller.base import current_user, register_exception_handlers
     from fastapi import FastAPI
 
     from egis_agentkit.service.resource._skill_import import SkillImportService
@@ -334,10 +335,18 @@ async def test_import_http_accepts_upload_metadata_and_routes_owner_only(
     app = FastAPI()
     app.state.egis_services = SimpleNamespace(resources=resources, skill_imports=queue)
     app.include_router(router)
+    register_exception_handlers(app)
     app.dependency_overrides[current_user] = lambda: alice
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
+        denied = await client.post(
+            "/manager/skills/imports",
+            files={"file": ("system.zip", bundle(), "application/zip")},
+            data={"owner_type": "system"},
+        )
+        assert denied.status_code == 403
+        assert (await client.get("/manager/skills/imports")).json() == {"items": []}
         response = await client.post(
             "/manager/skills/imports",
             files={"file": ("metadata.zip", bundle(), "application/zip")},
@@ -345,6 +354,7 @@ async def test_import_http_accepts_upload_metadata_and_routes_owner_only(
         )
         assert response.status_code == 202, response.text
         job = response.json()
+        assert job["owner_type"] == "user"
         assert job["category"] == "writing" and job["avatar"] == "book"
         assert job["status"] == "queued"
         assert "archive_location" not in job and "lease_token" not in job
@@ -465,10 +475,16 @@ async def test_failed_nas_upload_does_not_enqueue_job(storage, tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_virtual_user_bearer_import_review_and_publication(storage, tmp_path):
+@pytest.mark.parametrize(
+    "version, expected_version", [("1.2.3", "1.2.3"), (None, "1.0.0")]
+)
+async def test_virtual_user_bearer_import_review_and_publication(
+    storage, tmp_path, version, expected_version
+):
     from types import SimpleNamespace
 
-    from egis_agentkit_app.controller.resource._resource import router
+    from egis_agentkit_app.bootstrap._router import router
+    from egis_agentkit_app.controller.base import register_exception_handlers
     from fastapi import FastAPI
     from httpx import ASGITransport, AsyncClient
 
@@ -478,33 +494,61 @@ async def test_virtual_user_bearer_import_review_and_publication(storage, tmp_pa
     from egis_agentkit.service.resource._skill_import import SkillImportService
     from egis_agentkit.storage import tables as t
 
-    _, admin, _, _ = await identities(storage)
+    _, admin, alice, _ = await identities(storage)
     resources = ResourceService(storage, tmp_path)
     queue = SkillImportService(storage, resources)
     account = await queue.virtual_users.create(admin, "external catalog")
     app = FastAPI()
     app.state.egis_services = SimpleNamespace(
-        virtual_users=queue.virtual_users, skill_imports=queue, resources=resources
+        virtual_users=queue.virtual_users,
+        skill_imports=queue,
+        resources=resources,
+        users=queue.users,
+        sessions=None,
     )
-    app.include_router(router, prefix="/manager")
-    app.add_middleware(IdentityGuard, identity=None, services=app.state.egis_services)
+    app.include_router(router)
+    register_exception_handlers(app)
+    identity = SimpleNamespace(verify=lambda token: {"sub": token})
+    app.add_middleware(IdentityGuard, identity=identity, services=app.state.egis_services)
+    external_path = "/integrations/skills/imports"
+    internal_path = "/manager/skills/imports"
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
         headers={"Authorization": "Bearer " + account["token"]},
     ) as client:
-        assert (await client.get("/manager/skills/imports")).status_code == 200
+        assert (await client.get(external_path)).status_code == 200
         assert (await client.get("/manager/skills")).status_code == 403
-        content = bundle()
-        uploaded = await client.post(
-            "/manager/skills/imports", files={"file": ("test.zip", content)}
-        )
+        content = bundle(version)
+        files = {"file": ("test.zip", content)}
+        assert (await client.get(internal_path)).status_code == 403
+        assert (await client.post(internal_path, files=files)).status_code == 403
+        for user in (alice, admin):
+            headers = {"Authorization": "Bearer " + user.user_id}
+            assert (await client.get(external_path, headers=headers)).status_code == 403
+            assert (
+                await client.post(external_path, files=files, headers=headers)
+            ).status_code == 403
+        assert (await client.get(external_path)).json() == {"items": []}
+
+        uploaded = await client.post(external_path, files=files)
         assert uploaded.status_code == 202, uploaded.text
         job = uploaded.json()
         assert job["owner_type"] == "system" and job["uploader_type"] == "virtual"
+        suffix = "/" + job["job_id"]
+        assert (await client.get(internal_path + suffix)).status_code == 403
+        assert (await client.post(internal_path + suffix + "/retry")).status_code == 403
+        headers = {"Authorization": "Bearer " + alice.user_id}
+        assert (
+            await client.get(external_path + suffix, headers=headers)
+        ).status_code == 403
+        assert (
+            await client.post(external_path + suffix + "/retry", headers=headers)
+        ).status_code == 403
         assert await queue.run_once()
         pending = await queue.list_reviews(admin)
         assert [row["uploaded_by"] for row in pending] == [account["user_id"]]
+        assert pending[0]["resource_version"] == expected_version
         assert await queue.download_review(admin, job["job_id"]) == (
             "test.zip",
             content,
@@ -519,8 +563,10 @@ async def test_virtual_user_bearer_import_review_and_publication(storage, tmp_pa
             {"id": "0" * 32, "ok": False, "detail": "技能导入不在待审批状态"},
         ]
         assert await queue.run_once()
-        finished = (await client.get(f"/manager/skills/imports/{job['job_id']}")).json()
+        finished = (await client.get(external_path + suffix)).json()
         assert finished["status"] == "succeeded"
+        assert (await client.post(external_path + suffix + "/retry")).status_code == 409
+        assert finished["resource_version"] == expected_version
         assert finished["reviewed_by"] == admin.user_id
         (asset,) = await storage.assets.list_versions("skill")
         assert asset["owner_type"] == "system" and asset["owner_id"] == "system"
@@ -533,13 +579,12 @@ async def test_virtual_user_bearer_import_review_and_publication(storage, tmp_pa
         assert summary["owner_version"] == detail["version"] == 1
         assert summary["shared_version"] is None
         assert detail["import_job_id"] == job["job_id"]
-        assert detail["resource_version"] == "1.2.3"
-        assert (
-            tmp_path / "common" / "skills" / detail["skill_id"] / "1.2.3" / "SKILL.md"
-        ).is_file()
+        assert detail["resource_version"] == expected_version
+        published = tmp_path / "common" / "skills" / detail["skill_id"] / expected_version
+        assert (published / "SKILL.md").read_bytes() == read_archive_files(content)["SKILL.md"]
         assert not (queue.uploads.incoming / (job["job_id"] + ".zip")).exists()
         await queue.virtual_users.rotate(admin, account["user_id"])
-        assert (await client.get("/manager/skills/imports")).status_code == 401
+        assert (await client.get(external_path)).status_code == 401
 
 
 @pytest.mark.asyncio

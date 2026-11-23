@@ -8,6 +8,7 @@ from contextlib import aclosing, asynccontextmanager
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
+from agentscope.app._chat_input_store import cleanup_session
 from agentscope.app.message_bus import InMemoryMessageBus, MessageBus, MessageBusKeys
 
 from egis_agentkit.client.nacos._settings import KafkaConfig
@@ -71,8 +72,12 @@ class EgisMessageBus(MessageBus):
                 if kafka_bootstrap_servers is None
                 else kafka_bootstrap_servers
             ),
-            topic_prefix=connection.topic_prefix if topic_prefix is None else topic_prefix,
-            consumer_group=connection.consumer_group if consumer_group is None else consumer_group,
+            topic_prefix=connection.topic_prefix
+            if topic_prefix is None
+            else topic_prefix,
+            consumer_group=connection.consumer_group
+            if consumer_group is None
+            else consumer_group,
             node_id=node_id or uuid4().hex,
             buffer_size=buffer_size,
             options=kafka_options or {},
@@ -214,6 +219,15 @@ class EgisMessageBus(MessageBus):
             return await self._kafka().drain(max_count)
         return await self._primitives.queue_drain(key, max_count)
 
+    async def queue_read(self, key, max_count=100):
+        return await self._primitives.queue_read(key, max_count)
+
+    async def queue_replace(self, key, payloads):
+        return await self._primitives.queue_replace(key, payloads)
+
+    async def queue_remove_if(self, key, matches):
+        return await self._primitives.queue_remove_if(key, matches)
+
     async def queue_delete(self, key):
         if self.delegate is None and key == MessageBusKeys.wakeup_queue():
             await self._pg.trigger_state(
@@ -221,6 +235,40 @@ class EgisMessageBus(MessageBus):
             )
             return
         await self._primitives.queue_delete(key)
+
+    async def clear_rewrite_runtime(
+        self, conn, session_ids, *, extra_registry_namespaces=()
+    ):
+        """将集群会话的运行清理纳入消息历史事务，不触碰聊天凭据和 FIFO。"""
+        if self.delegate is not None:
+            raise ValueError("单机运行状态应在历史提交后清理")
+        await self._pg.clear_rewrite_runtime(
+            conn, session_ids, extra_registry_namespaces=extra_registry_namespaces
+        )
+
+    async def purge_sessions(self, session_ids, *, extra_registry_namespaces=()):
+        """一次清理范围内的会话总线数据，单机继续调用原生公共操作。"""
+        session_ids = sorted(set(session_ids))
+        if self.delegate is None:
+            return await self._pg.purge_sessions(
+                session_ids, extra_registry_namespaces=extra_registry_namespaces
+            )
+        for sid in session_ids:
+            await self.log_trim(MessageBusKeys.session_events(sid))
+            await self.queue_delete(MessageBusKeys.inbox(sid))
+            await self.queue_delete(MessageBusKeys.chat_inputs(sid))
+            await self.registry_del(MessageBusKeys.chat_input_inflight_registry(), sid)
+            await cleanup_session(self, sid)
+            await self.registry_del(MessageBusKeys.chat_active_reply_registry(), sid)
+            for namespace in (
+                MessageBusKeys.inbox_consumer(sid),
+                MessageBusKeys.bg_tasks(sid),
+                MessageBusKeys.session_event_checkpoint(sid),
+                MessageBusKeys.projection_namespace(sid),
+            ):
+                await self.registry_drop(namespace)
+        for namespace in extra_registry_namespaces:
+            await self.registry_drop(namespace)
 
     async def log_append(self, key, payload, *, ttl_secs=None, max_len=None):
         if key.startswith(MessageBusKeys.session_events("")):
@@ -282,6 +330,12 @@ class EgisMessageBus(MessageBus):
 
     async def is_locked(self, key):
         return await self._primitives.is_locked(key)
+
+    async def locked_keys(self, keys):
+        """批量读取当前持有的租约，单机保持原生内存锁的过期语义。"""
+        if self.delegate is None:
+            return await self._pg.locked_keys(keys)
+        return {key for key in keys if await self.delegate.is_locked(key)}
 
     @asynccontextmanager
     async def acquire_lock(self, key, *, ttl_secs=600):
@@ -362,6 +416,11 @@ class EgisMessageBus(MessageBus):
 
     async def registry_del(self, namespace, field):
         await self._primitives.registry_del(namespace, field)
+
+    async def registry_del_if(self, namespace, field, *, expected):
+        return await self._primitives.registry_del_if(
+            namespace, field, expected=expected
+        )
 
     async def registry_exists(self, namespace, field):
         return await self._primitives.registry_exists(namespace, field)

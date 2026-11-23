@@ -48,7 +48,10 @@ class ExpertInvite(ToolBase):
         self._invite = invite
 
     async def check_permissions(self, tool_input, context):
-        return PermissionDecision(PermissionBehavior.ALLOW)
+        return PermissionDecision(
+            behavior=PermissionBehavior.ALLOW,
+            message="已通过候选专家授权检查",
+        )
 
     async def call(self, *, target: str, prompt: str) -> ToolChunk:
         if target not in self._candidates:

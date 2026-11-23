@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from ..service.project._project_manager import ProjectManager
     from ..service.resource._catalog import ResourceService
     from ..service.resource._skill_import import SkillImportService
+    from ..service.schedule._service import ScheduleService
     from ..service.session._session import SessionService
     from ..service.team._definition import TeamDefinition
 
@@ -41,3 +42,4 @@ class AgentKitServices:
     skill_imports: "SkillImportService | None" = None
     composer: "ComposerService | None" = None
     session_feedback: "SessionFeedbackService | None" = None
+    schedules: "ScheduleService | None" = None

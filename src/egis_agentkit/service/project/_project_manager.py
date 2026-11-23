@@ -9,26 +9,49 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
+from agentscope.app._chat_input_store import cleanup_session
 from agentscope.app.message_bus import MessageBusKeys
 
+from egis_agentkit.core.message_bus import EgisMessageBus
 from egis_agentkit.core.project._project import Project
 from egis_agentkit.errors import Conflict, NotFound
+from egis_agentkit.service.session._steering_projection import (
+    steering_presentation_namespace,
+)
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
 logger = logging.getLogger(__name__)
 
 
-async def purge_session_bus(bus, sid):
-    """清理原生会话在消息总线上的投递和回放数据。"""
-    await bus.log_trim(MessageBusKeys.session_events(sid))
-    await bus.queue_delete(MessageBusKeys.inbox(sid))
-    for namespace in (
-        MessageBusKeys.inbox_consumer(sid),
-        MessageBusKeys.bg_tasks(sid),
-        MessageBusKeys.session_event_checkpoint(sid),
-        MessageBusKeys.projection_namespace(sid),
-    ):
-        await bus.registry_drop(namespace)
+async def purge_session_bus(bus, session_ids):
+    """批量清理原生会话总线数据，普通原生总线保留公共操作回退。"""
+    session_ids = (
+        [session_ids]
+        if isinstance(session_ids, str)
+        else list(dict.fromkeys(session_ids))
+    )
+    if isinstance(bus, EgisMessageBus):
+        return await bus.purge_sessions(
+            session_ids,
+            extra_registry_namespaces=[
+                steering_presentation_namespace(sid) for sid in session_ids
+            ],
+        )
+    for sid in session_ids:
+        await bus.log_trim(MessageBusKeys.session_events(sid))
+        await bus.queue_delete(MessageBusKeys.inbox(sid))
+        await bus.queue_delete(MessageBusKeys.chat_inputs(sid))
+        await bus.registry_del(MessageBusKeys.chat_input_inflight_registry(), sid)
+        await cleanup_session(bus, sid)
+        await bus.registry_del(MessageBusKeys.chat_active_reply_registry(), sid)
+        for namespace in (
+            MessageBusKeys.inbox_consumer(sid),
+            MessageBusKeys.bg_tasks(sid),
+            MessageBusKeys.session_event_checkpoint(sid),
+            MessageBusKeys.projection_namespace(sid),
+            steering_presentation_namespace(sid),
+        ):
+            await bus.registry_drop(namespace)
 
 
 class ProjectManager:
@@ -99,6 +122,11 @@ class ProjectManager:
     async def default(self, user):
         """并发调用复用该用户的同一个默认项目。"""
         defaults = self._defaults()
+        existing = await self.storage.projects.get_default(user.user_id)
+        if existing:
+            if existing["status_type"] != "active":
+                raise Conflict("默认项目正在删除，请选择其他项目")
+            return existing
         async with self.storage.projects.lock_default(user.user_id) as projects:
             project = await projects.get_default(user.user_id)
             if project:
@@ -119,8 +147,7 @@ class ProjectManager:
             name = self.project.validate_name(
                 project_name, is_default=project["is_default"]
             )
-            await projects.rename(user.user_id, project_id, name)
-        return await self.get(user, project_id)
+            return self._require(await projects.rename(user.user_id, project_id, name))
 
     async def session_project(self, user, session):
         """从原生会话绑定读取项目，并校验当前项目归属。"""
@@ -168,14 +195,9 @@ class ProjectManager:
         # 原生删除只清理借用专家的会话，借用的 Agent 由主会话持有。
         owned_projections = set()
         for row in rows:
-            record = await self.storage.read_session_unscoped(
-                user_id, row.agent_id, row.id
+            owned_projections.update(
+                member["native_agent_id"] for member in collaborators(row.binding or {})
             )
-            if record is not None:
-                binding = record.state.middle_context.get("egis_agentkit", {})
-                owned_projections.update(
-                    member["native_agent_id"] for member in collaborators(binding)
-                )
 
         async with self.storage.project_cleanup(project_id) as (
             projects,
@@ -186,8 +208,7 @@ class ProjectManager:
             await file_records.delete_project_records(project_id)
             await projects.delete(user_id, project_id)
             await asyncio.to_thread(self.files.remove_project, user_id, project_id)
-            for row in rows:
-                await purge_session_bus(bus, row.id)
+            await purge_session_bus(bus, [row.id for row in rows])
 
     async def on_system_prompt(self, scope, files, agent, current_prompt):
         """取得项目输入清单，再由 Core Project 组织本轮项目上下文。"""

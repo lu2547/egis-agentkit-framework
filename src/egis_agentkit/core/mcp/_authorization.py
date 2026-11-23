@@ -34,6 +34,8 @@ from egis_agentkit.storage.model import (
     utcnow,
 )
 
+_STATUS_NOT_LOADED = object()
+
 
 def _https(url):
     """解析 OAuth 端点，拒绝明文连接及携带用户信息的 URL。"""
@@ -223,13 +225,22 @@ class MCPAuthorization:
             await credentials.update(*identity, credential=credential)
         return {"authorized": True}
 
-    async def status(self, user, asset):
+    async def status(self, user, asset, *, credential_row=_STATUS_NOT_LOADED):
         """读取当前用户的连接认证状态，仅返回状态而不暴露凭据。"""
         method = self._config(asset).get("auth_type", "none")
         if method == "none":
             return {"auth_type": method, "authorized": True}
-        row = await self.credentials.read(user.user_id, self._connection(asset))
+        row = (
+            await self.credentials.read(user.user_id, self._connection(asset))
+            if credential_row is _STATUS_NOT_LOADED
+            else credential_row
+        )
         authorized = False
+        if row and (row["user_id"], row["connection_id"]) != (
+            user.user_id,
+            self._connection(asset),
+        ):
+            return {"auth_type": method, "authorized": False}
         if row and row["credential"]:
             try:
                 credential = self._decrypt(row["credential"])
@@ -237,7 +248,8 @@ class MCPAuthorization:
                 pass
             else:
                 authorized = method == "api_key" or bool(
-                    credential.get("refresh_token") or self._fresh(credential, self.settings)
+                    credential.get("refresh_token")
+                    or self._fresh(credential, self.settings)
                 )
         return {"auth_type": method, "authorized": authorized}
 

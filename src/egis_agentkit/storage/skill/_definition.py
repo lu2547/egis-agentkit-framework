@@ -6,7 +6,7 @@
 - 按当前指针读取目录候选，按明确包版本读取历史明细。
 """
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -49,40 +49,60 @@ def _definition_query(*, current_only=False):
     return statement
 
 
-def _catalog_skill_visibility(user):
-    """Choose the same current version and direct grants as the resource service."""
-    summary, detail, grant = t.skill_summary, t.skill_detail, t.resource_permission
-    system = summary.c.owner_type == "system"
-    own = and_(summary.c.owner_type == "user", summary.c.owner_id == user.user_id)
-    selected = detail.c.version == case(
-        (or_(system, own), summary.c.owner_version), else_=summary.c.shared_version
+def _catalog_skill_candidates(user):
+    """Drive catalog reads from owned IDs and recipient-scoped direct grants."""
+    summary, grant = t.skill_summary, t.resource_permission
+    own = select(summary.c.skill_id).where(
+        summary.c.owner_type == "user",
+        summary.c.owner_id == user.user_id,
+        summary.c.is_enabled,
     )
     groups = select(t.groups.c.group_id).where(
         t.groups.c.group_id.in_(user.group_ids), t.groups.c.is_enabled
     )
-    direct = (
-        select(grant.c.id)
+    granted = (
+        select(grant.c.resource_id.label("skill_id"))
+        .select_from(grant.join(summary, grant.c.resource_id == summary.c.skill_id))
         .where(
             grant.c.resource_type == "skill",
-            grant.c.resource_id == summary.c.skill_id,
-            grant.c.resource_view_type == case((system, "system"), else_="shared"),
             grant.c.revoked_at.is_(None),
             grant.c.root_grant_id.is_(None),
             grant.c.grant_source_type != "owner",
+            grant.c.resource_view_type
+            == case((summary.c.owner_type == "system", "system"), else_="shared"),
+            summary.c.is_enabled,
             or_(
                 and_(
                     grant.c.principal_type == "user",
                     grant.c.principal_id == user.user_id,
                 ),
                 and_(
-                    grant.c.principal_type == "group",
-                    grant.c.principal_id.in_(groups),
+                    grant.c.principal_type == "group", grant.c.principal_id.in_(groups)
                 ),
             ),
         )
-        .exists()
     )
-    visible = or_(own, and_(summary.c.is_enabled, detail.c.is_enabled, direct))
+    branches = [granted]
+    if user.role_type == "admin":
+        branches.append(
+            select(summary.c.skill_id).where(
+                summary.c.owner_type == "system", summary.c.is_enabled
+            )
+        )
+    # UNION removes overlapping user/group grants and owned+granted identities
+    # before joining version payloads, so permissions never multiply page rows.
+    return own.union(*branches).subquery("catalog_skill_ids")
+
+
+def _catalog_skill_visibility(user):
+    """Select the current pointer after joining the scoped candidate ID set."""
+    summary, detail = t.skill_summary, t.skill_detail
+    system = summary.c.owner_type == "system"
+    own = and_(summary.c.owner_type == "user", summary.c.owner_id == user.user_id)
+    selected = detail.c.version == case(
+        (or_(system, own), summary.c.owner_version), else_=summary.c.shared_version
+    )
+    visible = or_(own, detail.c.is_enabled)
     if user.role_type == "admin":
         visible = or_(system, visible)
     return summary.c.is_enabled, selected, visible
@@ -165,6 +185,18 @@ class SkillDefinitionStorage:
         rows = await self._rows(statement, conn=conn)
         return rows[0] if rows else None
 
+    async def get_many(self, identities, *, conn=None):
+        """Read a bounded set of pinned skill package versions."""
+        if not identities:
+            return []
+        detail = t.skill_detail
+        return await self._rows(
+            _definition_query().where(
+                tuple_(detail.c.skill_id, detail.c.resource_version).in_(identities)
+            ),
+            conn=conn,
+        )
+
     async def list_versions(
         self,
         *,
@@ -200,7 +232,12 @@ class SkillDefinitionStorage:
     async def page_catalog(self, user, *, after, limit, query, category, mine):
         """Filter current skills and personal selections before keyset pagination."""
         summary, detail = t.skill_summary, t.skill_detail
-        statement = _definition_query().where(*_catalog_skill_visibility(user))
+        candidates = _catalog_skill_candidates(user)
+        statement = (
+            _definition_query()
+            .join(candidates, summary.c.skill_id == candidates.c.skill_id)
+            .where(*_catalog_skill_visibility(user))
+        )
         if after is not None:
             statement = statement.where(summary.c.skill_id > after)
         if query:
@@ -235,9 +272,12 @@ class SkillDefinitionStorage:
         summary, detail = t.skill_summary, t.skill_detail
         category = _catalog_skill_category()
         joined = summary.join(detail, summary.c.skill_id == detail.c.skill_id)
+        candidates = _catalog_skill_candidates(user)
         categories = (
             select(category)
-            .select_from(joined)
+            .select_from(
+                joined.join(candidates, summary.c.skill_id == candidates.c.skill_id)
+            )
             .where(*_catalog_skill_visibility(user), category != "")
             .group_by(category)
             .order_by(func.min(summary.c.skill_id))
@@ -276,8 +316,9 @@ class SkillDefinitionStorage:
         summary = t.skill_summary
         current = (
             await conn.execute(
-                select(summary.c.owner_version, summary.c.is_enabled)
-                .where(summary.c.skill_id == resource_id)
+                select(summary.c.owner_version, summary.c.is_enabled).where(
+                    summary.c.skill_id == resource_id
+                )
             )
         ).one_or_none()
         if current is None:

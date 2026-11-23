@@ -189,15 +189,24 @@ class AgentManager:
     ) -> dict[str, Any]:
         """校验专家的使用权限，读取该授权指向的配置版本。"""
         permissions = self.permissions if permissions is None else permissions
-        await self._get_expert_definition(definition_id)
-        access = await permissions.require(
-            user, "agent", definition_id, view, version=version
+        source = await self._get_expert_definition(definition_id)
+        reference = {
+            "resource_type": "agent",
+            "resource_id": definition_id,
+            "resource_view_type": view,
+            "resource_version": version,
+            "allow_pinned": False,
+        }
+        snapshot = await permissions.read_snapshot(
+            user, [reference], loaded=[source], include_dependencies=False
         )
-        return await self.storage.definitions.get_definition_view(
-            definition_id,
-            view,
-            version=access.resource_version,
-            **access.source_options,
+        access = await snapshot.require("agent", definition_id, view, version=version)
+        return await snapshot.definition_view(
+            {
+                **reference,
+                "resource_version": access.resource_version,
+                **access.source_options,
+            }
         )
 
     async def list_versions(
@@ -205,7 +214,8 @@ class AgentManager:
     ) -> list[dict[str, Any]]:
         """读取调用者有权查看的专家版本引用。"""
         source = await self._get_expert_definition(definition_id)
-        result = await self.permissions.definition_versions(user, source)
+        snapshot = await self._read_definition_snapshot(user, source)
+        result = await snapshot.definition_versions(source)
         if not result:
             raise Forbidden()
         return result
@@ -231,17 +241,22 @@ class AgentManager:
         permissions: PermissionService | None = None,
     ) -> dict[str, Any]:
         permissions = self.permissions if permissions is None else permissions
-        access = await permissions.definition_access(
-            user, definition, view, version=version
+        snapshot = await self._read_definition_snapshot(
+            user, definition, view, version=version, permissions=permissions
         )
-        value = await self.storage.definitions.get_definition_view(
-            definition["id"],
-            access.view,
-            version=version or access.decision.resource_version,
-            **access.decision.source_options,
+        user = snapshot.user
+        access = await snapshot.definition_access(definition, view, version=version)
+        value = await snapshot.definition_view(
+            {
+                "resource_type": definition["definition_type"],
+                "resource_id": definition["id"],
+                "resource_view_type": access.view,
+                "resource_version": version or access.decision.resource_version,
+                "allow_pinned": False,
+                **access.decision.source_options,
+            }
         )
-        share = await permissions.share_availability(
-            user,
+        share = await snapshot.share_availability(
             value["definition_type"],
             value["id"],
             version=value["resource_version"],
@@ -258,6 +273,27 @@ class AgentManager:
             "is_deletable": editable,
             "is_usable": access.decision.is_allowed,
         }
+
+    async def _read_definition_snapshot(
+        self, user, source, view=None, *, version=None, permissions=None
+    ):
+        permissions = self.permissions if permissions is None else permissions
+        selected = view or (
+            "system"
+            if source["owner_type"] == "system"
+            else "private"
+            if source["owner_id"] == user.user_id
+            else "shared"
+        )
+        reference = {
+            "resource_type": source["definition_type"],
+            "resource_id": source["id"],
+            "resource_view_type": selected,
+            "resource_version": version,
+        }
+        return await permissions.read_snapshot(
+            user, [reference], loaded=[source], include_dependencies=False
+        )
 
     async def page_definitions(
         self,
@@ -321,15 +357,22 @@ class AgentManager:
         )
         result: dict[str, Any] = {"items": items, "next_cursor": next_cursor}
         if catalog and cursor is None:
-            result["categories"] = await self.repository.list_visible_categories(user, types)
+            result["categories"] = await self.repository.list_visible_categories(
+                user, types
+            )
         return result
 
     async def page_remote_definitions(self, user: User, page) -> dict[str, Any]:
         """分页查询管理员可维护的第三方专家，只返回管理摘要。"""
         require_admin(user)
         rows = await self.repository.page_visible_definitions(
-            user, ("remote",), after=None, limit=page.fetch_limit,
-            offset=page.offset, editable_only=True, policies=self.permissions.policies,
+            user,
+            ("remote",),
+            after=None,
+            limit=page.fetch_limit,
+            offset=page.offset,
+            editable_only=True,
+            policies=self.permissions.policies,
         )
         return page.response(rows)
 
@@ -373,11 +416,21 @@ async def get_definition_for_execution(
     version: int | str | None = None,
 ) -> dict[str, Any]:
     """新会话或邀请选用获准的当前定义，并检查固定绑定。"""
-    access = await permissions.require(
-        user, resource_type, definition_id, view, version=version
+    reference = {
+        "resource_type": resource_type,
+        "resource_id": definition_id,
+        "resource_view_type": view,
+        "resource_version": version,
+        "allow_pinned": False,
+    }
+    snapshot = await permissions.read_snapshot(user, [reference])
+    access = await snapshot.require(resource_type, definition_id, view, version=version)
+    root = await snapshot.definition_view(
+        {
+            **reference,
+            "resource_version": access.resource_version,
+            **access.source_options,
+        }
     )
-    root = await permissions.storage.definitions.get_definition_view(
-        definition_id, view, version=access.resource_version, **access.source_options
-    )
-    await permissions.require_execution(user, root)
+    await snapshot.require_execution(root)
     return root

@@ -5,6 +5,7 @@ from agentscope.app.storage import TeamData, TeamMember, TeamRecord
 from egis_agentkit.client.nacos._settings import TeamRosterConfig
 from egis_agentkit.core.agent._orchestrator_definition import OrchestratorDefinition
 from egis_agentkit.errors import Conflict, Forbidden, InvalidRequest, NotFound
+from egis_agentkit.service._user import UserService
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.storage.model import TeamDefinitionRecord, new_id
@@ -41,24 +42,31 @@ class TeamDefinition:
 
     async def _team_definition(self, identifier: str) -> dict:
         """读取专家团当前记录并校验定义类型。"""
-        source = await self.repository.get_definition(identifier)
+        source = await self.repository.get_definition(
+            identifier, definition_type="team"
+        )
         if source["definition_type"] != "team":
             raise NotFound("资源类型不匹配")
         return source
 
-    async def _describe(self, user, source, view=None, *, version=None) -> dict:
+    async def _describe(
+        self, user, source, view=None, *, version=None, snapshot=None
+    ) -> dict:
         """按当前权限选择视图和版本，再读取定义配置。"""
-        access = await self.permissions.definition_access(
-            user, source, view, version=version
+        if snapshot is None:
+            snapshot = await self._read_snapshot(user, source, view, version=version)
+        access = await snapshot.definition_access(source, view, version=version)
+        value = await snapshot.definition_view(
+            {
+                "resource_type": "team",
+                "resource_id": source["id"],
+                "resource_view_type": access.view,
+                "resource_version": access.decision.resource_version or version,
+                "allow_pinned": False,
+                **access.decision.source_options,
+            }
         )
-        value = await self.repository.get_definition_view(
-            source["id"],
-            access.view,
-            version=access.decision.resource_version or version,
-            **access.decision.source_options,
-        )
-        share = await self.permissions.share_availability(
-            user,
+        share = await snapshot.share_availability(
             value["definition_type"],
             value["id"],
             version=value["resource_version"],
@@ -73,19 +81,47 @@ class TeamDefinition:
             "is_usable": access.decision.is_allowed,
         }
 
+    async def _read_snapshot(self, user, source, view=None, *, version=None):
+        selected = view or (
+            "system"
+            if source["owner_type"] == "system"
+            else "private"
+            if source["owner_id"] == user.user_id
+            else "shared"
+        )
+        return await self.permissions.read_snapshot(
+            user,
+            [
+                {
+                    "resource_type": "team",
+                    "resource_id": source["id"],
+                    "resource_view_type": selected,
+                    "resource_version": version,
+                }
+            ],
+            loaded=[source],
+            include_dependencies=False,
+        )
+
     async def read(
         self, user, identifier: str, view: str = "private", *, version=None
     ) -> dict:
         """展示专家团指定版本，维护人员可读取该版本的主理人配置。"""
         source = await self._team_definition(identifier)
-        result = await self._describe(user, source, view, version=version)
+        snapshot = await self._read_snapshot(user, source, view, version=version)
+        user = snapshot.user
+        result = await self._describe(
+            user, source, view, version=version, snapshot=snapshot
+        )
         own = source["owner_type"] == "user" and source["owner_id"] == user.user_id
         if result["resource_view_type"] != "shared" and (
             own or user.role_type == "admin"
         ):
             ref = result["payload"]["orchestrator"]
             leader = await self.repository.get_definition(
-                ref["definition_id"], version=ref["resource_version"]
+                ref["definition_id"],
+                version=ref["resource_version"],
+                definition_type="agent",
             )
             result["orchestrator_config"] = {
                 key: leader[key]
@@ -103,17 +139,43 @@ class TeamDefinition:
         source = await self._team_definition(identifier)
         if not resource_available(source):
             raise Forbidden("资源已停用")
-        return await self.permissions.definition_versions(user, source)
+        snapshot = await self._read_snapshot(user, source)
+        return await snapshot.definition_versions(source)
 
     async def list(self, user) -> list[dict]:
         """列出当前用户可见的专家团及共享审核状态。"""
-        rows, states = await self.repository.list_definitions_and_reviews("team")
+        try:
+            user = await UserService(self.storage).get(user.user_id)
+        except (Forbidden, NotFound):
+            return []
+        rows, states = await self.repository.list_definitions_and_reviews(
+            "team", user=user
+        )
+        references = [
+            {
+                "resource_type": "team",
+                "resource_id": row["id"],
+                "resource_view_type": "system"
+                if row["owner_type"] == "system"
+                else "private"
+                if row["owner_id"] == user.user_id
+                else "shared",
+            }
+            for row in rows
+        ]
+        snapshot = await self.permissions.read_snapshot(
+            user,
+            references,
+            loaded=rows,
+            refresh_user=False,
+            include_dependencies=False,
+        )
         result = []
         for row in rows:
             if not resource_available(row):
                 continue
             try:
-                value = await self._describe(user, row)
+                value = await self._describe(user, row, snapshot=snapshot)
             except (Forbidden, NotFound):
                 continue
             status = states.get((value["id"], value["resource_version"]), "private")
@@ -179,30 +241,47 @@ class TeamDefinition:
                 raise Conflict("专家团配置已变更，请刷新后重试")
             orch = data["orchestrator_config"]
             # 只解析一次成员配置，将实际获准使用的版本保存到专家团。
+            references = [
+                {
+                    "resource_type": "agent",
+                    "resource_id": ref["definition_id"],
+                    "resource_view_type": ref["resource_view_type"],
+                    "resource_version": ref.get("resource_version"),
+                    "allow_pinned": False,
+                }
+                for ref in data["members"]
+            ]
+            snapshot = await permissions.read_snapshot(
+                user,
+                references,
+                include_dependencies=False,
+                refresh_user=user.role_type != "admin"
+                or any(ref["resource_view_type"] == "shared" for ref in references),
+            )
+            user = snapshot.user
+            permissions.require_definition_write(
+                user, owner_type=owner_type, owner_id=owner_id
+            )
             members = []
             names, seen = {orch["agent_name"]}, set()
-            for ref in data["members"]:
+            for ref, reference in zip(data["members"], references):
                 if ref["definition_id"] in seen:
                     raise Forbidden("不能重复添加同一专家")
                 seen.add(ref["definition_id"])
-                child_options = {"version": ref.get("resource_version")}
                 if user.role_type != "admin" or ref["resource_view_type"] == "shared":
-                    decision = await permissions.require(
-                        user,
+                    decision = await snapshot.require(
                         "agent",
                         ref["definition_id"],
                         ref["resource_view_type"],
                         version=ref.get("resource_version"),
                     )
-                    child_options.update(decision.source_options)
-                    child_options["version"] = decision.resource_version or ref.get(
-                        "resource_version"
-                    )
-                child = await write.definitions.get_definition_view(
-                    ref["definition_id"],
-                    ref["resource_view_type"],
-                    **child_options,
-                )
+                    reference = {
+                        **reference,
+                        "resource_version": decision.resource_version
+                        or ref.get("resource_version"),
+                        **decision.source_options,
+                    }
+                child = await snapshot.definition_view(reference)
                 if (
                     child["agent_type"] not in EXPERT_TYPES
                     or child["agent_name"] in names
@@ -286,7 +365,10 @@ class TeamDefinition:
         )
         core = OrchestratorDefinition()
         data = core.build_from_team(
-            owner_type=owner_type, owner_id=owner_id, orchestrator_config=config, previous_definition=previous
+            owner_type=owner_type,
+            owner_id=owner_id,
+            orchestrator_config=config,
+            previous_definition=previous,
         )
         permissions = PermissionService(write, policies)
         permissions.require_definition_write(

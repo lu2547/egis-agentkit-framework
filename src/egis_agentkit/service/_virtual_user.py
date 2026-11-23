@@ -15,8 +15,8 @@ from ._user import VIRTUAL_USER_PREFIX, require_admin
 VIRTUAL_TOKEN_PREFIX = "ak-skill."
 CREDENTIAL_RANDOM_BYTES = 32
 CREDENTIAL_PATTERN = re.compile(r"ak-skill\.([a-f0-9]{32})\.[A-Za-z0-9_-]{43}")
-UPLOAD_PATH = "/manager/skills/imports"
-STATUS_PATH = re.compile(r"/manager/skills/imports/[a-f0-9]{32}(/retry)?\Z")
+EXTERNAL_SKILL_IMPORT_PATH = "/integrations/skills/imports"
+STATUS_PATH = re.compile(rf"{EXTERNAL_SKILL_IMPORT_PATH}/[a-f0-9]{{32}}(/retry)?")
 
 
 class VirtualUserService:
@@ -30,7 +30,7 @@ class VirtualUserService:
         match = STATUS_PATH.fullmatch(path)
         if match:
             return method == ("POST" if match.group(1) else "GET")
-        return path == UPLOAD_PATH and method in ("GET", "POST")
+        return path == EXTERNAL_SKILL_IMPORT_PATH and method in ("GET", "POST")
 
     @staticmethod
     def _new_token(user_id):

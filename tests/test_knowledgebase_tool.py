@@ -6,6 +6,8 @@ import httpx
 import pytest
 from agentscope.agent import Agent
 from agentscope.app.deps import get_chat_service
+from agentscope.app._service import ChatService
+from agentscope.app.message_bus import MessageBusKeys
 from agentscope.event import ToolResultEndEvent
 from agentscope.formatter import OpenAIChatFormatter
 from agentscope.message import TextBlock, ToolCallBlock, ToolResultState, UserMsg
@@ -20,6 +22,7 @@ from test_domain import identities
 from egis_agentkit.bootstrap._init import init_agentkit
 from egis_agentkit.client.nacos import NacosBootstrap, NacosClient
 from egis_agentkit.client.nacos._settings import KnowledgeBaseToolConfig
+from egis_agentkit.core.session._context import verified_chat_authorization
 from egis_agentkit.service.session._preparation import SessionPreparationService
 from egis_agentkit.tool._knowledgebase_tool import KnowledgeBaseSearch
 
@@ -210,8 +213,9 @@ async def test_knowledgebase_never_sends_an_unsigned_request():
     assert "登录凭据" in result.content[0].text
 
 
+@pytest.mark.parametrize("queued", [False, True])
 async def test_verified_chat_jwt_reaches_knowledge_search_from_native_background_run(
-    storage, tmp_path, monkeypatch
+    storage, tmp_path, monkeypatch, queued
 ):
     monkeypatch.setenv(
         "TEST_DOWNLOAD", "download-secret-with-more-than-thirty-two-bytes"
@@ -262,16 +266,32 @@ async def test_verified_chat_jwt_reaches_knowledge_search_from_native_background
         )
         kit = app.state.egis_kit
 
-        async def run(*, user_id, agent_id, session_id, input_msg):
+        async def run(
+            *,
+            user_id,
+            agent_id,
+            session_id,
+            input_msg,
+            client_external_tools=None,
+            client_builtin_tools=None,
+            queue_item_id=None,
+            input_persisted=False,
+        ):
+            # 后台 FIFO 消费者不继承提交 HTTP 请求的 ContextVar。
+            marker = verified_chat_authorization.set(None) if queued else None
             try:
-                async with kit.bus.coordinator.bind(session_id):
+                async with kit.bus.acquire_lock(MessageBusKeys.session_lock(session_id)):
                     (tool,) = await kit.tools(user_id, agent_id, session_id)
                     tool.http_client = knowledge_client
                     completed.set_result(await tool.call(query="缴费规则"))
             except Exception as exc:
                 completed.set_exception(exc)
+            finally:
+                if marker is not None:
+                    verified_chat_authorization.reset(marker)
 
         app.dependency_overrides[get_chat_service] = lambda: SimpleNamespace(run=run)
+        monkeypatch.setattr(ChatService, "run", lambda _self, **kwargs: run(**kwargs))
         async with app.router.lifespan_context(app):
             personal = await kit.services.personal.get_or_add_definition(alice)
             task = await kit.services.sessions.add_session(
@@ -280,7 +300,9 @@ async def test_verified_chat_jwt_reaches_knowledge_search_from_native_background
             payload = {
                 "agent_id": task["agent_id"],
                 "session_id": task["session_id"],
-                "input": None,
+                "input": UserMsg(name="user", content="缴费规则").model_dump()
+                if queued
+                else None,
             }
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -294,6 +316,14 @@ async def test_verified_chat_jwt_reaches_knowledge_search_from_native_background
                     headers={"Authorization": f"Bearer {rejected}"},
                 )
                 assert response.status_code == 401
+                selection = await browser.post("/manager/tools/KnowledgeBaseSearch/install")
+                assert selection.status_code == 401
+                selection = await browser.post(
+                    "/manager/tools/KnowledgeBaseSearch/install",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert selection.status_code == 200, selection.text
+                assert selection.json()["is_enabled"]
                 response = await browser.post(
                     "/chat/", json=payload, headers={"Authorization": f"Bearer {token}"}
                 )
@@ -301,6 +331,7 @@ async def test_verified_chat_jwt_reaches_knowledge_search_from_native_background
                 result = await asyncio.wait_for(completed, timeout=5)
                 assert result.state == ToolResultState.SUCCESS
                 assert bearer_verified == [True]
+            await kit.services.sessions.authorizations.discard(task["session_id"])
             async with kit.bus.coordinator.bind(task["session_id"]):
                 (tool,) = await kit.tools(
                     alice.user_id, task["agent_id"], task["session_id"]
@@ -329,7 +360,7 @@ async def test_hybrid_sse_keeps_successful_source_when_the_other_fails():
     assert "文档答案" in result.content[0].text
 
 
-async def test_bootstrap_exposes_the_tool_when_configured_in_nacos(
+async def test_bootstrap_exposes_configured_tool_after_personal_selection(
     storage, tmp_path, monkeypatch
 ):
     monkeypatch.setenv("TEST_MODEL_KEY", "test-only-unused-model-key")
@@ -337,7 +368,6 @@ async def test_bootstrap_exposes_the_tool_when_configured_in_nacos(
     snapshot = app_snapshot(
         tmp_path,
         tool={
-            "defaults": {"registered_ids": ["KnowledgeBaseSearch"]},
             "knowledge_base": {"query_url": "https://knowledge.example.com/query"},
         },
     )
@@ -355,6 +385,7 @@ async def test_bootstrap_exposes_the_tool_when_configured_in_nacos(
         await kit.services.resources.seed_builtin_tools()
         personal = await kit.services.personal.get_or_add_definition(alice)
         task = await kit.services.sessions.add_session(alice, personal["id"], "private")
+        await kit.services.resources.install(alice, "tool", "KnowledgeBaseSearch")
         async with SessionPreparationService(storage, tmp_path, config).bind(
             task["session_id"]
         ) as scope:

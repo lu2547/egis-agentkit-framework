@@ -3,7 +3,7 @@
 核心能力
 - 汇总记录维护稳定身份、owner/shared 版本及删除状态。
 - 配置明细只追加，使用 owner_version 检查并发修改。
-- 使用有效直接授权的 EXISTS 条件过滤列表，再关联可见版本并分页。
+- 先合并本人及有效直接授权的 ID，再关联可见版本并分页。
 """
 
 from __future__ import annotations
@@ -88,15 +88,21 @@ class AgentDefinitionStorage:
             text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
             {"key": f"ak:definition:{definition_id}"},
         )
-        await conn.execute(
-            select(t.agent_definition_summary.c.id)
-            .where(t.agent_definition_summary.c.id == definition_id)
-            .with_for_update()
+        from .._definition import _build_definition_query, _build_definition_record
+
+        table = t.agent_definition_summary
+        row = (
+            (
+                await conn.execute(
+                    _build_definition_query(table)
+                    .where(table.c.id == definition_id)
+                    .with_for_update(of=table)
+                )
+            )
+            .mappings()
+            .first()
         )
-        try:
-            return await self.get_definition(definition_id, conn=conn)
-        except NotFound:
-            return None
+        return _build_definition_record(table, row) if row is not None else None
 
     async def get_definition_for_update(
         self, definition_id: str, *, conn: AsyncConnection | None = None
@@ -123,7 +129,12 @@ class AgentDefinitionStorage:
                     definition_values, actor=actor, conn=connection
                 )
         conn = transaction_connection(self.engine, conn)
-        previous = await self.get_locked_definition(definition_values["id"], conn=conn)
+        try:
+            previous = await self.get_definition(definition_values["id"], conn=conn)
+        except NotFound:
+            previous = await self.get_locked_definition(
+                definition_values["id"], conn=conn
+            )
         if previous is not None:
             if (
                 previous["agent_type"] != "personal"
@@ -131,7 +142,9 @@ class AgentDefinitionStorage:
             ):
                 raise Conflict("个人助理 ID 已被占用")
             return previous
-        return await self.add_definition(definition_values, actor=actor, conn=conn)
+        return await self._add_locked_definition(
+            definition_values, actor=actor, conn=conn
+        )
 
     async def add_definition(
         self,
@@ -142,9 +155,17 @@ class AgentDefinitionStorage:
     ) -> dict[str, Any]:
         """在当前存储事务插入汇总和首版明细。"""
         conn = transaction_connection(self.engine, conn)
+        previous = await self.get_locked_definition(definition_values["id"], conn=conn)
+        if previous is not None:
+            raise Conflict("定义已存在")
+        return await self._add_locked_definition(
+            definition_values, actor=actor, conn=conn
+        )
+
+    async def _add_locked_definition(self, definition_values, *, actor, conn):
+        """Insert under the caller's existing definition-ID advisory lock."""
         if definition_values["owner_version"] != 1:
             raise Conflict("新 Agent 的 owner_version 必须为 1")
-        previous = await self.get_locked_definition(definition_values["id"], conn=conn)
         team_exists = await conn.scalar(
             select(
                 exists().where(
@@ -152,7 +173,7 @@ class AgentDefinitionStorage:
                 )
             )
         )
-        if previous is not None or team_exists:
+        if team_exists:
             raise Conflict("定义已存在")
         now = utcnow()
         await conn.execute(
@@ -335,16 +356,56 @@ class AgentDefinitionStorage:
             .limit(1)
             .scalar_subquery()
         )
-        fields = ("description", "category", "tags", "avatar", "starter_prompts", "model_key")
+        fields = (
+            "description",
+            "category",
+            "tags",
+            "avatar",
+            "starter_prompts",
+            "model_key",
+        )
         card = [value for key in fields for value in (key, detail.c.payload[key])]
         if editable_only:
-            card.extend((
-                "remote_config",
-                func.jsonb_build_object(
-                    "transport", detail.c.payload["remote_config"]["transport"]
-                ),
-            ))
+            card.extend(
+                (
+                    "remote_config",
+                    func.jsonb_build_object(
+                        "transport", detail.c.payload["remote_config"]["transport"]
+                    ),
+                )
+            )
         visible = own if owner_only else or_(own, system if editable_only else direct)
+        owned_ids = select(summary.c.id).where(
+            own, summary.c.deleted_at.is_(None), summary.c.agent_type.in_(types)
+        )
+        if owner_only:
+            eligible = owned_ids.cte("eligible_agent_ids")
+        elif editable_only:
+            eligible = owned_ids.union(
+                select(summary.c.id).where(
+                    system,
+                    summary.c.deleted_at.is_(None),
+                    summary.c.agent_type.in_(types),
+                )
+            ).cte("eligible_agent_ids")
+        else:
+            granted_ids = select(access.c.resource_id.label("id")).where(
+                access.c.resource_type == "agent",
+                access.c.revoked_at.is_(None),
+                access.c.root_grant_id.is_(None),
+                access.c.grant_source_type.in_(("manual", "share")),
+                or_(
+                    and_(
+                        access.c.principal_type == "user",
+                        access.c.principal_id == user.user_id,
+                    ),
+                    and_(
+                        access.c.principal_type == "group",
+                        access.c.principal_id.in_(enabled_groups),
+                    ),
+                ),
+            )
+            eligible = owned_ids.union(granted_ids).cte("eligible_agent_ids")
         return (
             select(
                 summary.c.id,
@@ -373,7 +434,7 @@ class AgentDefinitionStorage:
                         detail.c.definition_id == summary.c.id,
                         detail.c.version == selected,
                     ),
-                )
+                ).join(eligible, eligible.c.id == summary.c.id)
             )
             .where(
                 summary.c.deleted_at.is_(None),
@@ -497,7 +558,11 @@ class AgentDefinitionStorage:
             return []
         summary, detail = t.agent_definition_summary, t.agent_definition_detail
         statement = (
-            select(summary.c.id, detail.c.agent_display_name, detail.c.payload["bindings"].label("bindings"))
+            select(
+                summary.c.id,
+                detail.c.agent_display_name,
+                detail.c.payload["bindings"].label("bindings"),
+            )
             .select_from(
                 summary.join(
                     detail,
@@ -509,7 +574,12 @@ class AgentDefinitionStorage:
             )
             .where(
                 summary.c.deleted_at.is_(None),
-                or_(*(detail.c.payload.contains({"bindings": [ref]}) for ref in references)),
+                or_(
+                    *(
+                        detail.c.payload.contains({"bindings": [ref]})
+                        for ref in references
+                    )
+                ),
             )
             .order_by(summary.c.created_at.desc(), summary.c.id)
         )

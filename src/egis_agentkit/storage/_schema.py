@@ -11,6 +11,8 @@ from agentscope.app.storage._sql._tables import _Base as NativeBase
 from sqlalchemy import inspect, text
 
 from ._message_bus import rename_bus_tables
+from ._query_indexes import create_query_indexes
+from ._schedule import create_schedule_columns
 from .migration._agent import RENAMES as AGENT_RENAMES
 from .migration._agent import agent_tables, migrate_agent_storage
 from .migration._connectors import CONNECTOR_ASSET_TABLE, migrate_connectors
@@ -79,26 +81,26 @@ async def init_schema(engine):
         if "ak_skill_imports" in existing:
             columns = await _table_columns(connection, schema, "ak_skill_imports")
             if "uploader_id" not in columns:
-                raise ValueError("开发库旧技能表请通过 reset-skills 重置")
+                raise ValueError("技能表结构需要通过部署 SQL 脚本更新")
         old_project_tables = {
             name for sources in TABLE_SOURCES.values() for name in sources
         }
         if old_project_tables & existing:
-            raise ValueError("项目文件表名需要先执行 upgrade-db 预览和升级")
+            raise ValueError("项目文件表名需要通过部署 SQL 脚本更新")
         if (
             "sessions" in existing
             and await migrate_session_workspaces(connection, schema) == "pending"
         ):
-            raise ValueError("会话工作区身份需要先执行 upgrade-db 预览和升级")
+            raise ValueError("会话工作区身份需要通过部署 SQL 脚本更新")
         if set(AGENT_RENAMES) & existing:
-            raise ValueError("旧版 Agent 数据库请先通过 upgrade-db 预览和升级")
+            raise ValueError("Agent 数据库结构需要通过部署 SQL 脚本更新")
         if set(TEAM_RENAMES) & existing:
-            raise ValueError("旧版 Team 数据库请先通过 upgrade-db 预览和升级")
+            raise ValueError("Team 数据库结构需要通过部署 SQL 脚本更新")
         if (
             "ak_team_definition_summary" in existing
             and await migrate_team_storage(connection, schema) == "pending"
         ):
-            raise ValueError("Team 存储结构需要先执行 upgrade-db")
+            raise ValueError("Team 存储结构需要通过部署 SQL 脚本更新")
         if (
             set(TABLE_RENAMES) & existing
             or LEGACY_PROJECT_SESSIONS in existing
@@ -107,23 +109,25 @@ async def init_schema(engine):
                 or not await _generated_project_id(connection, schema)
             )
         ):
-            raise ValueError("旧版数据库请先通过 upgrade-db 预览和升级")
+            raise ValueError("数据库结构需要通过部署 SQL 脚本更新")
         if await rename_bus_tables(connection, apply=False):
-            raise ValueError("旧版消息总线请先通过 upgrade-db 预览和升级")
+            raise ValueError("消息总线表结构需要通过部署 SQL 脚本更新")
         if "ak_agent_definitions" in existing:
             columns = await _table_columns(connection, schema, "ak_agent_definitions")
             if "shared_version" not in columns:
-                raise ValueError("旧版定义表请先通过 upgrade-db 预览和升级")
+                raise ValueError("定义表结构需要通过部署 SQL 脚本更新")
         if "ak_project_file_changes" in existing:
             if await migrate_workspace_changes(connection, schema) == "pending":
                 raise ValueError(
-                    "工作区变更表缺少会话归属字段或索引，请先执行 upgrade-db"
+                    "工作区变更表缺少会话归属字段或索引，请通过部署 SQL 脚本更新"
                 )
         await connection.run_sync(native.create_all, tables=required)
+        await create_schedule_columns(connection)
         if assets.name in existing:
             await migrate_skills(connection, schema, apply=True)
         await connection.run_sync(metadata.create_all)
         await _create_session_project_index(connection, schema)
+        await create_query_indexes(connection, schema)
 
 
 async def _existing_tables(connection, schema):
@@ -275,7 +279,9 @@ async def upgrade_schema(
             if states["授权和共享版本"] == "pending":
                 await upgrade_access_tables(connection, schema)
                 states["授权和共享版本"] = "upgraded"
-            states["技能版本指针"] = await migrate_skills(connection, schema, apply=True)
+            states["技能版本指针"] = await migrate_skills(
+                connection, schema, apply=True
+            )
             states["Agent 存储结构"] = await migrate_agent_storage(
                 connection, schema, apply=True
             )

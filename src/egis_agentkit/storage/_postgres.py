@@ -1,7 +1,10 @@
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from agentscope.app.storage import AsyncSQLAlchemyStorage
+from agentscope.app.storage import AsyncSQLAlchemyStorage, ScheduleRecord
+from agentscope.app.storage._sql._mappers import _to_record
+from agentscope.app.storage._sql._tables import ScheduleRow
+from sqlalchemy import column, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -12,10 +15,10 @@ from ._access import AccessStorage
 from ._definition import DefinitionStorage
 from ._remote_agent import RemoteRunStorage
 from ._resource import MCPCredentialStorage, ResourceAssetStorage
+from ._schedule import ScheduleStorage
 from ._schema import init_schema
 from ._session import SessionStorage
 from ._session_feedback import SessionFeedbackStorage
-from ._session_steering import SessionSteeringStorage
 from ._skill_import import SkillImportStorage
 from ._user import UserStorage
 from ._virtual_user import VirtualUserStorage
@@ -76,8 +79,8 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
         self.remote_runs = RemoteRunStorage(engine)
         self.projects = ProjectStorage(engine)
         self.sessions = SessionStorage(engine, self)
+        self.schedules = ScheduleStorage(engine)
         self.session_feedback = SessionFeedbackStorage(engine)
-        self.session_steering = SessionSteeringStorage(engine)
         self.project_files = ProjectFileRecordStorage(engine)
         super().__init__(url, engine=engine, create_tables=False)
 
@@ -137,6 +140,37 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
                 SessionStorage(transaction, self),
                 ProjectFileRecordStorage(transaction),
             )
+
+    async def _native_schedules(self, *conditions):
+        # The native adapter validates a different ScheduleData model.
+        async with self._session() as session:
+            rows = await session.scalars(select(ScheduleRow).where(
+                column("project_id").is_(None), *conditions
+            ))
+            return [_to_record(row, ScheduleRecord) for row in rows]
+
+    async def get_schedule(self, user_id, schedule_id):
+        rows = await self._native_schedules(
+            ScheduleRow.user_id == user_id, ScheduleRow.id == schedule_id
+        )
+        return rows[0] if rows else None
+
+    async def list_schedules(self, user_id):
+        return await self._native_schedules(ScheduleRow.user_id == user_id)
+
+    async def list_all_schedules(self):
+        return await self._native_schedules()
+
+    async def _delete_schedule_impl(self, session, user_id, schedule_id):
+        # This also guards cascades from the upstream agent cleanup.
+        project_id = await session.scalar(
+            select(column("project_id")).where(
+                ScheduleRow.id == schedule_id, ScheduleRow.user_id == user_id
+            )
+        )
+        if project_id is not None:
+            return False
+        return await super()._delete_schedule_impl(session, user_id, schedule_id)
 
     async def read_session_unscoped(self, user_id, agent_id, session_id):
         record = await super().get_session(user_id, agent_id, session_id)

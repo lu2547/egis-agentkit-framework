@@ -1,9 +1,12 @@
 """覆盖原生 Agent 和 Session 读取，提供锁内已解析的配置。"""
 
+import asyncio
+
 from egis_agentkit.client._tracing import trace_phase
 from egis_agentkit.core.session._context import (
     build_agent_record,
     session_execution_context,
+    verified_chat_authorization,
 )
 from egis_agentkit.storage._postgres import AgentKitStorage
 
@@ -20,6 +23,15 @@ class SessionExecutionStorage(AgentKitStorage):
             session_id,
         ):
             return scope.session_record.model_copy(deep=True)
+        verified = verified_chat_authorization.get()
+        if (
+            verified
+            and verified.session_record is not None
+            and verified.request_task is asyncio.current_task()
+            and (verified.user_id, verified.agent_id, verified.session_id)
+            == (user_id, agent_id, session_id)
+        ):
+            return verified.session_record.model_copy(deep=True)
         return await super().get_session(user_id, agent_id, session_id)
 
     async def get_agent(self, user_id, agent_id):

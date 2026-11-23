@@ -250,17 +250,20 @@ class ProjectFileManager:
             try:
                 before = await asyncio.to_thread(self.scan, user_id, project_id, limits)
                 # 先收录工具开始前已有的变化，不把其他会话或人工操作归给当前工具。
-                baseline = await workspace.baseline_exists(user_id, project_id)
-                if baseline is None:
+                scan_state = await workspace.scan_state(user_id, project_id)
+                if scan_state is None:
                     raise NotFound("项目不存在")
                 previous = (
-                    await workspace.fingerprints(project_id) if baseline else before
+                    scan_state["fingerprints"] if scan_state["initialized"] else before
                 )
                 await workspace.save_observation(
                     user_id,
                     project_id,
                     before,
                     self._make_changes(project_id, previous, before),
+                    previous=scan_state["fingerprints"],
+                    initialized=scan_state["initialized"],
+                    has_error=scan_state["has_error"],
                 )
             except Exception:
                 logging.getLogger(__name__).exception(
@@ -303,7 +306,8 @@ class ProjectFileManager:
                             reply_id=reply_id,
                         )
                         await workspace.save_observation(
-                            user_id, project_id, current, changes
+                            user_id, project_id, current, changes,
+                            previous=before, initialized=True, has_error=False,
                         )
                     except Exception:
                         logging.getLogger(__name__).exception(
@@ -375,8 +379,8 @@ class ProjectFileManager:
         limits = settings.scan if settings else ProjectScanConfig()
         async with self.locked([project_id]) as workspace:
             # 已删除项目的迟到扫描不能重建指纹或变更记录。
-            baseline = await workspace.baseline_exists(user_id, project_id)
-            if baseline is None:
+            scan_state = await workspace.scan_state(user_id, project_id)
+            if scan_state is None:
                 return
             if discover:
                 await asyncio.to_thread(
@@ -387,9 +391,13 @@ class ProjectFileManager:
                     settings=settings,
                 )
             current = await asyncio.to_thread(self.scan, user_id, project_id, limits)
-            previous = await workspace.fingerprints(project_id) if baseline else current
+            previous = scan_state["fingerprints"] if scan_state["initialized"] else current
             changes = self._make_changes(project_id, previous, current)
-            await workspace.save_observation(user_id, project_id, current, changes)
+            await workspace.save_observation(
+                user_id, project_id, current, changes,
+                previous=scan_state["fingerprints"],
+                initialized=scan_state["initialized"], has_error=scan_state["has_error"],
+            )
 
     async def observe_safe(self, user_id, project_id, *, discover=False):
         try:

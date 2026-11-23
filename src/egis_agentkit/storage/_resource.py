@@ -98,6 +98,80 @@ class ResourceAssetStorage:
             conn=conn,
         )
 
+    async def owner_display_names(self, owner_ids):
+        if not owner_ids:
+            return {}
+        async with self.engine.connect() as conn:
+            rows = await conn.execute(
+                select(t.users.c.user_id, t.users.c.username).where(
+                    t.users.c.user_id.in_(owner_ids)
+                )
+            )
+            return dict(rows.all())
+
+    async def get_many(self, resource_type, identities, *, conn=None):
+        """Read exact versions using only the identities required by this operation."""
+        identities = set(identities)
+        if not identities:
+            return []
+        if resource_type == "skill":
+            return await self.skills.get_many(identities, conn=conn)
+        if conn is None:
+            async with self.engine.connect() as connection:
+                return await self.get_many(resource_type, identities, conn=connection)
+        rows = await conn.execute(
+            select(t.assets).where(
+                t.assets.c.resource_type == resource_type,
+                tuple_(t.assets.c.resource_id, t.assets.c.resource_version).in_(
+                    identities
+                ),
+            )
+        )
+        return [dict(row) for row in rows.mappings()]
+
+    async def lock_resources(self, resource_type, resource_ids):
+        """Acquire the same resource locks in one round trip and stable order."""
+        identities = sorted({resource_type + ":" + rid for rid in resource_ids})
+        if not identities:
+            return
+        conn = transaction_connection(self.engine, None)
+        await conn.execute(
+            text(
+                "SELECT pg_advisory_xact_lock(hashtextextended(identity,0)) "
+                "FROM (SELECT unnest(CAST(:identities AS text[])) AS identity "
+                "ORDER BY identity) AS ordered_resources"
+            ),
+            {"identities": identities},
+        )
+
+    async def insert_assets(self, assets, *, actor):
+        """Insert an already-validated immutable tool batch in one statement."""
+        if not assets:
+            return
+        conn = transaction_connection(self.engine, None)
+        await conn.execute(
+            t.assets.insert(),
+            [
+                dict(**asset.model_dump(), created_by=actor, updated_by=actor)
+                for asset in assets
+            ],
+        )
+
+    async def enable_versions(self, resource_type, identities, *, actor):
+        if not identities:
+            return
+        conn = transaction_connection(self.engine, None)
+        await conn.execute(
+            t.assets.update()
+            .where(
+                t.assets.c.resource_type == resource_type,
+                tuple_(t.assets.c.resource_id, t.assets.c.resource_version).in_(
+                    identities
+                ),
+            )
+            .values(is_enabled=True, updated_by=actor, updated_at=utcnow())
+        )
+
     async def list_versions(
         self,
         resource_type: str,
@@ -245,9 +319,15 @@ class ResourceAssetStorage:
                 assets.c.resource_version == MCP_STORAGE_VERSION,
                 assets.c.payload.contains({MCP_MANAGED_FLAG: True}),
             )
-        statement = statement.order_by(
-            assets.c.resource_id, assets.c.publication_revision, assets.c.resource_version
-        ).offset(offset).limit(limit)
+        statement = (
+            statement.order_by(
+                assets.c.resource_id,
+                assets.c.publication_revision,
+                assets.c.resource_version,
+            )
+            .offset(offset)
+            .limit(limit)
+        )
         async with self.engine.connect() as conn:
             return [dict(row) for row in (await conn.execute(statement)).mappings()]
 
@@ -410,6 +490,19 @@ class MCPCredentialStorage:
             .where(*self._match(user_id, connection_id))
             .values(**values)
         )
+
+    async def read_many(self, user_id, connection_ids):
+        """Read status rows for one user and only this page's connection hashes."""
+        if not connection_ids:
+            return {}
+        async with self.engine.connect() as conn:
+            rows = await conn.execute(
+                select(t.mcp_credentials).where(
+                    t.mcp_credentials.c.user_id == user_id,
+                    t.mcp_credentials.c.connection_id.in_(connection_ids),
+                )
+            )
+            return {row["connection_id"]: dict(row) for row in rows.mappings()}
 
     async def read(self, user_id, connection_id):
         async with self.engine.connect() as conn:

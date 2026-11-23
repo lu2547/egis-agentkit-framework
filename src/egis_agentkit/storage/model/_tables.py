@@ -194,7 +194,7 @@ agent_personal_resources = Table(
     Column("resource_id", String(128), primary_key=True),
     Column("is_enabled", Boolean, nullable=False),
     *audit_columns(),
-    CheckConstraint("resource_type IN ('skill','mcp')"),
+    CheckConstraint("resource_type IN ('skill','mcp','tool')"),
 )
 Index(
     "ix_ak_agent_personal_resources_user_type",
@@ -522,7 +522,7 @@ file_changes = Table(
     "ak_project_file_changes",
     metadata,
     Column("change_id", BigInteger, primary_key=True, autoincrement=True),
-    Column("project_id", String(128), nullable=False, index=True),
+    Column("project_id", String(128), nullable=False),
     Column("session_id", String(128)),
     Column("reply_id", String(128)),
     Column("area", String(16), nullable=False),
@@ -536,6 +536,12 @@ file_changes = Table(
     ),
     Column("size", BigInteger),
     Column("previous_size", BigInteger),
+)
+
+Index(
+    "ix_ak_project_changes_page",
+    file_changes.c.project_id,
+    file_changes.c.change_id.desc(),
 )
 
 Index(

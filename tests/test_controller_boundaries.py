@@ -57,8 +57,9 @@ def test_manager_openapi_pins_version_and_excludes_tools_from_access_writes():
         )
         assert version is not None and not version["required"]
         assert set(paths[f"/manager/{collection}/{{identifier}}/versions"]) == {"get"}
-    assert "/manager/tools/{identifier}/install" not in paths
-    assert "/manager/tools/{identifier}/installation" not in paths
+    assert set(paths["/manager/tools/{identifier}/install"]) == {"post"}
+    assert set(paths["/manager/tools/{identifier}/installation"]) == {"patch", "delete"}
+    assert set(paths["/manager/tools"]) == {"get"}
 
     schemas = spec["components"]["schemas"]
     assert "resource_version" not in schemas["GrantWrite"]["properties"]

@@ -381,41 +381,37 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             )
             assert task.status_code == 201, task.text
             sid, aid = task.json()["session_id"], task.json()["agent_id"]
-            from agentscope.app._bus_ops import register_inbox_consumer
             from agentscope.message import UserMsg
 
-            await register_inbox_consumer(app.state.egis_bus, sid)
+            # Keep the turn queued so the HTTP lifecycle assertions are deterministic.
+            await app.state.egis_bus.try_lock(MessageBusKeys.session_lock(sid))
             guidance = UserMsg(name="user", content="不要覆盖输入文件")
-            steered = await client.post(
+            queued = await client.post(
                 "/chat/",
                 json={
                     "session_id": sid,
                     "agent_id": aid,
-                    "delivery": "steer",
                     "input": guidance.model_dump(mode="json"),
                 },
             )
-            assert steered.status_code == 200 and steered.json()["status"] == "queued"
-            inbox = await app.state.egis_bus.queue_drain(MessageBusKeys.inbox(sid))
-            assert [entry[1]["id"] for entry in inbox] == [guidance.id]
-            await app.state.egis_bus.publish(
-                MessageBusKeys.session_events(sid),
-                {
-                    "type": "HINT_BLOCK",
-                    "block_id": guidance.id,
-                    "source": "user_steering",
-                },
+            assert queued.status_code == 200, queued.text
+            assert queued.json()["status"] == "queued"
+            restored = await client.get(
+                "/chat/queue", params={"session_id": sid, "agent_id": aid}
             )
-            assert (
-                await storage.get_message(alice.user_id, sid, guidance.id)
-            ).metadata["agentkit_delivery"]["state"] == "received"
+            assert restored.status_code == 200
+            assert restored.json()["items"][0]["id"] == queued.json()["queue_item_id"]
+            await client.delete(
+                f"/chat/queue/{queued.json()['queue_item_id']}",
+                params={"session_id": sid, "agent_id": aid},
+            )
+            await app.state.egis_bus.unlock(MessageBusKeys.session_lock(sid))
             spec = app.openapi()
             assert (
-                spec["components"]["schemas"]["ChatRequest"]["properties"]["delivery"][
-                    "default"
-                ]
-                == "message"
+                "delivery"
+                not in spec["components"]["schemas"]["ChatRequest"]["properties"]
             )
+            assert "/chat/queue/{item_id}/steer" in spec["paths"]
             initial_config = config.snapshot
             config.snapshot = config.snapshot.model_copy(
                 update={
@@ -425,6 +421,11 @@ async def test_http_identity_native_write_seal_and_real_task_files(
                 }
             )
             assert (await client.get(f"/manager/tasks/{sid}")).status_code == 403
+            assert (
+                await client.get(
+                    "/chat/queue", params={"session_id": sid, "agent_id": aid}
+                )
+            ).status_code == 403
             config.snapshot = initial_config
             assert (
                 await client.post(

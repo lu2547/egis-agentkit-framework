@@ -96,6 +96,62 @@ async def test_standalone_native_contract_and_lifecycle(key):
         assert not await bus.is_locked(key)
 
 
+@pytest_asyncio.fixture
+async def standalone_bus():
+    async with EgisMessageBus() as bus:
+        yield bus
+
+
+@pytest.fixture(params=["standalone", "postgres"])
+def editable_bus(request):
+    if request.param == "postgres":
+        return request.getfixturevalue("pg_buses")[0]
+    return request.getfixturevalue("standalone_bus")
+
+
+async def test_editable_queue_preserves_order_and_acknowledges_atomically(
+    editable_bus, key
+):
+    bus = editable_bus
+    first = await bus.queue_push(key, {"id": "a", "state": "queued"})
+    await bus.queue_push(key, {"id": "b", "state": "steering"})
+    assert (await bus.queue_read(key))[0] == (first, {"id": "a", "state": "queued"})
+    assert len(await bus.queue_read(key)) == 2
+    replaced = await bus.queue_replace(
+        key,
+        [
+            {"id": "b", "state": "steering"},
+            {"id": "a", "state": "queued"},
+        ],
+    )
+    assert replaced[0] != first
+    snapshot = await bus.queue_read(key)
+    assert [entry["id"] for _, entry in snapshot] == ["b", "a"]
+    assert not await bus.queue_remove_if(key, [{"id": "b"}, {"id": "missing"}])
+    assert await bus.queue_read(key) == snapshot
+    assert not await bus.queue_remove_if(key, [{"id": "b"}, {"id": "b"}])
+    results = await asyncio.gather(
+        bus.queue_remove_if(key, [{"id": "b", "state": "steering"}]),
+        bus.queue_remove_if(key, [{"id": "b", "state": "steering"}]),
+    )
+    assert sorted(results) == [False, True]
+    assert await bus.queue_drain(key) == [snapshot[1]]
+    await bus.registry_set(key, "owner", "new")
+    assert not await bus.registry_del_if(key, "owner", expected="old")
+    assert await bus.registry_get(key, "owner") == "new"
+    assert await bus.registry_del_if(key, "owner", expected="new")
+    assert await bus.registry_get(key, "owner") is None
+
+
+async def test_editable_queue_append_retains_existing_expiry(editable_bus, key):
+    await editable_bus.queue_push(key, {"id": "a"}, ttl_secs=0.1)
+    await editable_bus.queue_push(key, {"id": "b"})
+    await asyncio.sleep(0.15)
+    assert await editable_bus.queue_read(key) == []
+    await editable_bus.queue_push(key, {"id": "c"})
+    assert [entry["id"] for _, entry in await editable_bus.queue_read(key)] == ["c"]
+
+
 def test_cluster_requires_explicit_pg_engine():
     with pytest.raises(ValueError):
         EgisMessageBus(deployment_mode="cluster")

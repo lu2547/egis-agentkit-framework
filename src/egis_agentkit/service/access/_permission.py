@@ -6,62 +6,24 @@
 - 校验执行时的入口与依赖授权。
 """
 
-from dataclasses import dataclass, field
-
 from egis_agentkit.errors import Forbidden, NotFound
 from egis_agentkit.service._user import UserService, require_admin
 from egis_agentkit.storage.model import AgentDefinition, User
 from egis_agentkit.storage.model._base import resource_available
 from egis_agentkit.storage.model._resource import (
     MCP_STORAGE_VERSION,
-    SYSTEM_DEFAULT_TOOL_SOURCES,
     is_managed_connector,
 )
 
-DEFINITION_KINDS = ("agent", "team")
-INTERNAL_AGENT_TYPES = ("personal", "orchestrator")
-
-
-def is_system_default_tool(asset):
-    payload = asset["payload"]
-    return (
-        asset.get("resource_type") == "tool"
-        and asset["owner_type"] == "system"
-        and payload.get("exposure") == "model"
-        and payload.get("source") in SYSTEM_DEFAULT_TOOL_SOURCES
-    )
-
-
-@dataclass
-class PermissionDecision:
-    """单次权限查询返回的版本和生效路径。"""
-
-    is_allowed: bool
-    paths: list[list[dict]] = field(default_factory=list)
-    review_id: str | None = None
-    grant_id: str | None = None
-    root_grant_id: str | None = None
-    resource_version: str | None = None
-
-    @property
-    def source_options(self):
-        return {
-            key: value
-            for key, value in (
-                ("grant_id", self.grant_id),
-                ("review_id", self.review_id),
-            )
-            if value is not None
-        }
-
-
-@dataclass(frozen=True)
-class DefinitionAccess:
-    """查询服务读取定义时使用的授权结果。"""
-
-    view: str
-    is_editable: bool
-    decision: PermissionDecision
+from ._decision import (
+    DEFINITION_KINDS,
+    INTERNAL_AGENT_TYPES,
+    PermissionDecision,
+    is_system_default_tool,
+)
+from ._decision import (
+    DefinitionAccess as DefinitionAccess,
+)
 
 
 class PermissionService:
@@ -69,6 +31,27 @@ class PermissionService:
 
     def __init__(self, storage, policies=None):
         self.storage, self.policies = storage, policies
+
+    async def read_snapshot(
+        self,
+        user,
+        references,
+        *,
+        loaded=(),
+        refresh_user=True,
+        include_dependencies=True,
+    ):
+        """Create one bounded read boundary; never retain it across operations."""
+        from ._snapshot import PermissionReadSnapshot
+
+        return await PermissionReadSnapshot.create(
+            self,
+            user,
+            references,
+            loaded=loaded,
+            refresh_user=refresh_user,
+            include_dependencies=include_dependencies,
+        )
 
     @staticmethod
     def require_definition_write(user: User, *, owner_type: str, owner_id: str) -> None:
@@ -84,18 +67,34 @@ class PermissionService:
         self, user: User, data: AgentDefinition
     ) -> list[dict]:
         """校验绑定资源的归属和使用权，返回通过校验的资源。"""
+        references = data.payload.get("bindings", [])
+        if not references:
+            return []
+        # Tool bindings and administrator-owned bindings have never required a
+        # persisted principal (the trusted bootstrap actor is synthetic).
+        check_identity = any(
+            ref["resource_type"] != "tool"
+            and (user.role_type != "admin" or ref["resource_view_type"] == "shared")
+            for ref in references
+        )
+        snapshot = await self.read_snapshot(
+            user, references, refresh_user=check_identity
+        )
+        user = snapshot.user
+        if not user.is_enabled:
+            raise Forbidden("用户已停用")
         assets = []
-        for ref in data.payload.get("bindings", []):
+        for ref in references:
             kind, identifier = ref["resource_type"], ref["resource_id"]
             version = MCP_STORAGE_VERSION if kind == "mcp" else ref["resource_version"]
-            asset = await self.storage.assets.get(kind, identifier, version)
+            asset = snapshot._resource(kind, identifier, version)
             if asset is None or not asset["is_enabled"]:
                 raise NotFound("绑定资源或指定版本不存在")
             if kind == "mcp":
                 if not is_managed_connector(asset):
                     raise NotFound("连接器未在管理控制台登记")
                 if user.role_type != "admin":
-                    await self.require(user, kind, identifier, "system")
+                    await snapshot.require(kind, identifier, "system")
                 assets.append(asset)
                 continue
             view = ref["resource_view_type"]
@@ -109,8 +108,7 @@ class PermissionService:
             if ref["resource_type"] == "tool":
                 continue
             if (user.role_type != "admin" or view == "shared") and not (
-                await self.explain(
-                    user,
+                await snapshot.explain(
                     ref["resource_type"],
                     ref["resource_id"],
                     ref["resource_view_type"],
@@ -123,54 +121,35 @@ class PermissionService:
 
     async def definition_access(self, user, source, view=None, *, version=None):
         """确定查询可读的视图与版本，并标记维护权限。"""
-        own = source["owner_type"] == "user" and source["owner_id"] == user.user_id
-        editable = own or user.role_type == "admin"
-        catalog = view is None
-        if catalog:
-            view = (
-                "system"
-                if source["owner_type"] == "system"
-                else ("private" if own else "shared")
-            )
-        if not user.is_enabled or (view == "private" and not editable):
-            raise Forbidden()
-        decision = await self.explain(
-            user, source["definition_type"], source["id"], view, version=version
-        )
-        if view == "shared" and not decision.is_allowed:
-            if not catalog or not editable:
-                raise Forbidden()
-            view = "private"
-        if view == "system" and not (editable or decision.is_allowed):
-            raise Forbidden()
-        current = version is None or str(
-            source["owner_version"]
-        ) == str(version)
-        return DefinitionAccess(
-            view, editable and current and view != "shared", decision
-        )
+        snapshot = await self._definition_snapshot(user, source, view, version=version)
+        return await snapshot.definition_access(source, view, version=version)
 
     async def definition_versions(self, user, source):
         """列出可维护的历史或独立可用的当前版本引用。"""
-        editable = user.role_type == "admin" or (
-            source["owner_type"] == "user" and source["owner_id"] == user.user_id
+        snapshot = await self._definition_snapshot(user, source)
+        return await snapshot.definition_versions(source)
+
+    async def _definition_snapshot(self, user, source, view=None, *, version=None):
+        selected = view or (
+            "system"
+            if source["owner_type"] == "system"
+            else "private"
+            if source["owner_id"] == user.user_id
+            else "shared"
         )
-        if editable and user.is_enabled:
-            view = "system" if source["owner_type"] == "system" else "private"
-            versions = await self.storage.definitions.list_versions(source["id"])
-            return [
-                {"resource_version": str(version), "resource_view_type": view}
-                for version in versions
-            ]
-        view = "system" if source["owner_type"] == "system" else "shared"
-        decision = await self.explain(
-            user, source["definition_type"], source["id"], view
+        return await self.read_snapshot(
+            user,
+            [
+                {
+                    "resource_type": source["definition_type"],
+                    "resource_id": source["id"],
+                    "resource_view_type": selected,
+                    "resource_version": version,
+                }
+            ],
+            loaded=[source],
+            include_dependencies=False,
         )
-        if not decision.is_allowed:
-            return []
-        return [
-            {"resource_version": decision.resource_version, "resource_view_type": view}
-        ]
 
     async def share_availability(self, user, kind, identifier, *, version, view):
         """返回当前私有版本可提交的共享操作。"""
@@ -215,6 +194,73 @@ class PermissionService:
         if version is not None:
             return await self.storage.assets.get(kind, identifier, str(version))
         return await self.storage.assets.find_asset(kind, identifier)
+
+    def _direct_decision(self, user, target, node, grants, *, review_id, grant_id):
+        """普通入口的统一判定；调用方已读取当前身份、生命周期和有效授权。"""
+        intrinsic = self._intrinsic_source(user, target, node["resource_view_type"])
+        if intrinsic:
+            return PermissionDecision(
+                True,
+                [[{"source": intrinsic}, node]],
+                resource_version=target["resource_version"],
+            )
+        matches = [
+            row
+            for row in grants
+            if self._matches_grant(
+                row,
+                node,
+                agent_id=None,
+                team_id=None,
+                review_id=review_id,
+                grant_id=grant_id,
+                root_grant_id=None,
+                parent_grant_id=None,
+            )
+        ]
+        if not matches:
+            return PermissionDecision(False)
+        selected = matches[0]
+        paths = [
+            [
+                {
+                    "grant_id": row["id"],
+                    "root_grant_id": row["root_grant_id"],
+                    "parent_grant_id": row["parent_grant_id"],
+                    "agent_id": row["agent_id"],
+                    "team_id": row["team_id"],
+                },
+                {**node, "resource_version": target["resource_version"]},
+            ]
+            for row in matches
+        ]
+        return PermissionDecision(
+            True,
+            paths,
+            review_id=selected["source_review_id"],
+            grant_id=selected["id"],
+            root_grant_id=selected["id"],
+            resource_version=target["resource_version"],
+        )
+
+    def explain_loaded_definition(
+        self, user, target, view, grants, *, review_id=None, grant_id=None
+    ):
+        """列表使用本次批量读取的固定版本与当前汇总状态，不跨请求缓存权限。"""
+        if (
+            not user.is_enabled
+            or not self._valid_view(target, view)
+            or (view == "shared" and target["shared_version"] is None)
+        ):
+            return PermissionDecision(False)
+        node = {
+            "resource_type": target["definition_type"],
+            "resource_id": target["id"],
+            "resource_view_type": view,
+        }
+        return self._direct_decision(
+            user, target, node, grants, review_id=review_id, grant_id=grant_id
+        )
 
     async def explain(
         self,
@@ -265,6 +311,26 @@ class PermissionService:
             return PermissionDecision(False)
         if not resolve_dependency and not self._valid_view(target, view):
             return PermissionDecision(False)
+
+        if root_grant_id is None:
+            node = {
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "resource_view_type": view,
+            }
+            grants = (
+                []
+                if self._intrinsic_source(user, target, view)
+                else await self.storage.access.active_grants(
+                    user.user_id,
+                    user.group_ids,
+                    kind=resource_type,
+                    resource_id=resource_id,
+                )
+            )
+            return self._direct_decision(
+                user, target, node, grants, review_id=review_id, grant_id=grant_id
+            )
 
         # 先检查平台默认与所有者权限，再匹配指定授权来源。
         node = {
@@ -466,60 +532,14 @@ class PermissionService:
 
     async def require_execution(self, user, root, *, allow_pinned=False):
         """校验根授权及定义中的固定成员和资源绑定。"""
-        from egis_agentkit.service.team._members import team_member_definitions
-
-        root_grant = await self.require(
-            user,
-            root["definition_type"],
-            root["id"],
-            root["resource_view_type"],
-            version=root["resource_version"],
-            grant_id=root.get("access_grant_id"),
-            review_id=root.get("shared_review_id"),
-            allow_pinned=allow_pinned,
-        )
-        if root["definition_type"] == "agent":
-            await self._require_bindings(
-                user, root, root_grant, allow_pinned=allow_pinned
-            )
-            return
-        team_id = root["id"]
-        for member in (await team_member_definitions(self.storage, root)).values():
-            member_grant = await self.require(
-                user,
-                "agent",
-                member["id"],
-                member["resource_view_type"],
-                version=member["resource_version"],
-                allow_pinned=allow_pinned,
-                root_grant_id=root_grant.root_grant_id,
-                _parent_grant_id=root_grant.grant_id,
-                agent_id=member["id"],
-                team_id=team_id,
-            )
-            await self._require_bindings(
-                user,
-                member,
-                member_grant,
-                team_id=team_id if root_grant.root_grant_id else None,
-                allow_pinned=allow_pinned,
-            )
-
-    async def _require_bindings(
-        self, user, agent, grant, *, allow_pinned, team_id=None
-    ):
-        parent_id = grant.paths[0][0]["grant_id"] if grant.root_grant_id else None
-        for binding in agent["payload"].get("bindings", []):
-            if binding["resource_type"] == "skill":
-                await self.require(
-                    user,
-                    binding["resource_type"],
-                    binding["resource_id"],
-                    binding["resource_view_type"],
-                    version=binding["resource_version"],
-                    allow_pinned=allow_pinned,
-                    root_grant_id=grant.root_grant_id,
-                    _parent_grant_id=parent_id,
-                    agent_id=agent["id"],
-                    team_id=team_id,
-                )
+        reference = {
+            "resource_type": root["definition_type"],
+            "resource_id": root["id"],
+            "resource_view_type": root["resource_view_type"],
+            "resource_version": root["resource_version"],
+            "grant_id": root.get("access_grant_id"),
+            "review_id": root.get("shared_review_id"),
+            "allow_pinned": allow_pinned,
+        }
+        snapshot = await self.read_snapshot(user, [reference])
+        await snapshot.require_execution(root, allow_pinned=allow_pinned)

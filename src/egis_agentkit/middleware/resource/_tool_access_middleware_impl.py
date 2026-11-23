@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from agentscope.skill import Skill
     from agentscope.state import AgentState
 
+_NATIVE_SCHEDULE_GROUP = "schedule_tools"
+
 DYNAMIC_TOOLS = [
     "TeamCreate",
     "AgentCreate",
@@ -56,9 +58,8 @@ class ToolAccessMiddleware(MiddlewareBase):
         *,
         validate_access: Callable[[], Awaitable[None]],
         may_send_team_message: Callable[[], bool],
-        prepare_collaboration: Callable[
-            [Agent, object], Awaitable[ExpertInvite | None]
-        ] | None = None,
+        prepare_collaboration: Callable[[Agent, object], Awaitable[ExpertInvite | None]]
+        | None = None,
         skills: SkillAccess | None = None,
         authorize_tool: Callable[..., Awaitable[None]] | None = None,
         resolve_sandbox_path: Callable[[str], Awaitable[PurePosixPath]] | None = None,
@@ -72,6 +73,15 @@ class ToolAccessMiddleware(MiddlewareBase):
         self.resolve_sandbox_path = resolve_sandbox_path
 
     async def on_reply(self, agent, input_kwargs, next_handler):
+        groups = agent.toolkit.tool_groups
+        if any(group.name == _NATIVE_SCHEDULE_GROUP for group in groups):
+            # ResetTools keeps the original list, so remove the old group in place.
+            groups[:] = [
+                group for group in groups if group.name != _NATIVE_SCHEDULE_GROUP
+            ]
+            active = agent.state.tool_context.activated_groups
+            active[:] = [name for name in active if name != _NATIVE_SCHEDULE_GROUP]
+
         invite = None
         if self.prepare_collaboration is not None:
             invite = await self.prepare_collaboration(agent, input_kwargs.get("inputs"))

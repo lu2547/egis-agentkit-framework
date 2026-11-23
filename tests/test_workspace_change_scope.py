@@ -192,7 +192,7 @@ async def test_explicit_upgrade_adds_change_ownership_without_guessing_old_rows(
                 "INSERT INTO ak_project_file_changes(project_id,area,path,change_type) VALUES('project','artifacts','old.md','created')"
             )
         )
-    with pytest.raises(ValueError, match="upgrade-db"):
+    with pytest.raises(ValueError, match="部署 SQL 脚本"):
         await storage.init_schema()
     preview = await upgrade_schema(storage.engine)
     assert preview.tables["工作区变更归属"] == "pending"

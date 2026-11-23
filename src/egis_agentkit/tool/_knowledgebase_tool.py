@@ -164,7 +164,7 @@ class KnowledgeBaseSearch(ToolBase):
         if self.config.query_url is None:
             return _failure("知识库检索地址尚未配置。")
         if not self._access_token:
-            return _failure("本轮缺少已验证的登录凭据，请发送新消息后重试。")
+            return _failure("当前执行缺少已验证的登录凭据，无法访问知识库。")
         request = {"query": query.strip(), "topK": topK, "threshold": threshold}
         if scope:
             request["scope"] = scope

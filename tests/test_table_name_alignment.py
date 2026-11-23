@@ -62,7 +62,7 @@ async def test_table_rename_preserves_rows_keys_indexes_and_storage_queries(
             )
         for old, new in INDEXES.items():
             await conn.execute(text(f'ALTER INDEX "{new}" RENAME TO "{old}"'))
-    with pytest.raises(ValueError, match="upgrade-db"):
+    with pytest.raises(ValueError, match="部署 SQL 脚本"):
         await storage.init_schema()
     preview = await upgrade_schema(storage.engine)
     assert all(preview.tables[old] == "pending" for old in RENAMES)

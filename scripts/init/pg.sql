@@ -64,6 +64,9 @@ CREATE TABLE schedules (
     created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
     updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
     payload JSON NOT NULL,
+    project_id VARCHAR(64),
+    next_run_at TIMESTAMP WITH TIME ZONE,
+    deleted_at TIMESTAMP WITH TIME ZONE,
     PRIMARY KEY (id)
 );
 
@@ -74,6 +77,53 @@ CREATE INDEX ix_schedules_created_at ON schedules (created_at);
 CREATE INDEX ix_schedules_updated_at ON schedules (updated_at);
 
 CREATE INDEX ix_schedules_user_id ON schedules (user_id);
+
+CREATE INDEX ix_schedules_user_project
+    ON schedules (user_id, project_id)
+    WHERE project_id IS NOT NULL AND deleted_at IS NULL;
+
+CREATE INDEX ix_schedules_due
+    ON schedules (next_run_at, id)
+    WHERE deleted_at IS NULL AND next_run_at IS NOT NULL;
+
+CREATE TABLE ak_schedule_runs (
+    id VARCHAR(64) PRIMARY KEY,
+    schedule_id VARCHAR(255) NOT NULL REFERENCES schedules (id),
+    schedule_name TEXT NOT NULL,
+    project_id VARCHAR(64) NOT NULL,
+    trigger_type VARCHAR(16) NOT NULL,
+    scheduled_for TIMESTAMP WITH TIME ZONE,
+    status VARCHAR(16) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    started_at TIMESTAMP WITH TIME ZONE,
+    finished_at TIMESTAMP WITH TIME ZONE,
+    input_snapshot JSONB NOT NULL,
+    session_id VARCHAR(255),
+    reply_id VARCHAR(255),
+    summary TEXT,
+    error_code VARCHAR(64),
+    error_message TEXT,
+    archived_at TIMESTAMP WITH TIME ZONE,
+    deleted_at TIMESTAMP WITH TIME ZONE,
+    CONSTRAINT ak_schedule_runs_trigger_type_check
+        CHECK (trigger_type IN ('scheduled', 'backfill', 'test')),
+    CONSTRAINT ak_schedule_runs_scheduled_for_check
+        CHECK ((trigger_type = 'test') = (scheduled_for IS NULL)),
+    CONSTRAINT ak_schedule_runs_status_check
+        CHECK (status IN ('queued', 'running', 'succeeded', 'failed'))
+);
+
+CREATE INDEX ix_ak_schedule_runs_history
+    ON ak_schedule_runs (schedule_id, created_at DESC, id);
+
+CREATE INDEX ix_ak_schedule_runs_queue
+    ON ak_schedule_runs (created_at, id) WHERE status = 'queued';
+
+CREATE INDEX ix_ak_schedule_runs_running
+    ON ak_schedule_runs (started_at) WHERE status = 'running';
+
+CREATE UNIQUE INDEX uq_ak_schedule_runs_automatic_time
+    ON ak_schedule_runs (schedule_id, scheduled_for) WHERE scheduled_for IS NOT NULL;
 
 CREATE TABLE sessions (
     user_id VARCHAR(255) NOT NULL,
@@ -98,7 +148,6 @@ CREATE INDEX ix_sessions_source_schedule_id ON sessions (source_schedule_id);
 
 CREATE INDEX ix_sessions_team_id ON sessions (team_id);
 
-CREATE INDEX ix_sessions_updated_at ON sessions (updated_at);
 
 CREATE INDEX ix_sessions_user_agent ON sessions (user_id, agent_id);
 
@@ -256,7 +305,7 @@ CREATE INDEX ix_ak_project_change_path ON ak_project_file_changes (project_id, a
 
 CREATE INDEX ix_ak_project_change_reply ON ak_project_file_changes (project_id, session_id, reply_id, area, change_id);
 
-CREATE INDEX ix_ak_project_file_changes_project_id ON ak_project_file_changes (project_id);
+CREATE INDEX ix_ak_project_changes_page ON ak_project_file_changes (project_id, change_id DESC);
 
 CREATE TABLE ak_project_file_fingerprints (
     project_id VARCHAR(128) NOT NULL,
@@ -398,6 +447,8 @@ CREATE INDEX ix_ak_resource_permission_parent_grant_id ON ak_resource_permission
 
 CREATE INDEX ix_ak_resource_permission_resource_principal ON ak_resource_permission (resource_type, resource_id, principal_type, principal_id, resource_view_type) WHERE revoked_at IS NULL AND root_grant_id IS NULL;
 
+CREATE INDEX ix_ak_permission_active_resource_principal ON ak_resource_permission (resource_type, resource_id, principal_type, principal_id) WHERE revoked_at IS NULL;
+
 CREATE INDEX ix_ak_resource_permission_root_grant_id ON ak_resource_permission (root_grant_id);
 
 CREATE UNIQUE INDEX uq_ak_resource_permission_origin ON ak_resource_permission (principal_type, principal_id, resource_type, resource_id, resource_view_type, resource_owner_type, resource_owner_id, grant_source_type, origin_key) WHERE revoked_at IS NULL;
@@ -495,7 +546,7 @@ CREATE TABLE ak_agent_personal_resources (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
     PRIMARY KEY (agent_id, resource_type, resource_id),
-    CHECK (resource_type IN ('skill','mcp')),
+    CHECK (resource_type IN ('skill','mcp','tool')),
     FOREIGN KEY(agent_id) REFERENCES ak_agent_definition_summary (id)
 );
 
@@ -562,6 +613,8 @@ CREATE TABLE ak_team_definition_detail (
 ALTER TABLE sessions ADD COLUMN project_id text GENERATED ALWAYS AS (payload #>> '{state,middle_context,egis_agentkit,project_id}') STORED;
 
 CREATE INDEX ix_sessions_project_user ON sessions (project_id, user_id) WHERE project_id IS NOT NULL;
+
+CREATE INDEX ix_sessions_main_user_updated ON sessions (user_id, updated_at DESC) INCLUDE (id) WHERE source='user' AND project_id IS NOT NULL;
 
 -- 4. cluster 消息总线的 PostgreSQL 状态；Kafka Topic 由独立脚本初始化。
 

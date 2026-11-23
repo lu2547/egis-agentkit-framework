@@ -2,7 +2,18 @@
 
 from contextlib import asynccontextmanager
 
-from sqlalchemy import and_, delete, func, insert, literal, select, text, update
+from sqlalchemy import (
+    and_,
+    delete,
+    func,
+    insert,
+    literal,
+    select,
+    text,
+    true,
+    tuple_,
+    update,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from egis_agentkit.client._postgres import PostgresTransaction
@@ -175,27 +186,78 @@ class ProjectFileRecordStorage:
             (row["area"], row["path"]): (row["digest"], row["size"]) for row in rows
         }
 
-    async def save_observation(self, user_id, project_id, current, changes):
-        """同一事务内追加历史、替换指纹并清除扫描错误。"""
+    async def scan_state(self, user_id, project_id):
+        """先限定所属项目，再关联该项目指纹；空项目也返回基线/错误状态。"""
+        project, fingerprints = t.projects, t.file_fingerprints
+        query = (
+            select(
+                project.c.scan_has_baseline,
+                project.c.scan_error,
+                fingerprints.c.area,
+                fingerprints.c.path,
+                fingerprints.c.digest,
+                fingerprints.c.size,
+            )
+            .select_from(
+                project.outerjoin(
+                    fingerprints, fingerprints.c.project_id == project.c.id
+                )
+            )
+            .where(*self._active_project(user_id, project_id))
+        )
+        async with self.engine.connect() as conn:
+            rows = (await conn.execute(query)).mappings().all()
+        if not rows:
+            return None
+        return {
+            "initialized": rows[0]["scan_has_baseline"],
+            "has_error": rows[0]["scan_error"] is not None,
+            "fingerprints": {
+                (row["area"], row["path"]): (row["digest"], row["size"])
+                for row in rows
+                if row["path"] is not None
+            },
+        }
+
+    async def save_observation(
+        self, user_id, project_id, current, changes, *, previous, initialized, has_error
+    ):
+        """同一事务追加历史，只修改增量指纹；无变化且无错误时完全不写。"""
+        removed = previous.keys() - current.keys()
+        changed = {
+            key: value for key, value in current.items() if previous.get(key) != value
+        }
         async with self.engine.connect() as conn:
             if changes:
                 await conn.execute(insert(t.file_changes), changes)
-            await conn.execute(
-                delete(t.file_fingerprints).where(
-                    t.file_fingerprints.c.project_id == project_id
-                )
-            )
-            await conn.execute(
-                update(t.projects)
-                .where(*self._active_project(user_id, project_id))
-                .values(scan_has_baseline=True, scan_error=None, scan_error_at=None)
-            )
-            if current:
+            if removed:
                 await conn.execute(
-                    insert(t.file_fingerprints),
+                    delete(t.file_fingerprints).where(
+                        t.file_fingerprints.c.project_id == project_id,
+                        tuple_(
+                            t.file_fingerprints.c.area, t.file_fingerprints.c.path
+                        ).in_(removed),
+                    )
+                )
+            if not initialized or has_error:
+                await conn.execute(
+                    update(t.projects)
+                    .where(*self._active_project(user_id, project_id))
+                    .values(scan_has_baseline=True, scan_error=None, scan_error_at=None)
+                )
+            if changed:
+                statement = pg_insert(t.file_fingerprints)
+                await conn.execute(
+                    statement.on_conflict_do_update(
+                        index_elements=list(t.file_fingerprints.primary_key.columns),
+                        set_={
+                            "digest": statement.excluded.digest,
+                            "size": statement.excluded.size,
+                        },
+                    ),
                     [
                         dict(project_id=project_id, area=a, path=p, digest=d, size=s)
-                        for (a, p), (d, s) in current.items()
+                        for (a, p), (d, s) in changed.items()
                     ],
                 )
 
@@ -210,38 +272,44 @@ class ProjectFileRecordStorage:
 
     async def list_changes(self, project_id, cursor, limit):
         """分页读取变更流水和当前扫描错误。"""
-        query = select(t.file_changes).where(t.file_changes.c.project_id == project_id)
+        query = (
+            select(t.file_changes.c.change_id)
+            .where(t.file_changes.c.project_id == t.projects.c.id)
+            .correlate(t.projects)
+        )
         if cursor is not None:
             query = query.where(t.file_changes.c.change_id < cursor)
+        page_ids = (
+            query.order_by(t.file_changes.c.change_id.desc())
+            .limit(limit + 1)
+            .lateral("change_page")
+        )
+        statement = (
+            select(t.file_changes, t.projects.c.scan_error, t.projects.c.scan_error_at)
+            .select_from(
+                t.projects.outerjoin(page_ids, true()).outerjoin(
+                    t.file_changes, t.file_changes.c.change_id == page_ids.c.change_id
+                )
+            )
+            .where(t.projects.c.id == project_id)
+            .order_by(page_ids.c.change_id.desc())
+        )
         async with self.engine.connect() as conn:
-            rows = (
-                (
-                    await conn.execute(
-                        query.order_by(t.file_changes.c.change_id.desc()).limit(
-                            limit + 1
-                        )
-                    )
-                )
-                .mappings()
-                .all()
-            )
-            error = (
-                (
-                    await conn.execute(
-                        select(
-                            t.projects.c.id.label("project_id"),
-                            t.projects.c.scan_error.label("message"),
-                            t.projects.c.scan_error_at.label("observed_at"),
-                        ).where(
-                            t.projects.c.id == project_id,
-                            t.projects.c.scan_error.is_not(None),
-                        )
-                    )
-                )
-                .mappings()
-                .first()
-            )
-        return rows, dict(error) if error else None
+            rows = (await conn.execute(statement)).mappings().all()
+        error = (
+            {
+                "project_id": project_id,
+                "message": rows[0]["scan_error"],
+                "observed_at": rows[0]["scan_error_at"],
+            }
+            if rows and rows[0]["scan_error"] is not None
+            else None
+        )
+        return [
+            {column.name: row[column.name] for column in t.file_changes.c}
+            for row in rows
+            if row["change_id"] is not None
+        ], error
 
     async def delete_session_artifacts(self, project_id, session_ids):
         """在会话清理事务内只移除所属项目的回复产物关系。"""

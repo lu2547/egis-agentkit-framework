@@ -6,9 +6,10 @@ import time
 
 from agentscope.app.message_bus import MessageBusKeys
 from agentscope.app.storage import (
+    SessionRecord,
     TeamMember,
 )
-from agentscope.app.storage._model._session import TeamOrigin
+from agentscope.app.storage._model._session import ScheduleOrigin, TeamOrigin, UserOrigin
 from agentscope.app.storage._utils import _resolve_team_leader
 from agentscope.event import ReplyEndEvent, ReplyFinishedReason
 from agentscope.permission import PermissionMode
@@ -19,6 +20,7 @@ from egis_agentkit.client.nacos._settings import (
     SessionListingConfig,
     SessionNamingConfig,
     SessionPermissionsConfig,
+    SessionSteeringConfig,
 )
 from egis_agentkit.core.agent._definition_base import (
     AgentDefinitionBase,
@@ -29,7 +31,6 @@ from egis_agentkit.core.workspace._identity import workspace_id_for
 from egis_agentkit.errors import Conflict, Forbidden, InvalidRequest, NotFound
 from egis_agentkit.service._reply import build_branch_context
 from egis_agentkit.service.access._permission import PermissionService
-from egis_agentkit.service.agent._agent_manager import get_definition_for_execution
 from egis_agentkit.service.agent._personal_manager import PersonalManager
 from egis_agentkit.service.project._project_manager import (
     ProjectManager,
@@ -42,20 +43,29 @@ from egis_agentkit.service.team._collaboration import (
     validate_collaborators,
 )
 from egis_agentkit.service.team._definition import TeamDefinition
-from egis_agentkit.service.team._members import team_member_definitions
 from egis_agentkit.storage.model import new_id
 from egis_agentkit.storage.model._definition import (
     build_definition_options,
 )
 from egis_agentkit.storage.project._files import ProjectFileStorage
 
-from ._steering import SessionSteeringService
-
 logger = logging.getLogger(__name__)
 
 
 class SessionService:
     """创建并维护原生会话，使用固定定义版本获取运行及展示信息。"""
+
+    def rewrite_message(self, user, session_id, agent_id, message_id, bus):
+        from ._message_rewrite import MessageRewriteService
+
+        return MessageRewriteService(self).replace(user, session_id, agent_id, message_id, bus)
+
+    def get_steering_settings(self):
+        return (
+            self.config.snapshot.session.steering
+            if self.config
+            else SessionSteeringConfig()
+        )
 
     def __init__(
         self,
@@ -66,9 +76,10 @@ class SessionService:
         *,
         projects=None,
         personal=None,
+        authorizations=None,
     ):
         self.storage = storage
-        self.steering = SessionSteeringService(self, storage, config_provider)
+        self.authorizations = authorizations
         self.files = ProjectFileStorage(workspace_root, config_provider=config_provider)
         self.models, self.config = models, config_provider
         self.personal = personal or PersonalManager(
@@ -122,6 +133,7 @@ class SessionService:
         model_key=None,
         permission_mode=None,
         project_id=None,
+        schedule_id=None,
     ):
         """在项目范围内按指定版本创建会话。"""
         configuration = self.config.snapshot if self.config else None
@@ -148,6 +160,7 @@ class SessionService:
                 project_id=project_record["id"],
                 configuration=configuration,
                 naming=naming,
+                schedule_id=schedule_id,
             )
 
     async def _add_session(
@@ -165,6 +178,7 @@ class SessionService:
         naming,
         branch_history=None,
         branch_source=None,
+        schedule_id=None,
     ):
         """解析授权版本，创建主会话以及固定 Team 的成员会话。"""
         permissions_config = (
@@ -172,34 +186,42 @@ class SessionService:
             if configuration
             else SessionPermissionsConfig()
         )
-        permission_mode = self.validate_permission_mode(
-            permissions_config.default_mode
-            if permission_mode is None
-            else permission_mode,
-            permissions=permissions_config,
-        )
+        if schedule_id is not None and permission_mode == PermissionMode.DONT_ASK:
+            permission_mode = PermissionMode.DONT_ASK
+        else:
+            permission_mode = self.validate_permission_mode(
+                permissions_config.default_mode
+                if permission_mode is None
+                else permission_mode,
+                permissions=permissions_config,
+            )
         source = await self.storage.get_definition(definition_id)
         policies = configuration.access if configuration else None
         permissions = PermissionService(self.storage, policies)
-        root = await get_definition_for_execution(
-            permissions,
-            user,
-            source["definition_type"],
-            definition_id,
-            view,
-            version=resource_version,
-        )
+        reference = {
+            "root_resource_type": source["definition_type"],
+            "definition_id": definition_id,
+            "resource_view_type": view,
+            "resource_version": resource_version,
+            "allow_pinned": False,
+        }
+        snapshot = await permissions.read_snapshot(user, [reference], loaded=[source])
+        user = snapshot.user
+        root = await snapshot.definition_view(reference)
+        await snapshot.require_execution(root)
         if root["definition_type"] == "agent" and root["agent_type"] == "orchestrator":
             raise Forbidden("编排智能体只能在专家团内使用")
         # 普通会话与分支均持有项目保护；只补齐缺失目录，不覆盖已有文件。
         await asyncio.to_thread(self.files.initialize_project, user.user_id, project_id)
         is_team = root["definition_type"] == "team"
-        agents = await team_member_definitions(self.storage, root)
+        agents = await snapshot.members(root)
         leader_id = (
             root["payload"]["orchestrator"]["definition_id"] if is_team else root["id"]
         )
         created_agents, created_sessions = [], []
         created_team_id = None
+        native_agents, native_sessions = [], []
+        published = False
 
         async def project(definition, *, member=False):
             personal = definition["agent_type"] == "personal"
@@ -213,7 +235,7 @@ class SessionService:
                 source="team" if member else "user",
                 preferences=preferences,
             )
-            await self.storage.upsert_agent(user.user_id, native)
+            native_agents.append(native)
             created_agents.append(native.id)
             sid = new_id()
             model = (
@@ -254,19 +276,24 @@ class SessionService:
                     },
                     deep=True,
                 )
-            session = await self.storage.upsert_session(
-                user.user_id,
-                native.id,
-                session_config,
-                session_id=sid,
+            session = SessionRecord(
+                user_id=user.user_id,
+                agent_id=native.id,
+                config=session_config,
+                id=sid,
                 state=state,
-                origin=TeamOrigin() if member else None,
+                origin=(
+                    TeamOrigin() if member else
+                    ScheduleOrigin(schedule_id=schedule_id) if schedule_id else UserOrigin()
+                ),
             )
+            native_sessions.append(session)
             created_sessions.append((native.id, session.id))
             return native, session
 
         try:
             leader, leader_session = await project(agents[leader_id])
+            team = None
             if is_team:
                 members = []
                 for ref in root["payload"]["members"]:
@@ -289,16 +316,15 @@ class SessionService:
                     description=root["payload"]["description"],
                     members=members,
                 )
-                await self.storage.upsert_team(user.user_id, team)
                 created_team_id = team.id
-                for _, sid in created_sessions:
-                    await self.storage.set_session_team_id(user.user_id, sid, team.id)
+                for session in native_sessions:
+                    session.team_id = team.id
             # 所有会话和团队关系就绪后才开放执行。
-            for aid, sid in reversed(created_sessions):
-                session = await self.storage.read_session_unscoped(
-                    user.user_id, aid, sid
+            for session in reversed(native_sessions):
+                sid = session.id
+                session.state.middle_context["egis_agentkit"]["is_initialized"] = (
+                    branch_history is None
                 )
-                session.state.middle_context["egis_agentkit"]["is_initialized"] = True
                 if branch_history is not None and sid == leader_session.id:
                     source_sid, reply_id, messages = branch_history
                     session.state.context = build_branch_context(
@@ -308,17 +334,19 @@ class SessionService:
                         "session_id": source_sid,
                         "reply_id": reply_id,
                     }
-                    await self.storage.sessions.save_branch_history(
-                        user.user_id,
-                        session,
-                        source_sid,
-                        [message.id for message in messages],
-                    )
-                else:
-                    await self.storage.update_session_state(
-                        user.user_id, aid, sid, session.state
-                    )
-            result = await self.get_session(user, leader_session.id)
+            await self.storage.sessions.publish_created(
+                native_agents, native_sessions, team
+            )
+            published = True
+            if branch_history is not None:
+                source_sid, _, messages = branch_history
+                await self.storage.sessions.save_branch_history(
+                    user.user_id,
+                    leader_session,
+                    source_sid,
+                    [message.id for message in messages],
+                )
+            result = await self._view_loaded(leader_session, snapshot)
             logger.info(
                 "session.created",
                 extra={
@@ -334,7 +362,9 @@ class SessionService:
             )
             return result
         except BaseException:
-            # 创建失败时只清理由本次请求分配的记录。
+            # 创建失败时只清理由本次请求已经发布的记录。
+            if not published:
+                raise
             if created_team_id is not None:
                 await self.storage.delete_team(user.user_id, created_team_id)
             async with self.storage.session_cleanup() as (sessions, workspace):
@@ -408,6 +438,51 @@ class SessionService:
             finally:
                 await bus.unlock(key)
 
+    async def _read_session(
+        self,
+        user,
+        session_id,
+        *,
+        agent_id=None,
+        require_use=True,
+        check_collaborators=True,
+    ):
+        """一个读取边界内共享当前身份、所属项目和固定定义；锁内调用仍重新读取。"""
+        from egis_agentkit.service._user import UserService
+
+        user = await UserService(self.storage).get(user.user_id)
+        session, project = await self.storage.sessions.read_with_project(
+            session_id, user_id=user.user_id, agent_id=agent_id
+        )
+        if session is None:
+            raise Forbidden("会话不存在或不可访问")
+        binding = session.state.middle_context.get("egis_agentkit", {})
+        if not binding.get("is_initialized"):
+            raise Forbidden("会话尚未初始化")
+        self.projects.project.require_available(project)
+        snapshot = None
+        if require_use:
+            policies = self.config.snapshot.access if self.config else None
+            permissions = PermissionService(self.storage, policies)
+            references = [
+                binding,
+                *(collaborators(binding) if check_collaborators else []),
+            ]
+            snapshot = await permissions.read_snapshot(
+                user, references, refresh_user=False
+            )
+            await snapshot.require(
+                binding["root_resource_type"],
+                binding["definition_id"],
+                binding["resource_view_type"],
+                **build_definition_options(binding),
+            )
+            if check_collaborators:
+                await validate_collaborators(
+                    permissions, user, binding, snapshot=snapshot
+                )
+        return user, session, snapshot
+
     async def get_session_record(
         self,
         user,
@@ -418,53 +493,41 @@ class SessionService:
         check_collaborators=True,
     ):
         """定位用户会话，并按需检查固定根和已选专家的当前权限。"""
-        from egis_agentkit.service._user import UserService
-
-        user = await UserService(self.storage).get(user.user_id)
-        locator = await self.storage.locate_session(session_id)
-        if (
-            locator is None
-            or locator[0] != user.user_id
-            or (agent_id and locator[1] != agent_id)
-        ):
-            raise Forbidden("会话不存在或不可访问")
-        session = await self.storage.read_session_unscoped(
-            user.user_id, locator[1], session_id
+        _, session, _ = await self._read_session(
+            user,
+            session_id,
+            agent_id=agent_id,
+            require_use=require_use,
+            check_collaborators=check_collaborators,
         )
-        if session is None:
-            raise Forbidden("会话不存在或不可访问")
-        binding = session.state.middle_context.get("egis_agentkit", {})
-        if not binding.get("is_initialized"):
-            raise Forbidden("会话尚未初始化")
-        await self.projects.session_project(user, session)
-        if require_use:
-            policies = self.config.snapshot.access if self.config else None
-            await PermissionService(self.storage, policies).require(
-                user,
-                binding["root_resource_type"],
-                binding["definition_id"],
-                binding["resource_view_type"],
-                **build_definition_options(binding),
-            )
-            if check_collaborators:
-                await validate_collaborators(
-                    PermissionService(self.storage, policies), user, binding
-                )
-        else:
-            from egis_agentkit.service._user import UserService
-
-            await UserService(self.storage).get(user.user_id)
         return session
+
+    async def _view_loaded(self, session, snapshot):
+        binding = session.state.middle_context["egis_agentkit"]
+        root = await snapshot.definition_view(binding)
+        agents = {root["id"]: root}
+        if root["definition_type"] == "team":
+            agents = {
+                ref["definition_id"]: await snapshot.definition_view(
+                    ref, dependency=True
+                )
+                for ref in (
+                    root["payload"]["orchestrator"],
+                    *root["payload"]["members"],
+                )
+            }
+        return self._session_view(session, root, agents)
 
     async def get_session(self, user, session_id):
         """从固定版本读取对话展示信息，保留可清除的待邀请选项。"""
-        # 元数据只检查根权限，不因待邀请成员或执行依赖停用而隐藏。
-        session = await self.get_session_record(
+        _, session, snapshot = await self._read_session(
             user, session_id, check_collaborators=False
         )
+        return await self._view_loaded(session, snapshot)
+
+    @staticmethod
+    def _session_view(session, root, agents):
         binding = session.state.middle_context["egis_agentkit"]
-        root = await self.storage.definitions.get_definition_by_reference(binding)
-        agents = await team_member_definitions(self.storage, root)
         return {
             "project_id": binding["project_id"],
             "collaboration_allowed": collaboration_allowed(session, root),
@@ -516,21 +579,9 @@ class SessionService:
             if self.config
             else SessionListingConfig()
         )
-        session_ids = await self.storage.sessions.list_main_ids(
-            user.user_id, limit=listing.max_sessions
-        )
-        result = []
-        for sid in session_ids:
-            try:
-                item = await self.get_session(user, sid)
-                if bus is not None:
-                    item["is_running"] = await bus.is_locked(
-                        MessageBusKeys.session_lock(sid)
-                    )
-                result.append(item)
-            except (Forbidden, NotFound):
-                continue
-        return result
+        from ._listing import list_sessions
+
+        return await list_sessions(self, user, bus, limit=listing.max_sessions)
 
     async def delete_session(self, user, session_id, bus):
         """在项目和会话锁内删除主会话及其成员记录。"""
@@ -574,8 +625,7 @@ class SessionService:
                     user.user_id, [(session.id, session.agent_id)], projections
                 )
                 await workspace.delete_session_artifacts(project_id, session_ids)
-                for sid in session_ids:
-                    await purge_session_bus(bus, sid)
+                await purge_session_bus(bus, session_ids)
         finally:
             for key in reversed(held):
                 await bus.unlock(key)
@@ -594,38 +644,33 @@ class SessionService:
             raise Conflict("会话名称不能为空")
         if len(name) > naming.max_length:
             raise InvalidRequest(f"会话名称最多 {naming.max_length} 个字符")
-        await self.get_session_record(user, session_id)
+        await self.get_session_record(user, session_id, require_use=False)
         key = MessageBusKeys.session_lock(session_id)
         if not await bus.try_lock(key):
             raise Conflict("对话正在运行，请先停止生成后再重命名")
         try:
-            session = await self.get_session_record(user, session_id)
+            user, session, snapshot = await self._read_session(user, session_id)
             if session.origin.type != "user":
                 raise Forbidden("只能重命名主对话")
             session.config.name = name
             session.config.naming = SessionNaming(auto=False)
-            await self.storage.upsert_session(
-                user.user_id,
-                session.agent_id,
-                session.config,
-                session_id=session.id,
-                state=session.state,
-            )
+            await self.storage.sessions.save_state(session)
+            result = await self._view_loaded(session, snapshot)
         finally:
             await bus.unlock(key)
-        return await self.get_session(user, session_id)
+        return result
 
     async def update_session_settings(
         self, user, session_id, bus, *, permission_mode=None, model_key=None
     ):
         from agentscope.app.message_bus import MessageBusKeys
 
-        await self.get_session_record(user, session_id)
+        await self.get_session_record(user, session_id, require_use=False)
         key = MessageBusKeys.session_lock(session_id)
         if not await bus.try_lock(key):
             raise Conflict("对话正在运行，请先停止生成后再修改设置")
         try:
-            session = await self.get_session_record(user, session_id)
+            user, session, snapshot = await self._read_session(user, session_id)
             if session.origin.type != "user":
                 raise Forbidden("只能修改主对话")
             if permission_mode is not None:
@@ -641,16 +686,11 @@ class SessionService:
                 session.state.middle_context["egis_agentkit"]["selected_model_key"] = (
                     model_key
                 )
-            await self.storage.upsert_session(
-                user.user_id,
-                session.agent_id,
-                session.config,
-                session_id=session.id,
-                state=session.state,
-            )
+            await self.storage.sessions.save_state(session)
+            result = await self._view_loaded(session, snapshot)
         finally:
             await bus.unlock(key)
-        return await self.get_session(user, session_id)
+        return result
 
     async def get_team_leader_name(self, scope):
         """为远程专家取得原生团队组长，独立会话及组长自身不需要汇报目标。"""
@@ -688,7 +728,10 @@ class SessionService:
         }
         logger.info(
             "reply.started",
-            extra={"component": "SessionService.on_workspace_reply", "context": context},
+            extra={
+                "component": "SessionService.on_workspace_reply",
+                "context": context,
+            },
         )
         reason = "interrupted"
         try:
@@ -709,7 +752,7 @@ class SessionService:
                     "context": {
                         **context,
                         "error_type": type(exc).__name__,
-                    }
+                    },
                 },
             )
             raise
@@ -722,6 +765,6 @@ class SessionService:
                         **context,
                         "reason": reason,
                         "duration_ms": round((time.monotonic() - started) * 1000),
-                    }
+                    },
                 },
             )

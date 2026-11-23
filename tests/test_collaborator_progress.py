@@ -14,6 +14,44 @@ from egis_agentkit.core.session._context import session_execution_context
 from egis_agentkit.service.session._message_bus_override import SessionMessageBus
 
 
+async def test_worker_start_and_finish_times_survive_progress_updates_and_reload():
+    async with SessionMessageBus(deployment_mode="standalone") as bus:
+        progress = bus.collaborator_progress
+        start = ReplyStartEvent(
+            session_id="worker", reply_id="first", name="skills-assistant",
+            created_at="2026-11-23T01:00:00Z",
+        )
+        finish = ReplyEndEvent(
+            session_id="worker", reply_id="first",
+            created_at="2026-11-23T01:01:00Z",
+        )
+        for event in (
+            start,
+            ToolCallStartEvent(
+                reply_id="first", tool_call_id="write", tool_call_name="CreateSkill"
+            ),
+            finish,
+        ):
+            await progress.observe(
+                "parent", "worker", "expert", "Skills 助手", event.model_dump(mode="json")
+            )
+        (saved,) = await progress.list("parent")
+        assert saved["started_at"] == start.model_dump(mode="json")["created_at"]
+        assert saved["finished_at"] == finish.model_dump(mode="json")["created_at"]
+        assert saved["status"] == "completed"
+
+        next_start = ReplyStartEvent(
+            session_id="worker", reply_id="second", name="skills-assistant",
+            created_at="2026-11-23T02:00:00Z",
+        )
+        await progress.observe(
+            "parent", "worker", "expert", "Skills 助手", next_start.model_dump(mode="json")
+        )
+        (saved,) = await progress.list("parent")
+        assert saved["started_at"] == next_start.model_dump(mode="json")["created_at"]
+        assert "finished_at" not in saved
+
+
 async def test_worker_progress_reaches_the_parent_after_its_reply_ends():
     async with SessionMessageBus(deployment_mode="standalone") as bus:
         await publish_session_event(
