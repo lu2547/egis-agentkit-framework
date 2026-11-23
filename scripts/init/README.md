@@ -4,6 +4,8 @@
 
 脚本不启动基础设施，不创建演示用户、专家或项目，不执行旧库升级。命令从 `egis-agentkit-framework` 目录执行。
 
+已有环境的逐版本增量发布见 [releases](../releases/README.md)，数据库 SQL 和 Nacos 人工变更说明一起按版本保存；不要用本目录的首次建表脚本替代增量发布。
+
 | 文件 | 执行内容 |
 | --- | --- |
 | [nas.sh](nas.sh) | 检查 NAS 已挂载，创建用户根目录、系统技能目录和技能上传暂存目录，验证文件写入、读回 |
@@ -117,7 +119,7 @@ python scripts/init/nacos.py --file "$HOME/.config/agentkit/agentkit.yaml"
 | `revision` | 首次配置版本，模板为 1 |
 | `workspace.runtime.root` | 唯一的 NAS 根目录，与 `NAS_ROOT` 一致；`workdir` 自动派生为该根目录下的 `user/{uid}`，不单独配置 |
 | `skill.storage.root` | `SKILL_STORAGE_ROOT` |
-| `project.upload.maxBytes` | 项目单文件上传上限，模板为 50 MiB（52,428,800 字节） |
+| `project.upload.maxBytes` | 项目单文件上传上限，模板与本机基线一致，为 20 MiB（20,971,520 字节） |
 | `workspace.runtime.mode` | 固定为 `pks` |
 | `workspace.runtime.sandbox` | 沙箱服务地址、镜像、凭据引用及执行参数；公司 Client 由接入方注入 |
 | `client.postgres.connection` | PostgreSQL 的 mode、host、port、database、username、TLS 和取密配置，见下节 |
@@ -151,9 +153,9 @@ App CLI 统一配置 Framework、App、AgentScope 和 Uvicorn 的日志。日志
 在转发上传请求的 `server` 或 `location` 中设置请求体上限。
 
 ```nginx
-client_max_body_size 50m;
+client_max_body_size 21m;
 ```
 
-Nginx 按整个 `multipart/form-data` 请求体计大小。要支持恰好 50 MiB 的文件，在上传路由生效的 `location` 中设为 `client_max_body_size 51m;`，给表单封装留出空间。修改后执行 `nginx -t`，通过后重新加载配置。 [Nginx 指令文档](https://nginx.org/en/docs/http/ngx_http_core_module.html#client_max_body_size)
+Nginx 按整个 `multipart/form-data` 请求体计大小。上述值给 20 MiB 项目文件和表单封装留出空间。Skill ZIP 等具有独立上限的上传路由按其实际上限配置，例如 50 MiB ZIP 可设为 `51m`。修改后执行 `nginx -t`，通过后重新加载配置。 [Nginx 指令文档](https://nginx.org/en/docs/http/ngx_http_core_module.html#client_max_body_size)
 
 执行顺序为 **NAS → PG → Kafka → Redis 检查 → Nacos**。全部成功后，由应用部署流程注入实际运行密钥并启动服务；本组脚本不安装和启动基础设施，也不执行旧环境迁移。

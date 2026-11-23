@@ -11,6 +11,31 @@ from egis_agentkit.client.nacos import (
 )
 
 
+def test_release_example_preserves_approved_workstation_behavior():
+    from pathlib import Path
+
+    from egis_agentkit.client.nacos import load_agentkit_config
+
+    settings = load_agentkit_config(
+        (Path(__file__).parents[1] / "examples/nacos/agentkit.yaml").read_text()
+    )
+    assert {
+        "permission_mode": settings.session.permissions.default_mode.value,
+        "deployment_mode": settings.client.kafka.connection.deployment_mode,
+        "project_memory": settings.project.memory.is_enabled,
+        "tracing": settings.client.tracing.enabled,
+        "upload_bytes": settings.project.upload.max_bytes,
+        "skill_bytes": settings.workspace.runtime.sandbox.max_skill_bytes,
+    } == {
+        "permission_mode": "bypass",
+        "deployment_mode": "cluster",
+        "project_memory": True,
+        "tracing": True,
+        "upload_bytes": 20_971_520,
+        "skill_bytes": 52_428_799,
+    }
+
+
 def test_workspace_configuration_accepts_one_shared_root():
     from egis_agentkit.client.nacos._settings import WorkspaceRuntimeConfig
 
@@ -397,7 +422,7 @@ def test_checked_in_agentkit_example_validates():
 
     example = Path(__file__).resolve().parents[1] / "examples/nacos/agentkit.yaml"
     settings = load_agentkit_config(example.read_text())
-    assert settings.project.upload.max_bytes == 50 * 1024 * 1024
+    assert settings.project.upload.max_bytes == 20 * 1024 * 1024
     assert settings.model.selection.default_key == "company"
     for resource in (settings.agent, settings.skill, settings.connector, settings.tool):
         assert resource.catalog.default_page_size == 10

@@ -218,7 +218,6 @@ class SessionSteeringConfig(ConfigModel):
     max_batch_size: PositiveInt = 20
     max_message_bytes: PositiveInt = 1_048_576
     max_text_length: PositiveInt = 32_000
-    wakeup_retry_seconds: Seconds = 60
 
 
 class SessionConfig(ConfigModel):
@@ -385,7 +384,7 @@ class SandboxWorkspaceConfig(ConfigModel):
             "curl -LsSf https://astral.sh/uv/{uv_version}/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh",
             "uv venv {gateway_venv}",
             "uv pip install --python {gateway_python} {pip_requirements}",
-            "uv pip install --python {gateway_python} --no-deps 'agentscope'",
+            "uv pip install --python {gateway_python} --no-deps 'agentscope==2.0.12'",
         ]
     )
     max_skill_bytes: PositiveInt = DEFAULT_SKILL_ARCHIVE_MAX_BYTES

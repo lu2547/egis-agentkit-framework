@@ -70,7 +70,6 @@ agentkit:
       maxBatchSize: 20
       maxMessageBytes: 1048576
       maxTextLength: 32000
-      wakeupRetrySeconds: 60
     permissions:
       defaultMode: bypass
       allowedModes:
@@ -143,7 +142,7 @@ agentkit:
       jwksTimeoutSeconds: 10.0
   project:
     memory:
-      isEnabled: false
+      isEnabled: true
       topK: 5
     defaults:
       name: 默认项目
@@ -156,7 +155,7 @@ agentkit:
       maxPageSize: 100
       writingTools: [Write, Edit, Bash, PowerShell, CreateDemoReport]
     upload:
-      maxBytes: 52428800
+      maxBytes: 20971520
     scan:
       maxDepth: 32
       maxEntries: 10000
@@ -272,8 +271,8 @@ agentkit:
         - curl -LsSf https://astral.sh/uv/{uv_version}/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
         - uv venv {gateway_venv}
         - uv pip install --python {gateway_python} {pip_requirements}
-        - uv pip install --python {gateway_python} --no-deps agentscope
-        maxSkillBytes: 52428800
+        - uv pip install --python {gateway_python} --no-deps 'agentscope==2.0.12'
+        maxSkillBytes: 52428799
         env: {}
         resource: {cpu: '1', memory: 1Gi}
         entrypoint: [tail, '-f', /dev/null]
@@ -333,7 +332,7 @@ agentkit:
         maxOverflow: 10
     kafka:
       connection:
-        deploymentMode: standalone
+        deploymentMode: cluster
         bootstrapServers:
         - 127.0.0.1:9092
         topicPrefix: egis-agentkit
@@ -361,7 +360,7 @@ agentkit:
         intervalSeconds: 10.0
         failureIntervalSeconds: 10.0
     tracing:
-      enabled: false
+      enabled: true
       endpoint: http://127.0.0.1:6006/v1/traces
       projectName: egis-agentkit
       httpProjectName: egis-agentkit-http

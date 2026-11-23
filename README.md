@@ -4,6 +4,8 @@ AgentScope 的配置管理与企业增强框架。首版已实现，不修改 Ag
 
 首次环境初始化见 [scripts/init](scripts/init/README.md)：面向企业已提供的 NAS、Nacos、Redis、Kafka、PG，包含目录初始化、配置发布、Topic 创建和业务建表 SQL；脚本不安装或启动基础设施。
 
+已有环境的增量发布见 [scripts/releases](scripts/releases/README.md)。按版本归档 SQL、Nacos 和镜像变更及执行顺序；[1.0.2](scripts/releases/1.0.2/README.md) 包含本次 3 个新索引、2 个冗余索引移除及 AgentScope 2.0.12 配套操作。
+
 数据库支持 Nacos `agentkit.client.postgres.connection.mode: key | cyberark`：key 使用 password 字段，cyberark 使用 CCP REST 获取新建连接所需密码。日志配置位于 `agentkit.logging`；Phoenix 导出位于 `agentkit.client.tracing`，启动后由原生 TracingMiddleware 记录回复、模型和工具调用，Framework 管理导出和关闭。配置示例及运维步骤见上述初始化说明。
 
 Phoenix 的运行主项目默认 `egis-agentkit`，以 `chat.run` 为根记录会话、项目、沙箱、资源、记忆、原生 Agent/模型/工具和收尾阶段，使用 `session.id` 对应实际会话。普通 HTTP 与 FastAPI 内部 Span 默认进入 `egis-agentkit-http`，由 `client.tracing.httpProjectName` 配置。Span 结束后导出，执行中的父阶段不提前标记完成。
@@ -60,7 +62,7 @@ python -m egis_agentkit_app reset-skills --database "$DB_NAME" --apply
 
 重置清理技能记录、授权、导入文件和 Agent 定义中的技能绑定，重建导入表。新部署直接执行 `init-db`。
 
-启动和真实联调见 [App](../egis-agentkit-app/README.md) 与 [实施记录](../egis-agentkit-app/docs/实施记录.md)。当前实际验收使用本地 AgentScope 2.0.11 源码；依赖范围为 `>=2.0.10,<2.1`，未单独声称已通过 2.0.10 的另一套完整验收。
+启动和真实联调见 [App](../egis-agentkit-app/README.md) 与 [实施记录](../egis-agentkit-app/docs/实施记录.md)。产品包版本为 1.0.2，配套本地 AgentScope 2.0.12 源码及会话 SSE 重放分页修复；API 与沙箱镜像使用同一份 SDK 制品。发布配置基线及操作步骤见 [1.0.2 发布说明](scripts/releases/1.0.2/README.md)。
 
 项目共享工作空间与删除规则见 [文件生命周期](docs/session-files.md)。
 
