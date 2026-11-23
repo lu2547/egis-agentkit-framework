@@ -9,6 +9,9 @@ from agentscope.app._bus_ops import enqueue_chat_input, list_chat_inputs
 from agentscope.app.message_bus import InMemoryMessageBus, MessageBusKeys
 from agentscope.message import ToolCallBlock, UserMsg
 from pydantic import SecretStr
+from redis_helpers import redis_bus as redis_bus
+from redis_helpers import redis_buses as redis_buses
+from redis_helpers import redis_config as redis_config
 from test_message_actions import history
 from test_session_steering import chat_api  # noqa: F401
 
@@ -47,7 +50,7 @@ async def test_edit_truncates_history_and_model_context_but_keeps_files(
         await replace(service, alice, task, original, edited, bus)
         saved, more = await storage.list_messages("alice", task["session_id"])
         assert not more
-        assert [m.id for m in saved] == [m.id for m in messages[:2]]
+        assert saved == [*messages[:2], edited]
         (queued,) = await list_chat_inputs(bus, task["session_id"])
         assert queued["input"]["id"] == original.id
         assert queued["input"]["content"][0]["text"] == "改后的问题"
@@ -73,7 +76,7 @@ async def test_edit_of_first_message_keeps_session_and_definition(storage, tmp_p
     async with InMemoryMessageBus() as bus:
         await replace(service, alice, task, messages[0], messages[0], bus)
     saved, _ = await storage.list_messages("alice", task["session_id"])
-    assert saved == []
+    assert saved == [messages[0]]
     after = await service.get_session_record(alice, task["session_id"])
     assert after.id == before.id and after.agent_id == before.agent_id
     assert after.config == before.config
@@ -224,7 +227,9 @@ async def test_http_replaces_a_message_and_queues_preserved_input(chat_api, stor
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "queued"
     assert response.json()["queue_item_id"]
-    assert (await storage.list_messages("alice", task["session_id"]))[0] == []
+    saved, _ = await storage.list_messages("alice", task["session_id"])
+    assert len(saved) == 1 and saved[0].id == edited.id
+    assert saved[0].name == alice.username and saved[0].metadata == edited.metadata
     (queued,) = await list_chat_inputs(bus, task["session_id"])
     assert queued["input"][0]["name"] == alice.username
     assert queued["input"][0]["metadata"] == edited.metadata
@@ -423,18 +428,16 @@ async def test_edit_resets_invited_worker_context_and_refuses_running_worker(
 
 @pytest.mark.parametrize("failure", [None, "enqueue", "commit"])
 async def test_cluster_rewrite_cleans_only_committed_runtime_and_retains_credentials(
-    storage, tmp_path, monkeypatch, failure
+    storage, tmp_path, monkeypatch, failure, redis_bus
 ):
     from unittest.mock import AsyncMock
 
-    from egis_agentkit.core.message_bus import EgisMessageBus
     from egis_agentkit.core.session._context import VerifiedChatAuthorization
     from egis_agentkit.service.session._authorization import ChatAuthorizationStore
 
     _, _, alice, _, service, task, messages = await history(storage, tmp_path)
     sid = task["session_id"]
-    bus = EgisMessageBus(deployment_mode="cluster", engine=storage.engine)
-    await bus.init_schema()
+    bus = redis_bus
     monkeypatch.setattr(bus, "publish", AsyncMock())
     original_push = bus.queue_push
 
@@ -520,4 +523,5 @@ async def test_cluster_rewrite_cleans_only_committed_runtime_and_retains_credent
             await store.load("alice", task["agent_id"], sid)
         ).access_token.get_secret_value() == "verified-test-token"
     finally:
-        await bus.aclose()
+        await bus.purge_sessions([sid])
+        await bus.registry_drop(ChatAuthorizationStore.namespace(sid))

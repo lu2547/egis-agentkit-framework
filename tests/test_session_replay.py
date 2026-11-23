@@ -1,4 +1,4 @@
-"""长回复切换会话后，完整重放尚未落库的事件，不能裁掉回复开头。"""
+"""会话事件保留原生重放上限与实时订阅。"""
 
 import asyncio
 import json
@@ -7,6 +7,9 @@ from contextlib import aclosing
 from agentscope.app._bus_ops import publish_session_event
 from agentscope.app._router._session import stream_session_events
 from agentscope.app.message_bus import MessageBusKeys
+from redis_helpers import redis_buses as redis_buses
+from redis_helpers import redis_config as redis_config
+from redis_helpers import redis_key as redis_key
 
 from egis_agentkit.core.message_bus import EgisMessageBus
 
@@ -16,42 +19,47 @@ class SessionStorage:
         return object()
 
 
-async def test_active_reply_is_retained_until_its_message_checkpoint_is_persisted():
-    async with EgisMessageBus(deployment_mode="standalone") as bus:
-        sid = "long-reply"
-        key = MessageBusKeys.session_events(sid)
-        await publish_session_event(
-            bus, sid, {"type": "REPLY_START", "reply_id": "first"}
+async def assert_bounded_session_events(bus):
+    sid = "bounded-replay"
+    key = MessageBusKeys.session_events(sid)
+    for index in range(1002):
+        await bus.log_append(
+            key, {"sequence": index}, max_len=MessageBusKeys.SESSION_REPLAY_MAX_LEN
         )
-        cursor = None
-        for index in range(MessageBusKeys.SESSION_REPLAY_MAX_LEN + 1):
-            cursor = await publish_session_event(
-                bus, sid, {"type": "TEXT_BLOCK_DELTA", "delta": str(index)}
-            )
-        page = await bus.log_read(key, max_count=MessageBusKeys.SESSION_REPLAY_MAX_LEN)
-        assert page[0][1]["type"] == "REPLY_START"
-        assert len(await bus.log_read(key, since=page[-1][0])) == 2
-        await bus.registry_set(
-            MessageBusKeys.session_event_checkpoint(sid),
-            MessageBusKeys.SESSION_EVENT_CURSOR_FIELD,
-            cursor,
-        )
-        await publish_session_event(
-            bus, sid, {"type": "REPLY_START", "reply_id": "second"}
-        )
-        remaining = await bus.log_read(key)
-        assert len(remaining) <= 2
-        assert remaining[-1][1]["reply_id"] == "second"
+    retained = await bus.log_read(key, max_count=1002)
+    assert len(retained) == 1000
+    assert [event["sequence"] for _, event in retained] == list(range(2, 1002))
+    assert await bus.log_read(key, since=retained[-1][0]) == []
 
 
-async def test_sse_replays_all_pages_before_switching_to_live_events():
+async def test_standalone_session_events_keep_latest_1000():
     async with EgisMessageBus(deployment_mode="standalone") as bus:
-        count = MessageBusKeys.SESSION_REPLAY_MAX_LEN + 2
-        key = MessageBusKeys.session_events("paged-replay")
-        for index in range(count):
-            await bus.delegate.log_append(key, {"sequence": index})
+        await assert_bounded_session_events(bus)
+
+
+async def test_redis_session_events_keep_the_latest_page(redis_buses, redis_key):
+    sender, reader = redis_buses
+    key = MessageBusKeys.session_events(redis_key)
+    cap = MessageBusKeys.SESSION_REPLAY_MAX_LEN
+    count = cap + 300
+    for index in range(count):
+        await sender.log_append(key, {"sequence": index}, max_len=cap)
+    retained = await reader.log_read(key, max_count=count)
+    # AgentScope's Redis Streams MAXLEN trim is approximate.
+    assert cap <= len(retained) < count
+    assert [event["sequence"] for _, event in retained[-cap:]] == list(
+        range(count - cap, count)
+    )
+    assert await reader.log_read(key, since=retained[-1][0]) == []
+
+
+async def test_native_sse_replays_retained_events_then_receives_new_live_events():
+    async with EgisMessageBus(deployment_mode="standalone") as bus:
+        sid = "native-replay"
+        for index in range(1002):
+            await publish_session_event(bus, sid, {"sequence": index})
         response = await stream_session_events(
-            session_id="paged-replay",
+            session_id=sid,
             agent_id="agent",
             user_id="user",
             storage=SessionStorage(),
@@ -62,27 +70,9 @@ async def test_sse_replays_all_pages_before_switching_to_live_events():
             async with asyncio.timeout(2):
                 frames = [
                     json.loads((await anext(stream)).removeprefix("data: ").strip())
-                    for _ in range(count)
+                    for _ in range(1000)
                 ]
-            assert [frame["sequence"] for frame in frames] == list(range(count))
-
-
-async def test_postgres_replay_keeps_the_start_of_a_long_active_reply(storage):
-    bus = EgisMessageBus(deployment_mode="cluster", engine=storage.engine)
-    await bus.init_schema()
-    try:
-        key = MessageBusKeys.session_events("postgres-long-reply")
-        await bus.log_append(
-            key, {"type": "REPLY_START"}, max_len=MessageBusKeys.SESSION_REPLAY_MAX_LEN
-        )
-        for index in range(MessageBusKeys.SESSION_REPLAY_MAX_LEN + 1):
-            await bus.log_append(
-                key,
-                {"type": "TEXT_BLOCK_DELTA", "delta": str(index)},
-                max_len=MessageBusKeys.SESSION_REPLAY_MAX_LEN,
-            )
-        page = await bus.log_read(key, max_count=MessageBusKeys.SESSION_REPLAY_MAX_LEN)
-        assert page[0][1]["type"] == "REPLY_START"
-        assert len(await bus.log_read(key, since=page[-1][0])) == 2
-    finally:
-        await bus.aclose()
+                assert [frame["sequence"] for frame in frames] == list(range(2, 1002))
+                await publish_session_event(bus, sid, {"sequence": 1002})
+                live = json.loads((await anext(stream)).removeprefix("data: ").strip())
+                assert live["sequence"] == 1002

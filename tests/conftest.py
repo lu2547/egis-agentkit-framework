@@ -12,6 +12,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from egis_agentkit.storage import AgentKitStorage
+from egis_agentkit.storage.project._files import ProjectFileStorage
 
 
 @pytest_asyncio.fixture
@@ -39,7 +40,7 @@ async def storage(tmp_path):
         hide_parameters=True,
         connect_args={"server_settings": {"search_path": schema}},
     )
-    result = AgentKitStorage(str(url), engine)
+    result = AgentKitStorage(str(url), engine, files=ProjectFileStorage(tmp_path))
     result.test_workspace_root = tmp_path
     await result.init_schema()
     async with result:

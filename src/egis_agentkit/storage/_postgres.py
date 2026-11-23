@@ -3,8 +3,8 @@ from typing import AsyncIterator
 
 from agentscope.app.storage import AsyncSQLAlchemyStorage, ScheduleRecord
 from agentscope.app.storage._sql._mappers import _to_record
-from agentscope.app.storage._sql._tables import ScheduleRow
-from sqlalchemy import column, select
+from agentscope.app.storage._sql._tables import ScheduleRow, SessionRow, TeamRow
+from sqlalchemy import column, delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -19,6 +19,7 @@ from ._schedule import ScheduleStorage
 from ._schema import init_schema
 from ._session import SessionStorage
 from ._session_feedback import SessionFeedbackStorage
+from ._session_history import SessionHistoryStorage
 from ._skill_import import SkillImportStorage
 from ._user import UserStorage
 from ._virtual_user import VirtualUserStorage
@@ -58,14 +59,13 @@ class DefinitionWrite:
 
 
 class AgentKitStorage(AsyncSQLAlchemyStorage):
-    """Keep upstream storage intact, share an explicitly owned PG engine.
+    """PG 保存运行记录和元数据，完整消息由 NAS 历史存储提供。"""
 
-    Schema creation is an explicit deploy operation. Services coordinate
-    enterprise transactions and reuse native persistence for runtime records.
-    """
-
-    def __init__(self, url: str, engine: AsyncEngine):
+    def __init__(self, url: str, engine: AsyncEngine, *, files=None):
         self.engine = engine
+        self.history = (
+            SessionHistoryStorage(engine, files) if files is not None else None
+        )
         self.users = UserStorage(engine)
         self.personal_resources = PersonalResourceStorage(engine)
         self.expert_candidates = ExpertCandidateStorage(engine)
@@ -119,6 +119,80 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
         """从原生锁的会话 ID 读取归属。"""
         return await self.sessions.locate(session_id)
 
+    def message_history(self):
+        if self.history is None:
+            raise RuntimeError("完整消息历史需要配置 NAS 文件存储")
+        return self.history
+
+    async def upsert_message(self, user_id, session_id, msg):
+        await self.message_history().upsert(user_id, session_id, msg)
+
+    async def get_message(self, user_id, session_id, message_id):
+        messages = await self.message_history().read(user_id, session_id)
+        return next((message for message in messages if message.id == message_id), None)
+
+    async def list_messages(self, user_id, session_id, limit=50, before=None, **kwargs):
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        messages = await self.message_history().read(user_id, session_id)
+        if before is not None:
+            boundary = next(
+                (i for i, message in enumerate(messages) if message.id == before), None
+            )
+            if boundary is None:
+                return [], False
+            messages = messages[:boundary]
+        return messages[-limit:], len(messages) > limit
+
+    async def delete_message(self, user_id, session_id, message_id):
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                select(SessionRow.id)
+                .where(
+                    SessionRow.id == session_id,
+                    SessionRow.user_id == user_id,
+                )
+                .with_for_update()
+            )
+            history = self.message_history()
+            messages = await history.read(user_id, session_id, conn=conn)
+            retained = [message for message in messages if message.id != message_id]
+            if len(retained) == len(messages):
+                return False
+            await history.replace(user_id, session_id, retained, conn=conn)
+            return True
+
+    async def _delete_session_impl(self, sess, user_id, agent_id, session_id):
+        """保留原生团队级联规则；NAS 历史没有 PostgreSQL 消息表可清理。"""
+        row = await sess.scalar(
+            select(SessionRow).where(
+                SessionRow.id == session_id,
+                SessionRow.user_id == user_id,
+                SessionRow.agent_id == agent_id,
+            )
+        )
+        if row is None:
+            return False
+        if row.team_id:
+            team = await sess.scalar(
+                select(TeamRow).where(
+                    TeamRow.id == row.team_id,
+                    TeamRow.user_id == user_id,
+                )
+            )
+            if team is not None and team.session_id == session_id:
+                await self._delete_team_impl(sess, user_id, row.team_id)
+        await self.message_history().queue_deleted(
+            await sess.connection(), [(user_id, session_id)]
+        )
+        await sess.execute(
+            delete(SessionRow).where(
+                SessionRow.id == session_id,
+                SessionRow.user_id == user_id,
+            )
+        )
+        return True
+
     @asynccontextmanager
     async def project_cleanup(self, project_id):
         """锁住文件变更，并在一个事务内清理项目、原生会话和文件记录。"""
@@ -144,9 +218,9 @@ class AgentKitStorage(AsyncSQLAlchemyStorage):
     async def _native_schedules(self, *conditions):
         # The native adapter validates a different ScheduleData model.
         async with self._session() as session:
-            rows = await session.scalars(select(ScheduleRow).where(
-                column("project_id").is_(None), *conditions
-            ))
+            rows = await session.scalars(
+                select(ScheduleRow).where(column("project_id").is_(None), *conditions)
+            )
             return [_to_record(row, ScheduleRecord) for row in rows]
 
     async def get_schedule(self, user_id, schedule_id):

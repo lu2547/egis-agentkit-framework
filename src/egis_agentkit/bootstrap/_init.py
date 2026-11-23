@@ -138,6 +138,10 @@ class AgentKit:
                 phase = "skill_imports"
                 stack.push_async_callback(self._skill_imports.close)
                 await self._skill_imports.start()
+                phase = "history_cleanup"
+                history = self._storage.message_history()
+                stack.push_async_callback(history.aclose)
+                await history.start_cleanup()
                 phase = "schedules"
                 stack.push_async_callback(self._schedule_worker.close)
                 await self._schedule_worker.start()
@@ -202,12 +206,13 @@ def init_agentkit(
     if engine is None:
         engine = create_postgres_engine_from_config(postgres)
     database_url = postgres_url(postgres)
-    storage = AgentKitStorage(database_url, engine)
-    native_storage = SessionExecutionStorage(database_url, engine)
+    storage = AgentKitStorage(database_url, engine, files=files)
+    native_storage = SessionExecutionStorage(database_url, engine, files=files)
     tracing = TracingClient(snapshot.client.tracing)
     bus = SessionMessageBus(
         engine=engine,
         kafka=snapshot.client.kafka,
+        redis=snapshot.client.redis,
         tracing=tracing,
         presentation_storage=storage,
     )

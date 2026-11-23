@@ -7,12 +7,10 @@ from agentscope.app.storage._sql._mappers import _from_record, _to_record
 from agentscope.app.storage._sql._storage import _utcnow
 from agentscope.app.storage._sql._tables import (
     AgentRow,
-    MessageRow,
     ScheduleRow,
     SessionRow,
     TeamRow,
 )
-from agentscope.message import Msg
 from sqlalchemy import (
     bindparam,
     cast,
@@ -25,12 +23,13 @@ from sqlalchemy import (
     or_,
     select,
     tuple_,
+    union_all,
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
 from egis_agentkit.client._postgres import transaction_connection
-from egis_agentkit.errors import Forbidden
+from egis_agentkit.errors import Forbidden, NotFound
 from egis_agentkit.storage.model._tables import projects, reply_artifacts
 
 # 由 AgentKit 的 PostgreSQL schema 从原生会话状态生成。
@@ -45,74 +44,67 @@ class SessionStorage:
         self.engine = engine
         self.native = native
 
-    async def _get_message_cursor(self, conn, session_id, message_id):
-        return (
-            await conn.execute(
-                select(MessageRow.created_at, MessageRow.msg_id).where(
-                    MessageRow.session_id == session_id,
-                    MessageRow.msg_id == message_id,
-                )
-            )
-        ).one_or_none()
+    async def _history(self, conn, session_id):
+        user_id = await conn.scalar(
+            select(SessionRow.user_id).where(SessionRow.id == session_id)
+        )
+        if user_id is None:
+            return []
+        return await self.native.message_history().read(user_id, session_id, conn=conn)
 
     async def list_messages_through(self, session_id, message_id, *, limit):
-        """按数据库消息顺序取分支边界，预算外多取一条供 Service 拒绝。"""
+        """按 NAS 历史顺序取分支边界，预算外多取一条供 Service 拒绝。"""
         async with self.engine.connect() as conn:
-            cursor = await self._get_message_cursor(conn, session_id, message_id)
-            if cursor is None:
-                return []
-            rows = await conn.scalars(
-                select(MessageRow.payload)
-                .where(
-                    MessageRow.session_id == session_id,
-                    tuple_(MessageRow.created_at, MessageRow.msg_id)
-                    <= tuple_(cursor.created_at, cursor.msg_id),
-                )
-                .order_by(MessageRow.created_at, MessageRow.msg_id)
-                .limit(limit + 1)
+            messages = await self._history(conn, session_id)
+            boundary = next(
+                (i for i, message in enumerate(messages) if message.id == message_id),
+                None,
             )
-            return [Msg.model_validate(payload) for payload in rows]
+            return (
+                messages[: min(boundary + 1, limit + 1)] if boundary is not None else []
+            )
 
     async def get_question_before_reply(self, session_id, reply_id):
         async with self.engine.connect() as conn:
-            cursor = await self._get_message_cursor(conn, session_id, reply_id)
-            if cursor is None:
-                return None
-            payload = await conn.scalar(
-                select(MessageRow.payload)
-                .where(
-                    MessageRow.session_id == session_id,
-                    MessageRow.payload["role"].as_string() == "user",
-                    tuple_(MessageRow.created_at, MessageRow.msg_id)
-                    < tuple_(cursor.created_at, cursor.msg_id),
-                )
-                .order_by(MessageRow.created_at.desc(), MessageRow.msg_id.desc())
-                .limit(1)
+            messages = await self._history(conn, session_id)
+            boundary = next(
+                (i for i, message in enumerate(messages) if message.id == reply_id),
+                None,
             )
-            return Msg.model_validate(payload) if payload else None
+            if boundary is None:
+                return None
+            return next(
+                (
+                    message
+                    for message in reversed(messages[:boundary])
+                    if message.role == "user"
+                ),
+                None,
+            )
 
     @asynccontextmanager
     async def rewrite_before(self, user_id, record, message_id, workers):
         """截断消息及运行状态，与调用方的消息入队共用提交/回滚边界。"""
         async with self.engine.begin() as conn:
-            cursor = await self._get_message_cursor(conn, record.id, message_id)
-            if cursor is None:
-                from egis_agentkit.errors import NotFound
-
-                raise NotFound("消息不存在或不可访问")
             await conn.execute(
-                delete(MessageRow).where(
-                    MessageRow.session_id == record.id,
-                    tuple_(MessageRow.created_at, MessageRow.msg_id)
-                    >= tuple_(cursor.created_at, cursor.msg_id),
+                select(SessionRow.id)
+                .where(
+                    SessionRow.id == record.id,
+                    SessionRow.user_id == user_id,
                 )
+                .with_for_update()
             )
-            if workers:
-                await conn.execute(
-                    delete(MessageRow).where(
-                        MessageRow.session_id.in_([worker.id for worker in workers])
-                    )
-                )
+            history = self.native.message_history()
+            messages = await history.read(user_id, record.id, conn=conn)
+            boundary = next(
+                (i for i, message in enumerate(messages) if message.id == message_id),
+                None,
+            )
+            if boundary is None:
+                raise NotFound("消息不存在或不可访问")
+            await history.replace(user_id, record.id, messages[:boundary], conn=conn)
+            for worker in workers:
+                await history.replace(user_id, worker.id, [], conn=conn)
             for session in [record, *workers]:
                 session.updated_at = _utcnow()
                 row = _from_record(SessionRow, session)
@@ -127,11 +119,9 @@ class SessionStorage:
                 )
             yield conn
 
-    async def save_branch_history(
-        self, user_id, record, source_session_id, message_ids
-    ):
+    async def save_branch_history(self, user_id, record, source_session_id, messages):
         """原子发布分支上下文、原生消息和产物引用；保留原消息排序及 ID。"""
-        ids = message_ids
+        ids = [message.id for message in messages]
         # The initial branch graph is deliberately inaccessible. Publish its
         # initialized state in the same transaction as history and artifacts.
         record.state.middle_context["egis_agentkit"]["is_initialized"] = True
@@ -164,21 +154,8 @@ class SessionStorage:
                         )
                     )
                 )
-            messages = MessageRow.__table__
-            await conn.execute(
-                insert(messages).from_select(
-                    ["session_id", "msg_id", "created_at", "payload"],
-                    select(
-                        literal(record.id),
-                        messages.c.msg_id,
-                        messages.c.created_at,
-                        messages.c.payload,
-                    ).where(
-                        messages.c.session_id == source_session_id,
-                        messages.c.msg_id.in_(ids),
-                    ),
-                )
-            )
+            history = self.native.message_history()
+            await history.replace(user_id, record.id, messages, conn=conn)
             await conn.execute(
                 insert(reply_artifacts).from_select(
                     ["project_id", "session_id", "reply_id", "path", "digest"],
@@ -261,15 +238,23 @@ class SessionStorage:
 
     @staticmethod
     def main_records_query(user_id, *, limit):
-        """先用覆盖索引取得窄分页，再按主键关联原生大记录。"""
-        page = (
-            select(_SESSIONS.c.id, _SESSIONS.c.updated_at)
-            .where(
-                _SESSIONS.c.user_id == user_id,
-                _SESSIONS.c.source == literal_column("'user'"),
-                _PROJECT_ID.is_not(None),
+        """按来源取窄分页，保留普通主会话覆盖索引后再合并并关联大记录。"""
+        candidates = union_all(
+            *(
+                select(_SESSIONS.c.id, _SESSIONS.c.updated_at)
+                .where(
+                    _SESSIONS.c.user_id == user_id,
+                    _SESSIONS.c.source == literal_column(source),
+                    _PROJECT_ID.is_not(None),
+                )
+                .order_by(_SESSIONS.c.updated_at.desc())
+                .limit(limit)
+                for source in ("'user'", "'schedule'")
             )
-            .order_by(_SESSIONS.c.updated_at.desc())
+        ).subquery("main_candidates")
+        page = (
+            select(candidates)
+            .order_by(candidates.c.updated_at.desc())
             .limit(limit)
             .cte("session_page")
             .prefix_with("MATERIALIZED", dialect="postgresql")
@@ -579,10 +564,8 @@ class SessionStorage:
                 delete(TeamRow).where(tuple_(TeamRow.user_id, TeamRow.id).in_(teams))
             )
         if loaded_sessions:
-            await conn.execute(
-                delete(MessageRow).where(
-                    MessageRow.session_id.in_([sid for _, sid in loaded_sessions])
-                )
+            await self.native.message_history().queue_deleted(
+                conn, list(loaded_sessions)
             )
             await conn.execute(
                 delete(SessionRow).where(

@@ -18,7 +18,7 @@ from egis_agentkit.client.nacos import AgentKitConfig
 from egis_agentkit.client.nas_files import decode_wire, encode_wire
 from egis_agentkit.core.agent._personal_definition import DOCUMENT_FILES
 from egis_agentkit.errors import AgentKitError, Conflict, Forbidden, InvalidRequest
-from egis_agentkit.storage._files import FileStorage
+from egis_agentkit.storage._files import HISTORY_CHUNK_BYTES, FileStorage
 from egis_agentkit.storage.project._files import ProjectFileStorage
 from egis_agentkit.storage.skill._upload import SkillUploadStorage
 from egis_agentkit.storage.skill._version import SkillVersionStorage
@@ -29,6 +29,9 @@ _OPERATIONS = {
     "workspace": {
         "initialize_user_workspace",
         "read_user_texts",
+        "read_history_chunk",
+        "append_history_chunk",
+        "remove_history",
         "write_user_texts",
     },
     "project": {
@@ -61,6 +64,8 @@ def _request_limit(snapshot, scope, operation):
     binary = extra = 0
     if (scope, operation) == ("workspace", "write_user_texts"):
         extra = 6 * len(_PREFERENCE_FILES) * snapshot.agent.personal.documents.max_bytes
+    elif (scope, operation) == ("workspace", "append_history_chunk"):
+        binary = HISTORY_CHUNK_BYTES
     elif scope == "project" and operation in {"write", "update_file"}:
         binary = project.upload.max_bytes
     elif (scope, operation) == ("project", "discover_deliveries"):

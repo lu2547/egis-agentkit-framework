@@ -17,7 +17,7 @@ async def runtime_storage(storage):
         SessionExecutionStorage,
     )
 
-    async with SessionExecutionStorage("postgresql+asyncpg://unused", storage.engine) as projected:
+    async with SessionExecutionStorage("postgresql+asyncpg://unused", storage.engine, files=storage.message_history().files) as projected:
         yield projected
 
 

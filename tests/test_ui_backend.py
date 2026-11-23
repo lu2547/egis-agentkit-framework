@@ -1,4 +1,5 @@
 import pytest
+from redis_helpers import redis_buses as redis_buses, redis_config as redis_config
 from agentscope.app.message_bus import MessageBusKeys
 from test_domain import expert, identities
 
@@ -139,7 +140,7 @@ async def test_workspace_http_routes_and_project_upload_persist(storage, tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_team_delete_rejects_member_run_then_cascades(storage, tmp_path):
+async def test_team_delete_rejects_member_run_then_cascades(storage, tmp_path, redis_buses):
     from egis_agentkit.core.message_bus import EgisMessageBus
     from egis_agentkit.service.team._definition import TeamDefinition
 
@@ -174,9 +175,7 @@ async def test_team_delete_rejects_member_run_then_cascades(storage, tmp_path):
         service.files.write(alice.user_id, project_id, "owned.txt", b"owned", area=area)
     await changes.observe(alice.user_id, project_id)
     history = await changes.list_changes(project_id)
-    bus = EgisMessageBus(deployment_mode="cluster", engine=storage.engine)
-    other = EgisMessageBus(deployment_mode="cluster", engine=storage.engine)
-    await bus.init_schema()
+    bus, other = redis_buses
     key = MessageBusKeys.session_lock(worker.session_id)
     assert await other.try_lock(key)
     with pytest.raises(Conflict):

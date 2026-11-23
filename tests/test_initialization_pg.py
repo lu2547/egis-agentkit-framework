@@ -4,12 +4,13 @@ from pathlib import Path
 from uuid import uuid4
 
 import asyncpg
+import pytest
 
 from egis_agentkit.storage._message_bus import PostgresPrimitives
 
 PG_SQL = Path(__file__).resolve().parents[1] / "scripts/init/pg.sql"
 CLUSTER_TABLES = {
-    "agents", "credentials", "messages", "schedules", "sessions", "teams",
+    "agents", "credentials", "schedules", "sessions", "teams",
     "ak_users", "ak_groups", "ak_agent_definition_summary",
     "ak_agent_definition_detail", "ak_agent_personal_resources", "ak_agent_invite_candidates",
     "ak_agent_remote_runs", "ak_team_definition_summary",
@@ -17,8 +18,8 @@ CLUSTER_TABLES = {
     "ak_approve", "ak_skill_imports", "ak_skill_summary", "ak_skill_detail",
     "ak_virtual_users", "ak_mcp_credentials", "ak_projects", "ak_schedule_runs",
     "ak_project_file_changes", "ak_project_file_fingerprints",
-    "ak_project_reply_artifacts", "ak_feedback", "ak_bus_keys", "ak_bus_entries",
-    "ak_bus_registry", "ak_bus_leases", "ak_bus_broadcast_payloads",
+    "ak_project_reply_artifacts", "ak_feedback", "ak_session_history", "ak_session_history_gc", "ak_bus_keys",
+    "ak_bus_entries", "ak_bus_registry", "ak_bus_leases", "ak_bus_broadcast_payloads",
 }
 
 
@@ -110,6 +111,48 @@ async def test_pg_sql_initializes_cluster_schema_and_rejects_rerun(storage):
             assert await pg.fetchval(
                 "SELECT project_id FROM sessions WHERE id = 'first-session'"
             ) == "first-project"
+        finally:
+            if pg.is_in_transaction():
+                await pg.execute("ROLLBACK")
+            await pg.execute(f'SET search_path TO "{original}"')
+            await pg.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+async def test_nas_history_release_preserves_old_messages_and_bus_state(storage):
+    release = PG_SQL.parents[1] / "releases/1.0.3/nas-history.sql"
+    assert release.is_file()
+    schema = "ak_upgrade_test_" + uuid4().hex
+    async with storage.engine.connect() as conn:
+        raw = await conn.get_raw_connection()
+        pg = raw.driver_connection
+        original = await pg.fetchval("SELECT current_schema()")
+        await pg.execute(f'CREATE SCHEMA "{schema}"')
+        try:
+            await pg.execute(f'SET search_path TO "{schema}"')
+            await pg.execute("""
+                CREATE TABLE sessions (id VARCHAR(255) PRIMARY KEY);
+                INSERT INTO sessions VALUES ('previous');
+                CREATE TABLE messages (payload TEXT);
+                INSERT INTO messages VALUES ('existing message');
+                CREATE TABLE ak_bus_keys (key TEXT);
+                INSERT INTO ak_bus_keys VALUES ('existing key');
+            """)
+            script = release.read_text()
+            await pg.execute(script)
+            assert await pg.fetchval("SELECT count(*) FROM ak_session_history") == 0
+            await pg.execute("INSERT INTO ak_session_history VALUES ('previous', 'owner', 42)")
+            first = await pg.fetchval("SELECT nextval('ak_session_history_write_fence')")
+            await pg.execute(script)
+            assert await pg.fetchval("SELECT nextval('ak_session_history_write_fence')") > first
+            assert await pg.fetchval("SELECT committed_bytes FROM ak_session_history") == 42
+            assert await pg.fetchval("SELECT payload FROM messages") == "existing message"
+            assert await pg.fetchval("SELECT key FROM ak_bus_keys") == "existing key"
+            with pytest.raises(asyncpg.CheckViolationError):
+                await pg.execute("UPDATE ak_session_history SET committed_bytes = -1")
+            with pytest.raises(asyncpg.ForeignKeyViolationError):
+                await pg.execute("INSERT INTO ak_session_history VALUES ('missing', 'owner', 0)")
+            await pg.execute("DELETE FROM sessions WHERE id = 'previous'")
+            assert await pg.fetchval("SELECT count(*) FROM ak_session_history") == 0
         finally:
             if pg.is_in_transaction():
                 await pg.execute("ROLLBACK")

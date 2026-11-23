@@ -2,9 +2,9 @@
 
 AgentScope 的配置管理与企业增强框架。首版已实现，不修改 AgentScope service 源码。
 
-首次环境初始化见 [scripts/init](scripts/init/README.md)：面向企业已提供的 NAS、Nacos、Redis、Kafka、PG，包含目录初始化、配置发布、Topic 创建和业务建表 SQL；脚本不安装或启动基础设施。
+首次环境初始化见 [scripts/init](scripts/init/README.md)：面向企业已提供的 NAS、Nacos、Redis、Kafka、PG，包含目录初始化、业务建表、Kafka Topic 创建、Redis 连接检查和配置发布；脚本不安装或启动基础设施。
 
-已有环境的增量发布见 [scripts/releases](scripts/releases/README.md)。按版本归档 SQL、Nacos 和镜像变更及执行顺序；[1.0.3](scripts/releases/1.0.3/README.md) 包含当前数据库增量、配置核对、SDK 补丁及部署顺序，功能清单见 [Release Notes](scripts/releases/1.0.3/release-notes.md)。
+已有环境的增量发布见 [scripts/releases](scripts/releases/README.md)。按版本归档 SQL、Nacos 和镜像变更及执行顺序；[1.0.3](scripts/releases/1.0.3/README.md) 包含当前数据库增量、配置核对及部署顺序，功能清单见 [Release Notes](scripts/releases/1.0.3/release-notes.md)。
 
 数据库支持 Nacos `agentkit.client.postgres.connection.mode: key | cyberark`：key 使用 password 字段，cyberark 使用 CCP REST 获取新建连接所需密码。日志配置位于 `agentkit.logging`；Phoenix 导出位于 `agentkit.client.tracing`，启动后由原生 TracingMiddleware 记录回复、模型和工具调用，Framework 管理导出和关闭。配置示例及运维步骤见上述初始化说明。
 
@@ -22,7 +22,7 @@ App CLI 使用 Python `logging.config.dictConfig` 统一配置 AgentKit、AgentS
 | `core/` | Agent、Project、Workspace 自有能力；Agent 定义及原生对象装配 |
 | `storage/` | 企业持久化和原生 SQL Storage 复用 |
 | `extension/` | AgentScope 扩展实现，包括中间件、工作区、远程专家和消息总线 |
-| `client/` | PostgreSQL 连接池、Nacos 配置、Kafka 通信及远程 Agent 协议 |
+| `client/` | PostgreSQL 连接池、Nacos 配置、Kafka 通信、NAS 文件服务及远程 Agent 协议 |
 | `bootstrap/` | 对象创建、依赖装配和生命周期 |
 
 App 通过具名 `AgentKitServices` 调用业务服务。聊天循环、团队通信、消息事件、HITL、SSE 和模型调用继续使用 AgentScope。
@@ -41,9 +41,9 @@ AgentScope 运行时最低版本为 2.0.12。原生内置工具使用 SDK 版本
 
 SSE `chat_queue_changed` 同步队列快照，`chat_input_injected` 表示实际接收，`chat_input_steer_failed` 保留失败项供修改重试。本轮未消费的引导退回普通待发队列；`chat_input_started` 表示队列消息开始下一轮执行。消息 ID、文件引用和批注通过展示投影保留在原生消息历史和事件回放中，不增加第二条投递链路。
 
-集群模式使用 PostgreSQL 消息总线保存队列，支持跨实例和刷新恢复，没有新增表或 Kafka Topic。`agentkit.session.steering` 配置 `maxBatchSize`、`maxMessageBytes`、`maxTextLength`，输入区通过 `/manager/runtime-options` 读取。standalone 使用原生内存总线，队列不会跨服务重启保留。
+集群模式保留原生 FIFO 的投递链路。待处理输入、注册信息和租约保存在 PostgreSQL，Kafka 处理跨节点唤醒和广播。多节点通过 `agentkit.client.redis` 指向同一 Redis 回放库。`agentkit.session.steering` 配置 `maxBatchSize`、`maxMessageBytes`、`maxTextLength`，输入区通过 `/manager/runtime-options` 读取。standalone 使用原生内存总线。
 
-长回复重放：企业消息总线保留尚未被消息检查点覆盖的完整事件，下一条回复开始时清理已落库的前缀。不能按固定 1000 条裁掉正在生成的回复开头。当前同时依赖仓库内 AgentScope 会话 SSE 路由的分页修复（`app/_router/_session.py`），重放读完所有页后才切到实时订阅；发布时需一并构建这份依赖，不能替换成未包含修复的同名发行包。通过 `tests/test_session_replay.py` 验证超过单页长度的重放与 PostgreSQL 保留规则。
+会话临时事件使用 Redis Streams，按消息检查点裁剪，`client.redis.retentionSeconds` 控制到期时间。完整原始消息及其元数据保存在 `{workspace.runtime.root}/user/{uid}/session/history/{sid}/messages.jsonl`，供历史、编辑和分支接口使用。PostgreSQL 保存原生会话状态，`ak_session_history` 每个有历史的会话记录用户归属及已提交字节数。
 
 专家定义可以绑定已授权的 Skill、MCP 和平台工具。第三方专家通过 HTTP 或 WebSocket 执行。
 
@@ -67,7 +67,7 @@ Agent 当前实现见 [Agent 管理与定义](./docs/Agent管理与定义.md)，
 
 首次部署由部署流程或 DBA 执行 [PG 初始化脚本](scripts/init/pg.sql)。数据库结构变更、数据清理和技能目录维护统一由部署脚本负责；应用 CLI 仅保留服务启动与指定用户的管理员授权。
 
-启动和真实联调见 [App](../egis-agentkit-app/README.md) 与 [实施记录](../egis-agentkit-app/docs/实施记录.md)。产品包版本为 1.0.3，配套本地 AgentScope 2.0.12 源码及会话 SSE 重放分页修复；API 与沙箱镜像使用同一份 SDK 制品。发布配置基线及操作步骤见 [1.0.3 发布说明](scripts/releases/1.0.3/README.md)。
+启动和真实联调见 [App](../egis-agentkit-app/README.md) 与 [实施记录](../egis-agentkit-app/docs/实施记录.md)。产品包版本为 1.0.3，配套官方原版 AgentScope 2.0.12；API 与沙箱镜像保持相同 SDK 版本。发布配置基线及操作步骤见 [1.0.3 发布说明](scripts/releases/1.0.3/README.md)。
 
 项目共享工作空间与删除规则见 [文件生命周期](docs/session-files.md)。
 
@@ -78,7 +78,7 @@ OpenSandbox Docker 工作区通过 `EgisSandboxManager` 接入。Manager 实现�
 沙箱配置统一使用 `agentkit.workspace.runtime.mode: pks` 和同级 `sandbox` 节点。`root` 是唯一的 NAS 持久根目录，沙箱执行宿主机与实际处理文件的 Linux 服务或 Agent 节点须通过同一绝对路径访问同一份 NAS。Workspace 的 `workdir` 固定派生为 `{root}/user/{uid}`，不再单独配置 `/workspace`；Workspace Backend 默认目录、提示词和用户目录挂载目标均使用这个用户路径。沙箱直接挂载该根目录下的当前用户项目，文件无需复制。当前开发通信仍由 `OpenSandboxClient` 对接已有 SDK；开发环境需安装 OpenSandbox extra，服务端的 `storage.allowed_host_paths` 必须包含 `root`。`apiKeyEnv` 引用部署环境变量，不把密钥写进 Nacos。公司 PKS 接入通过 `init_agentkit(..., sandbox_client_factory=...)` 注入实际 Client，配置命名调整不代表已经实现公司通信协议。修改镜像和挂载后需要重启 API；已有沙箱的挂载不会自动改变，需在停止其执行后重建实例，NAS 文件保留。Manager、Workspace 直接实现原生通用基类，Backend 在 Core，提供方 SDK 仅位于 Client。
 
 
-`agentkit.workspace.files.win` 默认是 `false`，用于已挂载 NAS 的 Agent 节点。原生 Windows Agent 将 `win` 设为 `true`，并配置 `endpoint` 指向 Linux 文件服务。个人偏好、项目文件和 Skill 由该服务操作同一份 NAS，`runtime.root` 仍填写 Linux 上的 NAS 根目录。文件服务通过 `tokenEnv` 从部署环境读取两端共享的服务凭据。HTTP 模式下将 `agentkit.project.memory.isEnabled` 设为 `false`，因为原生 ReMe 直接访问 Agent 宿主的目录。启动方式见 [App 部署说明](../egis-agentkit-app/README.md)。
+`agentkit.workspace.files.win` 默认是 `false`，用于已挂载 NAS 的 Agent 节点。原生 Windows Agent 将 `win` 设为 `true`，并配置 `endpoint` 指向 Linux 文件服务。先部署支持历史读写的同版本 NAS 服务，再启动 API/Worker。个人偏好、会话历史、项目文件和 Skill 由该服务操作同一份 NAS，`runtime.root` 仍填写 Linux 上的 NAS 根目录。文件服务通过 `tokenEnv` 从部署环境读取两端共享的服务凭据。HTTP 模式下将 `agentkit.project.memory.isEnabled` 设为 `false`，因为原生 ReMe 直接访问 Agent 宿主的目录。启动方式见 [App 部署说明](../egis-agentkit-app/README.md)。
 
 工具通过 EgisSandboxBackend 调用注入的沙箱 Client 执行；MCP 通过容器内原生网关连接，连接配置不写入 `.mcp`，网关临时内容只允许经过启动时验证为 tmpfs 的 `gatewayTmpDir`；技能在激活后暂存完整再安装，完成的同一内容直接复用，授权失效会移除运行副本。持久激活记录继续校验原资源内容。MCP 中的 `localhost` 指沙箱自身；访问宿主开发服务应使用沙箱可达地址。
 

@@ -9,6 +9,7 @@ import pytest_asyncio
 from agentscope.app.message_bus import MessageBusKeys
 from aiokafka.errors import CommitFailedError
 from aiokafka.structs import TopicPartition
+from redis_helpers import redis_config as redis_config
 from test_message_bus import pg_engine as pg_engine
 
 from egis_agentkit.core.message_bus import EgisMessageBus
@@ -18,11 +19,12 @@ WAKE_SIGNAL = MessageBusKeys.wakeup_signal()
 
 
 @pytest_asyncio.fixture
-async def kafka_buses(pg_engine):
+async def kafka_buses(pg_engine, redis_config):
     prefix = "egis-test-" + uuid4().hex
     kwargs = dict(
         deployment_mode="cluster",
         engine=pg_engine,
+        redis=redis_config,
         topic_prefix=prefix,
         consumer_group=prefix + "-workers",
         buffer_size=5,
@@ -294,7 +296,8 @@ async def test_large_native_image_event_and_concurrent_small_events_across_nodes
     from agentscope.app._bus_ops import publish_session_event
 
     a, b = kafka_buses
-    key = MessageBusKeys.session_events("large-native-image")
+    sid = "test-large-native-" + uuid4().hex
+    key = MessageBusKeys.session_events(sid)
     # More than a 20 MiB JPEG after base64 expansion, under the 32 MiB bound.
     event = {
         "type": "tool_result",
@@ -313,7 +316,7 @@ async def test_large_native_image_event_and_concurrent_small_events_across_nodes
     try:
         await asyncio.wait_for(asyncio.gather(*(r.wait() for r in ready)), 5)
         sending = asyncio.create_task(
-            publish_session_event(a, "large-native-image", event)
+            publish_session_event(a, sid, event)
         )
         # Start small events while the large event's PG body/send is in flight.
         async with asyncio.timeout(10):
@@ -338,3 +341,4 @@ async def test_large_native_image_event_and_concurrent_small_events_across_nodes
         )
         for subscription in subscriptions:
             await subscription.aclose()
+        await a.log_trim(key)

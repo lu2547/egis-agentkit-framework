@@ -1,8 +1,10 @@
 """编辑重发用户消息：只截断对话与执行状态，不回退项目文件。"""
 
+import json
 import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
+from uuid import uuid4
 
 from agentscope.app._bus_ops import (
     delete_chat_input,
@@ -20,6 +22,7 @@ from egis_agentkit.client.nacos._settings import SessionBranchConfig
 from egis_agentkit.core.message_bus import EgisMessageBus
 from egis_agentkit.errors import Conflict, Forbidden, InvalidRequest, NotFound
 from egis_agentkit.service._reply import build_branch_context
+from egis_agentkit.service.session._rewrite_notice import publish_rewrite_notice
 from egis_agentkit.service.session._steering_projection import (
     steering_presentation_namespace,
 )
@@ -64,8 +67,8 @@ class MessageRewriteService:
         return workers
 
     @staticmethod
-    async def _clear_memory_runtime(bus, session_ids):
-        """单机状态在数据库成功提交后才清理，拒绝/入队失败不改变原现场。"""
+    async def _clear_rewrite_runtime(bus, session_ids):
+        """PG 历史指针提交后清理旧运行数据，保留鉴权及新入队的输入。"""
         for sid in session_ids:
             await bus.log_trim(MessageBusKeys.session_events(sid))
             await bus.queue_delete(MessageBusKeys.inbox(sid))
@@ -149,6 +152,15 @@ class MessageRewriteService:
                     raise Conflict(
                         "对话或受邀专家正在等待工具确认，请先处理或停止后再编辑消息"
                     )
+            shared_runtime = isinstance(bus, EgisMessageBus) and bus.delegate is None
+            session_ids = [session_id, *[worker.id for worker in workers]]
+            replay_tails = {}
+            if shared_runtime:
+                await locks.enter_async_context(
+                    bus.acquire_lock(bus.rewrite_notice_lock(session_id), ttl_secs=30)
+                )
+                for sid in session_ids:
+                    replay_tails[sid] = await bus.capture_replay_tail(sid)
             original = await tasks.storage.get_message(
                 user.user_id, session_id, message_id
             )
@@ -174,16 +186,15 @@ class MessageRewriteService:
             for worker in workers:
                 self._reset_state(worker, [])
             try:
-                session_ids = [session_id, *[worker.id for worker in workers]]
-                shared_runtime = (
-                    isinstance(bus, EgisMessageBus) and bus.delegate is None
-                )
                 async with tasks.storage.sessions.rewrite_before(
                     user.user_id, session, message_id, workers
                 ) as conn:
                     yield receipt
                     if not receipt.queue_item_id or receipt.replacement is None:
                         raise RuntimeError("编辑后的消息未进入队列")
+                    await tasks.storage.message_history().upsert(
+                        user.user_id, session_id, receipt.replacement, conn=conn
+                    )
                     if shared_runtime:
                         await bus.clear_rewrite_runtime(
                             conn,
@@ -193,35 +204,73 @@ class MessageRewriteService:
                                 for sid in session_ids
                             ],
                         )
+                        notice = json.dumps(
+                            {
+                                "user_id": user.user_id,
+                                "message_id": message_id,
+                                "retained_message_ids": receipt.retained_message_ids,
+                                "event_id": uuid4().hex,
+                            }
+                        )
+                        for sid in session_ids:
+                            await bus.stage_rewrite_replay(
+                                conn,
+                                sid,
+                                replay_tails[sid],
+                                notice if sid == session_id else None,
+                            )
             except BaseException:
                 if receipt.queue_item_id:
                     await delete_chat_input(
                         bus, user.user_id, session_id, agent_id, receipt.queue_item_id
                     )
                 raise
-            if not shared_runtime:
-                await self._clear_memory_runtime(bus, session_ids)
+            if shared_runtime:
+                for sid in session_ids:
+                    try:
+                        await bus.log_trim(
+                            MessageBusKeys.session_events(sid),
+                            before_id=replay_tails[sid],
+                        )
+                    except Exception:
+                        logger.exception(
+                            "message.rewrite_trim_failed",
+                            extra={"context": {"session_id": sid}},
+                        )
+            else:
+                await self._clear_rewrite_runtime(bus, session_ids)
             # 其他已打开页面使用服务器的保留边界同步，不能继续展示旧问题和后续回答。
             try:
-                await publish_session_event(
-                    bus,
-                    session_id,
-                    CustomEvent(
-                        name="chat_history_rewritten",
-                        value={
-                            "message_id": message_id,
-                            "input": receipt.replacement.model_dump(mode="json"),
-                            "retained_message_ids": receipt.retained_message_ids,
-                        },
-                    ).model_dump(mode="json"),
-                )
+                if shared_runtime:
+                    await publish_rewrite_notice(
+                        bus, tasks.storage, session_id, lock_held=True
+                    )
+                else:
+                    await publish_session_event(
+                        bus,
+                        session_id,
+                        CustomEvent(
+                            name="chat_history_rewritten",
+                            value={
+                                "message_id": message_id,
+                                "input": receipt.replacement.model_dump(mode="json"),
+                                "retained_message_ids": receipt.retained_message_ids,
+                            },
+                        ).model_dump(mode="json"),
+                    )
             except Exception:
                 logger.exception(
                     "message.rewrite_notification_failed",
                     extra={"context": {"session_id": session_id}},
                 )
         # 入队时持有运行/派发锁，显式唤醒避免等下一次后台扫描。
-        await nudge_chat_inputs(bus, user.user_id, session_id, agent_id)
+        try:
+            await nudge_chat_inputs(bus, user.user_id, session_id, agent_id)
+        except Exception:
+            logger.exception(
+                "message.rewrite_wakeup_failed",
+                extra={"context": {"session_id": session_id}},
+            )
         logger.info(
             "message.rewritten",
             extra={

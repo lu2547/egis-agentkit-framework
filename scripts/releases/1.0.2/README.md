@@ -29,7 +29,7 @@ App 安装依赖包含 Framework 的 `cluster,memory` extra，使已开启的项
 | [02_verify_indexes.sql](02_verify_indexes.sql) | 只读核验 3 个新索引有效、2 个旧索引不存在，并输出实际定义 |
 | [nacos.md](nacos.md) | 本次精确的配置修改、删除项及重启说明；SQL 优化本身没有新增配置项 |
 | [nacos-diff.md](nacos-diff.md) | 与正式标签 1.0.1 逐字段比较的完整示例配置差异，包含此前累计的配置调整 |
-| 依赖及沙箱镜像 | API 与沙箱网关使用本次验证的 AgentScope 2.0.12 源码制品，包含会话 SSE 重放分页修复 |
+| 依赖及沙箱镜像 | API 与沙箱网关统一使用官方原版 AgentScope 2.0.12 |
 
 **本轮 SQL 优化**不新增表、列、Kafka Topic 或 NAS 目录。本目录的索引脚本面向已经具备当前企业表结构的环境，尤其是 `sessions.project_id` 生成列、项目文件变更表和资源授权表。正式标签 1.0.1 与当前结构之间还累计过技能汇总/明细、虚拟用户、候选专家及技能导入审核等变化；本轮索引脚本不冒充这些历史结构的数据迁移。新项目首次部署直接用当前 `scripts/init/pg.sql`；已有环境缺少基线时先核对实际结构，再准备对应的数据迁移步骤，不能对有数据的 schema 重跑首次建表 SQL。
 
@@ -90,7 +90,7 @@ PYTHONPATH=src python scripts/build_workspace_image.py \
   --agentscope-source ../../harness/agentscope
 ```
 
-API 和镜像中的 SDK 均应包含同一份重放修复；仅安装同名但未包含修复的官方 2.0.12 包不满足本次发布要求。记录实际 wheel/源码提交及镜像摘要。
+API 和镜像统一使用官方原版 AgentScope 2.0.12，记录实际 wheel/官方源码提交及镜像摘要。会话事件保留和重放沿用原生最近 1000 条策略。
 
 ## 回退说明
 

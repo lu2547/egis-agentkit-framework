@@ -128,6 +128,7 @@ def _fixed_components(snapshot: AgentKitConfig) -> dict:
         "agentkit.connector.oauth.credentialKeyEnv": snapshot.connector.oauth.credential_key_env,
         "agentkit.client.postgres": snapshot.client.postgres,
         "agentkit.client.kafka": snapshot.client.kafka,
+        "agentkit.client.redis": snapshot.client.redis,
         "agentkit.client.tracing": snapshot.client.tracing,
         "agentkit.logging": snapshot.logging,
         "agentkit.user.identity": snapshot.user.identity,

@@ -1,7 +1,10 @@
 import time
+from dataclasses import replace
+from uuid import uuid4
 
 from agentscope.app.message_bus import InMemoryMessageBus
 from pydantic import SecretStr
+from redis_helpers import redis_config as redis_config
 
 from egis_agentkit.core.session._context import VerifiedChatAuthorization
 from egis_agentkit.service.session._authorization import ChatAuthorizationStore
@@ -43,12 +46,25 @@ async def test_expired_authorization_cannot_be_loaded_or_extended(monkeypatch):
     assert await store.load("alice", "agent", "session") is None
 
 
-async def test_cluster_worker_can_read_the_credentials_from_another_process_bus(storage):
-    sender = SessionMessageBus(deployment_mode="cluster", engine=storage.engine)
-    worker = SessionMessageBus(deployment_mode="cluster", engine=storage.engine)
+async def test_cluster_worker_can_read_the_credentials_from_another_process_bus(
+    storage, redis_config
+):
+    kwargs = {
+        "deployment_mode": "cluster",
+        "engine": storage.engine,
+        "redis": redis_config,
+    }
+    sender, worker = SessionMessageBus(**kwargs), SessionMessageBus(**kwargs)
     await sender.init_schema()
-    await ChatAuthorizationStore(sender).remember(authorization())
-    loaded = await ChatAuthorizationStore(worker).load("alice", "agent", "session")
-    assert loaded.access_token.get_secret_value() == "verified-test-token"
-    await worker.purge_sessions(["session"])
-    assert await ChatAuthorizationStore(sender).load("alice", "agent", "session") is None
+    await worker._start_replay()
+    sid = "test-chat-auth-" + uuid4().hex
+    try:
+        writer, reader = ChatAuthorizationStore(sender), ChatAuthorizationStore(worker)
+        await writer.remember(replace(authorization(), session_id=sid))
+        loaded = await reader.load("alice", "agent", sid)
+        assert loaded.access_token.get_secret_value() == "verified-test-token"
+        await worker.purge_sessions([sid])
+        assert await writer.load("alice", "agent", sid) is None
+    finally:
+        await worker.aclose()
+        await sender.aclose()

@@ -7,6 +7,7 @@ import time
 import httpx
 import pytest
 import pytest_asyncio
+from redis_helpers import redis_buses as redis_buses, redis_config as redis_config
 from agentscope.app._bus_ops import (
     enqueue_chat_input,
     finish_active_chat_reply,
@@ -214,10 +215,8 @@ async def test_native_steering_waits_for_real_injection_and_rejects_stale_reply(
     await bus.unlock(MessageBusKeys.session_lock(sid))
 
 
-async def test_postgres_steering_multiple_inputs_survive_new_bus_and_cleanup(storage):
-    bus = EgisMessageBus(deployment_mode="cluster", engine=storage.engine)
-    other = EgisMessageBus(deployment_mode="cluster", engine=storage.engine)
-    await bus.init_schema()
+async def test_postgres_steering_multiple_inputs_survive_new_bus_and_cleanup(storage, redis_buses):
+    bus, other = redis_buses
     bus.publish = other.publish = AsyncMock()
     sid, aid, uid = "durable-session", "agent", "alice"
     for text in ("预算", "配色", "不要改原文"):

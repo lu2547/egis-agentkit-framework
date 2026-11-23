@@ -5,6 +5,7 @@ import json
 import traceback
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -12,6 +13,7 @@ from agentscope.app._bus_ops import publish_session_event
 from agentscope.app.message_bus import MessageBusKeys
 from aiokafka.errors import MessageSizeTooLargeError
 from aiokafka.structs import TopicPartition
+from redis_helpers import redis_config as redis_config
 from sqlalchemy import text
 from sqlalchemy.exc import StatementError
 from test_message_bus import pg_engine as pg_engine
@@ -66,13 +68,15 @@ class BroadcastReader:
 
 
 @pytest_asyncio.fixture
-async def limited_buses(pg_engine):
+async def limited_buses(pg_engine, redis_config):
     broker = LimitedBroker()
     buses = [
-        EgisMessageBus(deployment_mode="cluster", engine=pg_engine) for _ in range(2)
+        EgisMessageBus(deployment_mode="cluster", engine=pg_engine, redis=redis_config)
+        for _ in range(2)
     ]
     await buses[0].init_schema()
     for bus in buses:
+        await bus._start_replay()
         transport = KafkaTransport(bus._pg, **bus._kafka_args)
         bus._transport = transport
         transport.producer = broker
@@ -95,7 +99,8 @@ async def test_native_large_image_event_is_delivered_in_order_and_replays(
 ):
     """Removing PG offload must fail at the producer's actual byte-size check."""
     a, b, broker = limited_buses
-    key = MessageBusKeys.session_events("large-image")
+    sid = "test-large-image-" + uuid4().hex
+    key = MessageBusKeys.session_events(sid)
     event = {
         "type": "tool_result",
         "content": [
@@ -108,7 +113,7 @@ async def test_native_large_image_event_is_delivered_in_order_and_replays(
         while any(key not in bus._transport._subscriptions for bus in (a, b)):
             await asyncio.sleep(0)
     try:
-        entry_id = await publish_session_event(a, "large-image", event)
+        entry_id = await publish_session_event(a, sid, event)
         await a.publish(key, {"after": True})
         results = await asyncio.wait_for(asyncio.gather(*waiting), 2)
         assert results == [{**event, "_entry_id": entry_id}] * 2
@@ -125,6 +130,7 @@ async def test_native_large_image_event_is_delivered_in_order_and_replays(
         await asyncio.gather(*waiting, return_exceptions=True)
         for subscription in subscriptions:
             await subscription.aclose()
+        await a.log_trim(key)
 
 
 async def test_small_broadcast_stays_inline_without_payload_storage(limited_buses):

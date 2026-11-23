@@ -19,7 +19,6 @@ async def test_schema_creates_only_native_tables_required_by_workbench(storage):
     assert set(names) == set(tables.metadata.tables) | {
         "agents",
         "credentials",
-        "messages",
         "schedules",
         "sessions",
         "teams",

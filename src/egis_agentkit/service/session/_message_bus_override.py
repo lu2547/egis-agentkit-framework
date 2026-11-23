@@ -6,8 +6,15 @@
 - publish 观察原生失败终态，保持原消息及传输方式不变。
 """
 
+import asyncio
 import logging
-from contextlib import AsyncExitStack, aclosing, asynccontextmanager, nullcontext
+from contextlib import (
+    AsyncExitStack,
+    aclosing,
+    asynccontextmanager,
+    nullcontext,
+    suppress,
+)
 
 from agentscope.app.message_bus import MessageBusKeys
 from agentscope.event import EventType, ReplyFinishedReason
@@ -23,6 +30,7 @@ from egis_agentkit.core.session._context import (
 from egis_agentkit.errors import AgentKitError
 from egis_agentkit.service.session._authorization import ChatAuthorizationStore
 from egis_agentkit.service.session._preparation import SessionPreparationService
+from egis_agentkit.service.session._rewrite_notice import publish_rewrite_notice
 from egis_agentkit.service.session._steering_projection import SteeringPresentation
 from egis_agentkit.service.team._collaboration import collaborators
 from egis_agentkit.service.team._progress import OBSERVED_EVENTS, CollaboratorProgress
@@ -45,6 +53,78 @@ class SessionMessageBus(EgisMessageBus):
         )
         self.tracing = tracing
         self.collaborator_progress = CollaboratorProgress(self)
+        self._rewrite_notifier = None
+
+    async def __aenter__(self):
+        await super().__aenter__()
+        if (
+            self.delegate is None
+            and self.steering_presentation is not None
+            and self._rewrite_notifier is None
+        ):
+            self._rewrite_notifier = asyncio.create_task(self._retry_rewrite_notices())
+        return self
+
+    async def aclose(self):
+        if self._rewrite_notifier is not None:
+            self._rewrite_notifier.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._rewrite_notifier
+            self._rewrite_notifier = None
+        await super().aclose()
+
+    async def _retry_rewrite_notices(self):
+        while True:
+            try:
+                notices = await self.registry_getall(self.rewrite_notice_namespace())
+                for sid in notices:
+                    try:
+                        await publish_rewrite_notice(
+                            self, self.steering_presentation.storage, sid
+                        )
+                    except Exception:
+                        logger.exception(
+                            "message.rewrite_notification_retry_failed",
+                            extra={"context": {"session_id": sid}},
+                        )
+            except Exception:
+                logger.exception("message.rewrite_notification_scan_failed")
+            await asyncio.sleep(1)
+
+    async def _publish_rewrite_before_run(self, session_id):
+        """先投递历史边界，再开始新回复，避免迟到通知抹掉新回复。"""
+        while (
+            await self.registry_get(self.rewrite_notice_namespace(), session_id)
+            is not None
+        ):
+            try:
+                await publish_rewrite_notice(
+                    self, self.steering_presentation.storage, session_id
+                )
+            except Exception:
+                logger.exception(
+                    "message.rewrite_notification_waiting",
+                    extra={"context": {"session_id": session_id}},
+                )
+                await asyncio.sleep(1)
+
+    async def log_read(self, key, since=None, max_count=100):
+        prefix = MessageBusKeys.session_events("")
+        if (
+            self.delegate is None
+            and self.steering_presentation is not None
+            and key.startswith(prefix)
+        ):
+            try:
+                await publish_rewrite_notice(
+                    self, self.steering_presentation.storage, key[len(prefix) :]
+                )
+            except Exception:
+                logger.exception(
+                    "message.rewrite_notification_read_failed",
+                    extra={"context": {"session_id": key[len(prefix) :]}},
+                )
+        return await super().log_read(key, since=since, max_count=max_count)
 
     async def purge_sessions(self, session_ids, *, extra_registry_namespaces=()):
         session_ids = tuple(session_ids)
@@ -182,6 +262,12 @@ class SessionMessageBus(EgisMessageBus):
                     await lifetime.enter_async_context(
                         super().acquire_lock(key, ttl_secs=ttl_secs)
                     )
+                if (
+                    key.startswith(prefix)
+                    and self.delegate is None
+                    and self.steering_presentation is not None
+                ):
+                    await self._publish_rewrite_before_run(key[len(prefix) :])
                 async with self._session_scope(key, prefix, scoped):
                     yield
 

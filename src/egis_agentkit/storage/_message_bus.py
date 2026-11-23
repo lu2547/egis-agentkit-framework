@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from uuid import uuid4
 
 from agentscope.app.message_bus import MessageBusKeys
@@ -104,8 +104,8 @@ class PostgresPrimitives:
                 await conn.execute(text(statement))
 
     @asynccontextmanager
-    async def _key(self, kind, key):
-        async with self.engine.begin() as conn:
+    async def _key(self, kind, key, *, conn=None):
+        async with (self.engine.begin() if conn is None else nullcontext(conn)) as conn:
             args = {"kind": kind, "key": key}
             await conn.execute(
                 text("""INSERT INTO ak_bus_keys(kind,key)
@@ -326,7 +326,7 @@ class PostgresPrimitives:
     async def clear_rewrite_runtime(
         self, conn, session_ids, *, extra_registry_namespaces=()
     ):
-        """在历史截断事务内清理旧事件/收件箱，保留凭据及新入队消息。"""
+        """在历史截断事务内清理收件箱和运行索引，保留凭据及新入队消息。"""
         session_ids = list(dict.fromkeys(session_ids))
         namespaces = list(extra_registry_namespaces)
         for sid in session_ids:
@@ -340,11 +340,9 @@ class PostgresPrimitives:
         await conn.execute(
             text("""
             DELETE FROM ak_bus_entries WHERE
-                (kind='log' AND key=ANY(CAST(:logs AS text[]))) OR
-                (kind='queue' AND key=ANY(CAST(:inboxes AS text[])))
+                kind='queue' AND key=ANY(CAST(:inboxes AS text[]))
         """),
             {
-                "logs": [MessageBusKeys.session_events(sid) for sid in session_ids],
                 "inboxes": [MessageBusKeys.inbox(sid) for sid in session_ids],
             },
         )
@@ -359,7 +357,7 @@ class PostgresPrimitives:
                 "sessions": session_ids,
             },
         )
-        # 日志/收件箱的序号墓碑保留，重连游标不会复用旧条目 ID。
+        # 保留收件箱序号，后续信号不会复用旧条目 ID。
         await conn.execute(
             text("""
             DELETE FROM ak_bus_keys WHERE kind='registry'
@@ -368,8 +366,10 @@ class PostgresPrimitives:
             {"namespaces": namespaces},
         )
 
-    async def purge_sessions(self, session_ids, *, extra_registry_namespaces=()):
-        """批量清理会话数据，保留队列/日志游标墓碑及所有正在持有的租约。"""
+    async def purge_sessions(
+        self, session_ids, *, extra_registry_namespaces=(), extra_field_namespaces=()
+    ):
+        """批量清理会话队列和索引，保留队列序号及所有正在持有的租约。"""
         session_ids = sorted(set(session_ids))
         if not session_ids:
             return
@@ -377,6 +377,7 @@ class PostgresPrimitives:
         field_namespaces = {
             MessageBusKeys.chat_input_inflight_registry(),
             MessageBusKeys.chat_active_reply_registry(),
+            *extra_field_namespaces,
         }
         drop_namespaces = set(extra_registry_namespaces)
         pairs = {("registry", key) for key in (*field_namespaces, pending)}
@@ -385,7 +386,6 @@ class PostgresPrimitives:
                 {
                     ("queue", MessageBusKeys.inbox(sid)),
                     ("queue", MessageBusKeys.chat_inputs(sid)),
-                    ("log", MessageBusKeys.session_events(sid)),
                 }
             )
             drop_namespaces.update(
@@ -491,7 +491,7 @@ class PostgresPrimitives:
                     await conn.execute(
                         text("""DELETE FROM ak_bus_entries e USING
                         jsonb_to_recordset(CAST(:plan AS jsonb)) x(kind text,key text)
-                        WHERE e.kind=x.kind AND e.key=x.key AND x.kind IN ('queue','log')"""),
+                        WHERE e.kind='queue' AND e.kind=x.kind AND e.key=x.key"""),
                         args,
                     )
                     await conn.execute(
@@ -564,9 +564,9 @@ class PostgresPrimitives:
             )
         return payload
 
-    async def registry_set(self, namespace, field, value, *, ttl_secs=None):
+    async def registry_set(self, namespace, field, value, *, ttl_secs=None, conn=None):
         self._ttl(ttl_secs)
-        async with self._key("registry", namespace) as (conn, _):
+        async with self._key("registry", namespace, conn=conn) as (conn, _):
             await conn.execute(
                 text("""INSERT INTO ak_bus_registry(key,field,value)
                 VALUES (:key,:field,:value) ON CONFLICT(key,field) DO UPDATE SET value=:value"""),

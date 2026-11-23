@@ -25,6 +25,7 @@ from sqlalchemy import (
     or_,
     select,
     text,
+    tuple_,
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB, array, insert
@@ -178,6 +179,49 @@ class ScheduleStorage:
 
     def __init__(self, engine: AsyncEngine | PostgresTransaction):
         self.engine = engine
+
+    async def latest_completed_run_ids(
+        self, user_id: str, session_sources: dict[str, tuple[str, str]]
+    ) -> dict[str, str]:
+        """Return only completion watermarks for owned session/schedule/project triples.
+
+        Hidden history still contributes its watermark so archive/delete cannot
+        make an older completion look new. No run content is exposed here.
+        """
+        if not session_sources:
+            return {}
+        latest = (
+            select(
+                run_columns.session_id,
+                run_columns.id,
+                func.row_number().over(
+                    partition_by=run_columns.session_id,
+                    order_by=(run_columns.finished_at.desc(), run_columns.id.desc()),
+                ).label("position"),
+            )
+            .join(schedules, schedule_columns.id == run_columns.schedule_id)
+            .where(
+                schedule_columns.user_id == user_id,
+                run_columns.schedule_id.in_(
+                    {source[0] for source in session_sources.values()}
+                ),
+                tuple_(
+                    run_columns.session_id,
+                    run_columns.schedule_id,
+                    run_columns.project_id,
+                ).in_(
+                    [(sid, *source) for sid, source in session_sources.items()]
+                ),
+                run_columns.status.in_(_FINISHED),
+                run_columns.finished_at.is_not(None),
+            )
+            .subquery("completed_runs")
+        )
+        query = select(latest.c.session_id, latest.c.id).where(
+            latest.c.position == 1
+        )
+        async with self.engine.connect() as conn:
+            return dict((await conn.execute(query)).all())
 
     async def create(self, task: dict) -> dict:
         created_at = task.get("created_at") or datetime.now(timezone.utc)

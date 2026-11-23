@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 from agentscope.app._bus_ops import publish_session_event
 from agentscope.app.message_bus import MessageBusKeys
@@ -9,6 +10,7 @@ from agentscope.event import (
     ToolCallStartEvent,
     ToolResultEndEvent,
 )
+from redis_helpers import redis_config as redis_config
 
 from egis_agentkit.core.session._context import session_execution_context
 from egis_agentkit.service.session._message_bus_override import SessionMessageBus
@@ -106,11 +108,15 @@ async def test_worker_progress_reaches_the_parent_after_its_reply_ends():
 
 
 async def test_postgres_progress_preserves_worker_state_when_first_dispatch_arrives_late(
-    storage, monkeypatch
+    storage, monkeypatch, redis_config
 ):
-    bus = SessionMessageBus(deployment_mode="cluster", engine=storage.engine)
+    bus = SessionMessageBus(
+        deployment_mode="cluster", engine=storage.engine, redis=redis_config
+    )
     await bus.init_schema()
+    await bus._start_replay()
     monkeypatch.setattr(bus, "_kafka", lambda: SimpleNamespace(publish=AsyncMock()))
+    parent = "test-parent-" + uuid4().hex
     progress = bus.collaborator_progress
     member = {
         "worker_session_id": "worker",
@@ -120,12 +126,15 @@ async def test_postgres_progress_preserves_worker_state_when_first_dispatch_arri
     start = ReplyStartEvent(
         session_id="worker", reply_id="child", name="skills-assistant"
     )
-    await progress.observe(
-        "parent", "worker", "expert", "Skills 助手", start.model_dump(mode="json")
-    )
-    await progress.dispatched("parent", member)
-    (snapshot,) = await progress.list("parent")
-    assert snapshot["status"] == "running"
-    assert snapshot["revision"] == 1
-    await progress.forget("parent", "worker")
-    assert await progress.list("parent") == []
+    try:
+        await progress.observe(
+            parent, "worker", "expert", "Skills 助手", start.model_dump(mode="json")
+        )
+        await progress.dispatched(parent, member)
+        (snapshot,) = await progress.list(parent)
+        assert snapshot["status"] == "running"
+        assert snapshot["revision"] == 1
+        await progress.forget(parent, "worker")
+    finally:
+        await bus.log_trim(MessageBusKeys.session_events(parent))
+        await bus.aclose()

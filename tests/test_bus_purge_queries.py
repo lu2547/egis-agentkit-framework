@@ -6,6 +6,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from agentscope.app.message_bus import MessageBusKeys
+from redis_helpers import redis_bus as redis_bus
+from redis_helpers import redis_buses as redis_buses
+from redis_helpers import redis_config as redis_config
+from redis_helpers import redis_key as redis_key
 from sqlalchemy import text
 from test_session_sql_queries import sql_queries
 
@@ -97,13 +101,14 @@ async def seed_bus(storage, sids):
 
 @pytest.mark.parametrize("count", [1, 50])
 async def test_cluster_session_purge_has_constant_sql_and_preserves_unrelated_state(
-    storage, count
+    storage, redis_bus, redis_key, count
 ):
-    bus = EgisMessageBus(deployment_mode="cluster", engine=storage.engine)
-    await bus._pg.init_schema()
-    sids = [f"remove-{i}" for i in range(count)]
-    unrelated = "unrelated"
+    bus = redis_bus
+    sids = [f"{redis_key}-remove-{i}" for i in range(count)]
+    unrelated = f"{redis_key}-unrelated"
     expiry = await seed_bus(storage, [*sids, unrelated])
+    for sid in [*sids, unrelated]:
+        await bus.log_append(MessageBusKeys.session_events(sid), {"live": sid})
     assert await bus.try_lock(MessageBusKeys.session_lock(sids[0]))
     assert await bus.try_lock(MessageBusKeys.session_lock(unrelated))
     try:
@@ -119,7 +124,11 @@ async def test_cluster_session_purge_has_constant_sql_and_preserves_unrelated_st
         for sid in sids:
             assert await bus.queue_read(MessageBusKeys.inbox(sid)) == []
             assert await bus.queue_read(MessageBusKeys.chat_inputs(sid)) == []
-            assert await bus.log_read(MessageBusKeys.session_events(sid)) == []
+            replay_key = MessageBusKeys.session_events(sid)
+            assert await bus.log_read(replay_key) == []
+            assert await bus._pg.log_read(replay_key) == [
+                ("13-0", {"id": "old-" + sid, "session_id": sid})
+            ]
             assert (
                 await bus.registry_get(
                     MessageBusKeys.chat_input_pending_registry(), sid
@@ -147,6 +156,7 @@ async def test_cluster_session_purge_has_constant_sql_and_preserves_unrelated_st
         assert await bus.is_locked(MessageBusKeys.session_lock(sids[0]))
         assert await bus.is_locked(MessageBusKeys.session_lock(unrelated))
         assert await bus.queue_read(MessageBusKeys.chat_inputs(unrelated))
+        assert await bus.log_read(MessageBusKeys.session_events(unrelated))
         assert await bus.registry_get(
             MessageBusKeys.chat_input_pending_registry(), unrelated
         )
@@ -230,7 +240,7 @@ async def test_batch_purge_parses_foreign_and_invalid_pending_owners_without_era
     bus = EgisMessageBus(deployment_mode="cluster", engine=storage.engine)
     await bus._pg.init_schema()
     await seed_bus(storage, ["remove-foreign", "remove-invalid", "unrelated-foreign"])
-    await purge_session_bus(bus, ["remove-foreign", "remove-invalid"])
+    await bus._pg.purge_sessions(["remove-foreign", "remove-invalid"])
     assert (
         await bus.registry_get(
             MessageBusKeys.chat_input_user_sessions("bob"), "remove-foreign"
@@ -270,7 +280,7 @@ async def test_concurrent_old_queue_removal_cannot_delete_post_purge_append(stor
             ),
             {"key": key},
         )
-        purge = asyncio.create_task(purge_session_bus(bus, ["remove"]))
+        purge = asyncio.create_task(bus._pg.purge_sessions(["remove"]))
         await asyncio.sleep(0.02)
         stale_remove = asyncio.create_task(
             bus.queue_remove_if(key, [{"id": "old-remove"}])
@@ -306,7 +316,10 @@ async def test_purge_preserves_expired_metadata_without_resurrecting_global_fiel
             ),
             {"past": past, "keys": expired_keys},
         )
-    await purge_session_bus(bus, ["remove"])
+    await bus._pg.purge_sessions(
+        ["remove"],
+        extra_registry_namespaces=[steering_presentation_namespace("remove")],
+    )
     async with storage.engine.connect() as conn:
         remaining = (
             await conn.execute(
@@ -345,10 +358,12 @@ async def test_purge_preserves_expired_metadata_without_resurrecting_global_fiel
         == "indexed"
     )
     assert (
-        await bus.log_append(MessageBusKeys.session_events("remove"), {"type": "after"})
+        await bus._pg.log_append(
+            MessageBusKeys.session_events("remove"), {"type": "after"}
+        )
         == "14-0"
     )
-    assert await bus.log_read(
+    assert await bus._pg.log_read(
         MessageBusKeys.session_events("remove"), since="13-0"
     ) == [("14-0", {"type": "after"})]
 
@@ -375,7 +390,7 @@ async def test_pending_owner_change_retries_with_canonical_key_locks(storage):
             {"key": pending},
         )
         event.listen(storage.engine.sync_engine, "before_cursor_execute", observe)
-        operation = asyncio.create_task(purge_session_bus(bus, ["remove"]))
+        operation = asyncio.create_task(bus._pg.purge_sessions(["remove"]))
         try:
             await asyncio.wait_for(reached_lock.wait(), 5)
             await conn.execute(
@@ -442,7 +457,7 @@ async def test_standalone_batch_purge_uses_native_public_operations():
 
 @pytest.mark.parametrize("count", [1, 50])
 async def test_real_cluster_project_delete_batches_bus_purge_after_all_session_locks(
-    storage, tmp_path, count
+    storage, tmp_path, redis_bus, count
 ):
     from test_domain import expert, identities
 
@@ -462,23 +477,35 @@ async def test_real_cluster_project_delete_batches_bus_purge_after_all_session_l
         for _ in range(count)
     ]
     keep = await tasks.add_session(alice, source["id"], "private")
-    bus = EgisMessageBus(deployment_mode="cluster", engine=storage.engine)
-    await bus._pg.init_schema()
+    bus = redis_bus
     await seed_bus(storage, [*session_ids, keep["session_id"]])
-    with sql_queries(storage) as statements:
-        await tasks.projects.delete(alice, project["id"], bus)
-    purge_queries = [
-        statement
-        for statement in statements
-        if "ak_bus_" in statement and "ak_bus_leases" not in statement
+    replay_keys = [
+        MessageBusKeys.session_events(sid) for sid in [*session_ids, keep["session_id"]]
     ]
-    print(
-        f"PROJECT_PURGE_SQL sessions={count} purge={len(purge_queries)} total_with_leases={len(statements)}"
-    )
-    assert len(purge_queries) == 8
-    assert await storage.projects.get(alice.user_id, project["id"]) is None
-    assert await storage.sessions.in_project(alice.user_id, project["id"]) == []
-    assert await bus.queue_read(MessageBusKeys.chat_inputs(keep["session_id"]))
-    assert (await tasks.get_session(alice, keep["session_id"]))["session_id"] == keep[
-        "session_id"
-    ]
+    try:
+        for key in replay_keys:
+            await bus.log_append(key, {"live": True})
+        with sql_queries(storage) as statements:
+            await tasks.projects.delete(alice, project["id"], bus)
+        purge_queries = [
+            statement
+            for statement in statements
+            if "ak_bus_" in statement and "ak_bus_leases" not in statement
+        ]
+        print(
+            f"PROJECT_PURGE_SQL sessions={count} purge={len(purge_queries)} "
+            f"total_with_leases={len(statements)}"
+        )
+        assert len(purge_queries) == 8
+        assert await storage.projects.get(alice.user_id, project["id"]) is None
+        assert await storage.sessions.in_project(alice.user_id, project["id"]) == []
+        for key in replay_keys[:-1]:
+            assert await bus.log_read(key) == []
+        assert await bus.log_read(replay_keys[-1])
+        assert await bus.queue_read(MessageBusKeys.chat_inputs(keep["session_id"]))
+        assert (await tasks.get_session(alice, keep["session_id"]))["session_id"] == keep[
+            "session_id"
+        ]
+    finally:
+        for key in replay_keys:
+            await bus.log_trim(key)

@@ -141,6 +141,81 @@ async def test_large_session_history_uses_owner_time_index(storage):
     assert scan["Actual Rows"] == 20
 
 
+async def test_mixed_main_sessions_keep_indexed_user_page_and_hide_workers(storage):
+    from egis_agentkit.storage._session import SessionStorage
+
+    async with storage.engine.begin() as conn:
+        await conn.execute(
+            text("""
+            INSERT INTO sessions (id, user_id, agent_id, source, source_schedule_id, created_at, updated_at, payload)
+            SELECT 'mixed-' || n::text,
+                   CASE WHEN n <= 5000 THEN 'target' ELSE 'other-' || (n % 100)::text END,
+                   'agent', CASE WHEN n % 100 = 0 THEN 'schedule' WHEN n % 3 = 0 THEN 'team' ELSE 'user' END,
+                   CASE WHEN n % 100 = 0 THEN 'morning' END,
+                   now(), now() + n * interval '1 second',
+                   '{"state":{"middle_context":{"egis_agentkit":{"project_id":"project"}}}}'::json
+            FROM generate_series(1, 50000) n
+        """)
+        )
+        await conn.execute(text("ANALYZE sessions"))
+        rows = (
+            await conn.execute(SessionStorage.main_records_query("target", limit=20))
+        ).mappings().all()
+    assert len(rows) == 20
+    assert rows[0]["id"] == "mixed-5000"
+    assert {row["source"] for row in rows} == {"user", "schedule"}
+    assert all(row["user_id"] == "target" for row in rows)
+    assert [row["updated_at"] for row in rows] == sorted(
+        (row["updated_at"] for row in rows), reverse=True
+    )
+    plan = await explain(storage, SessionStorage.main_records_query("target", limit=20))
+    report_plan("50k-mixed-sessions-page", plan)
+    assert any(
+        node.get("Index Name") == "ix_sessions_main_user_updated"
+        for node in nodes(plan["Plan"])
+    )
+    assert not any(node["Node Type"] == "Seq Scan" for node in nodes(plan["Plan"]))
+
+
+async def test_schedule_completion_batch_uses_existing_history_index(storage):
+    from test_schedule_storage import task
+
+    await storage.schedules.create(task())
+    await storage.schedules.create(task("unrelated"))
+    async with storage.engine.begin() as conn:
+        await conn.execute(
+            text("""
+            INSERT INTO ak_schedule_runs
+                (id, schedule_id, schedule_name, project_id, trigger_type,
+                 status, created_at, finished_at, input_snapshot, session_id)
+            SELECT 'run-' || lpad(n::text, 5, '0'),
+                   CASE WHEN n <= 500 THEN 'morning' ELSE 'unrelated' END,
+                   'Report', 'workspace', 'test', 'succeeded',
+                   now() + n * interval '1 second', now() + n * interval '1 second',
+                   '{"agent_id":"writer"}'::jsonb,
+                   CASE WHEN n <= 500 THEN 'session' ELSE 'other-session' END
+            FROM generate_series(1, 50000) n
+        """)
+        )
+        await conn.execute(text("ANALYZE ak_schedule_runs"))
+    with capture_selects(storage) as queries:
+        assert await storage.schedules.latest_completed_run_ids(
+            "alice", {"session": ("morning", "workspace")}
+        ) == {"session": "run-00500"}
+    assert len(queries) == 1
+    plan = await explain(storage, queries[0])
+    report_plan("50k-schedule-completion-batch", plan)
+    assert any(
+        node.get("Index Name") == "ix_ak_schedule_runs_history"
+        for node in nodes(plan["Plan"])
+    )
+    assert not any(
+        node["Node Type"] == "Seq Scan"
+        and node.get("Relation Name") == "ak_schedule_runs"
+        for node in nodes(plan["Plan"])
+    )
+
+
 async def test_online_index_preview_and_apply_do_not_rewrite_business_data(storage):
     from egis_agentkit.storage._query_indexes import optimize_query_indexes
 

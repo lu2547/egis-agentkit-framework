@@ -35,7 +35,6 @@ SCHEMA_LOCK = 727140201
 NATIVE_TABLES = (
     "agents",
     "credentials",
-    "messages",
     "schedules",
     "sessions",
     "teams",

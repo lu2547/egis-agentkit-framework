@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 当前框架无 Redis 业务数据；仅验证平台提供的连接、认证和逻辑库。
+# 验证 Redis 会话事件回放的连接、认证和逻辑库。运行时按需创建 Stream。
 set -euo pipefail
 
 : "${REDIS_HOST:?请设置 Redis 地址}"

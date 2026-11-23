@@ -823,6 +823,17 @@ class KafkaConfig(ConfigModel):
     broadcast: KafkaBroadcastConfig = Field(default_factory=KafkaBroadcastConfig)
 
 
+class RedisConfig(ConfigModel):
+    host: NonEmptyString = "127.0.0.1"
+    port: Annotated[int, Field(strict=True, ge=1, le=65535)] = 6380
+    db: NonNegativeInt = 0
+    password_env: SecretRef | None = None
+    max_connections: PositiveInt = 128
+    connect_timeout_seconds: Seconds = 3.0
+    socket_timeout_seconds: Seconds = 5.0
+    retention_seconds: PositiveInt = 86_400
+
+
 class NacosRefreshConfig(ConfigModel):
     interval_seconds: Seconds = 10
     failure_interval_seconds: Seconds = 10
@@ -925,6 +936,7 @@ class LoggingConfig(ConfigModel):
 class ClientConfig(ConfigModel):
     postgres: PostgresConfig = Field(default_factory=PostgresConfig)
     kafka: KafkaConfig = Field(default_factory=KafkaConfig)
+    redis: RedisConfig = Field(default_factory=RedisConfig)
     nacos: NacosConfig = Field(default_factory=NacosConfig)
     tracing: TracingConfig = Field(default_factory=TracingConfig)
 

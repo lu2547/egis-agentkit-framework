@@ -355,6 +355,15 @@ agentkit:
         maxKeyBytes: 65536
         payloadTtlSeconds: 3600
         storageTimeoutSeconds: 30.0
+    redis:
+      host: 127.0.0.1
+      port: 6380
+      db: 0
+      passwordEnv: null  # Redis 启用密码时填写服务进程的环境变量名。
+      maxConnections: 128
+      connectTimeoutSeconds: 3.0
+      socketTimeoutSeconds: 5.0
+      retentionSeconds: 86400
     nacos:
       refresh:
         intervalSeconds: 10.0

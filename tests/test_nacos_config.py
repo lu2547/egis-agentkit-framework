@@ -22,6 +22,8 @@ def test_release_example_preserves_approved_workstation_behavior():
     assert {
         "permission_mode": settings.session.permissions.default_mode.value,
         "deployment_mode": settings.client.kafka.connection.deployment_mode,
+        "redis_port": settings.client.redis.port,
+        "replay_retention_seconds": settings.client.redis.retention_seconds,
         "project_memory": settings.project.memory.is_enabled,
         "tracing": settings.client.tracing.enabled,
         "upload_bytes": settings.project.upload.max_bytes,
@@ -29,6 +31,8 @@ def test_release_example_preserves_approved_workstation_behavior():
     } == {
         "permission_mode": "bypass",
         "deployment_mode": "cluster",
+        "redis_port": 6380,
+        "replay_retention_seconds": 86400,
         "project_memory": True,
         "tracing": True,
         "upload_bytes": 20_971_520,
@@ -168,7 +172,7 @@ async def test_client_rejects_cross_origin_paths_and_scrubs_server_errors():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "fixed_component", ["workspace", "skill-storage", "tracing", "logging"]
+    "fixed_component", ["workspace", "skill-storage", "tracing", "logging", "redis"]
 )
 async def test_snapshot_reads_one_document_and_updates_typed_hot_settings(
     fixed_component,
@@ -217,6 +221,10 @@ async def test_snapshot_reads_one_document_and_updates_typed_hot_settings(
             docs["agentkit.yaml"]["agentkit"].setdefault("client", {})["tracing"] = {
                 "enabled": True,
             }
+        elif fixed_component == "redis":
+            docs["agentkit.yaml"]["agentkit"].setdefault("client", {})["redis"] = {
+                "retentionSeconds": 60,
+            }
         else:
             docs["agentkit.yaml"]["agentkit"]["logging"] = {"level": "DEBUG"}
         with pytest.raises(NacosError, match="restart"):
@@ -224,6 +232,27 @@ async def test_snapshot_reads_one_document_and_updates_typed_hot_settings(
         assert provider.restart_required is True
         assert provider.snapshot == second
     assert requests == ["agentkit.yaml"] * 4
+
+
+@pytest.mark.parametrize(
+    ("settings", "path"),
+    [
+        ({"port": 65536}, "port"),
+        ({"db": -1}, "db"),
+        ({"password": "test-secret"}, "<unknown>"),
+        ({"passwordEnv": "invalid-name"}, "passwordEnv"),
+        ({"retentionSeconds": 0}, "retentionSeconds"),
+    ],
+)
+def test_redis_replay_requires_valid_connection_and_retention(settings, path):
+    from egis_agentkit.client.nacos import load_agentkit_config
+
+    document = documents()["agentkit.yaml"]
+    document["agentkit"]["client"] = {"redis": settings}
+    with pytest.raises(NacosError) as exc:
+        load_agentkit_config(yaml.safe_dump(document))
+    assert f"agentkit.client.redis.{path}" in str(exc.value)
+    assert "test-secret" not in str(exc.value)
 
 
 @pytest.mark.asyncio

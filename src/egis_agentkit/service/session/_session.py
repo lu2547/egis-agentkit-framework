@@ -344,7 +344,7 @@ class SessionService:
                     user.user_id,
                     leader_session,
                     source_sid,
-                    [message.id for message in messages],
+                    messages,
                 )
             result = await self._view_loaded(leader_session, snapshot)
             logger.info(
@@ -391,13 +391,6 @@ class SessionService:
             try:
                 session = await self.get_session_record(user, session_id)
                 binding = session.state.middle_context["egis_agentkit"]
-                reply = await self.storage.get_message(
-                    user.user_id, session_id, reply_id
-                )
-                if reply is None:
-                    raise NotFound("回复不存在或不可访问")
-                if reply.role != "assistant" or not reply.finished_at:
-                    raise InvalidRequest("请选择已经完成的助手回复")
                 configuration = self.config.snapshot if self.config else None
                 branch = (
                     configuration.session.branch
@@ -416,6 +409,11 @@ class SessionService:
                     raise InvalidRequest(
                         f"分支历史超过 {branch.max_messages} 条，请选择较早的回复"
                     )
+                if not messages:
+                    raise NotFound("回复不存在或不可访问")
+                reply = messages[-1]
+                if reply.role != "assistant" or not reply.finished_at:
+                    raise InvalidRequest("请选择已经完成的助手回复")
                 return await self._add_session(
                     user,
                     binding["definition_id"],
@@ -516,7 +514,14 @@ class SessionService:
                     *root["payload"]["members"],
                 )
             }
-        return self._session_view(session, root, agents)
+        result = self._session_view(session, root, agents)
+        if session.origin.type == "schedule":
+            completed = await self.storage.schedules.latest_completed_run_ids(
+                session.user_id,
+                {session.id: (session.origin.schedule_id, binding["project_id"])},
+            )
+            result["latest_schedule_run_id"] = completed.get(session.id)
+        return result
 
     async def get_session(self, user, session_id):
         """从固定版本读取对话展示信息，保留可清除的待邀请选项。"""
@@ -549,6 +554,8 @@ class SessionService:
                 for member in collaborators(binding)
             ],
             "session_id": session.id,
+            "source": session.origin.type,
+            "latest_schedule_run_id": None,
             "agent_id": session.agent_id,
             "permission_mode": session.state.permission_context.mode.value,
             "model_key": binding.get("selected_model_key"),

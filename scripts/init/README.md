@@ -1,6 +1,6 @@
 # 首次环境初始化
 
-这组脚本用于企业已经提供的 **NAS、Nacos、Redis、Kafka、PostgreSQL**，初始化应用需要的目录、配置、Topic 和表。服务安装、数据库/账号创建、网络、NAS 挂载和平台权限由企业运维提供。
+这组脚本用于企业已经提供的 **NAS、Nacos、Redis、Kafka、PostgreSQL**，初始化应用需要的目录、配置、Kafka Topic 和表，并验证 Redis 连接。服务安装、数据库/账号创建、网络、NAS 挂载和平台权限由企业运维提供。
 
 脚本不启动基础设施，不创建演示用户、专家或项目，不执行旧库升级。命令从 `egis-agentkit-framework` 目录执行。
 
@@ -9,9 +9,9 @@
 | 文件 | 执行内容 |
 | --- | --- |
 | [nas.sh](nas.sh) | 检查 NAS 已挂载，创建用户根目录、系统技能目录和技能上传暂存目录，验证文件写入、读回 |
-| [pg.sql](pg.sql) | 在空的目标 schema 中创建 32 张表及约束、索引，包括 Session 项目生成列 |
+| [pg.sql](pg.sql) | 在空的目标 schema 中创建 35 张表、相关索引和序列，包括会话项目生成列及 NAS 历史提交位置 |
 | [kafka.sh](kafka.sh) | 创建 `<前缀>.triggers`、`<前缀>.broadcast`，核对分区数和副本数 |
-| [redis.sh](redis.sh) | 验证地址、认证、TLS 和逻辑库；当前框架没有需要预置的 Redis 业务 Key |
+| [redis.sh](redis.sh) | 对会话事件回放使用的 Redis 逻辑库执行 PING |
 | [nacos.py](nacos.py) | 校验并首次发布 `agentkit.yaml`，然后读回核对 |
 | [init.env.example](init.env.example) | 初始化参数名称与格式；没有实际密钥 |
 
@@ -50,7 +50,9 @@ bash scripts/init/nas.sh
 - 已存在的 `user/` 不能是符号链接；持久根、用户根和技能根均执行读写探针。
 - 不递归修改已有权限，不预建具体用户或项目；文件探针执行后会清理。
 
-所有 API/技能导入节点与沙箱执行宿主机必须将同一份 NAS 挂载到相同绝对路径。Nacos 的 `workspace.runtime.root` 是唯一持久根目录，值与 `NAS_ROOT` 一致；沙箱直接挂载当前项目目录，无需复制项目文件。使用 OpenSandbox 开发适配器时，服务端的 `storage.allowed_host_paths` 必须包含该根目录。用户 NAS 目录按 `user/{uid}/{skills,session,projects}` 组织，由 Workspace 初始化补齐；初始化脚本不预建具体用户。多模态卸载文件放在当前项目的 `.work/data/`，`skills/session` 下按执行绑定分区并挂入沙箱，NAS `session` 对应 SDK `sessions`。项目创建时建立项目基础目录，会话创建时安全补齐缺失目录。
+直接访问文件的 API/技能导入节点和沙箱执行宿主机将同一份 NAS 挂载到相同绝对路径。Windows API 使用认证的 Linux NAS 文件服务时，先部署与 API 同版本的 `serve-files`，配置 `workspace.files.endpoint` 和两端相同的 `tokenEnv` 凭据，再启动 API/Worker。Nacos 的 `workspace.runtime.root` 是唯一持久根目录，值与 `NAS_ROOT` 一致；沙箱直接挂载当前项目目录，无需复制项目文件。使用 OpenSandbox 开发适配器时，服务端的 `storage.allowed_host_paths` 必须包含该根目录。用户 NAS 目录按 `user/{uid}/{skills,session,projects}` 组织，由 Workspace 初始化补齐；初始化脚本不预建具体用户。多模态卸载文件放在当前项目的 `.work/data/`，`skills/session` 下按执行绑定分区并挂入沙箱，NAS `session` 对应 SDK `sessions`。项目创建时建立项目基础目录，会话创建时安全补齐缺失目录。
+
+每个会话的完整原始消息保存在 `NAS_ROOT/user/{uid}/session/history/{sid}/messages.jsonl`。消息 ID、内容块和元数据随日志持久化。模型压缩上下文后，历史接口仍能读取原始消息。相邻的 `.write-fence` 记录最新写入序号，保护已提交的历史。重写后，历史接口展示新版本。删除会话或项目时，PG 在同一事务中登记 NAS 清理任务并移除历史提交位置。API 在启动时和此后每 60 秒清理已提交的任务，失败后重试。清理会移除原始消息文件，并保留写入序号和锁文件以拦截迟到的旧写入。
 
 ## 3 PostgreSQL
 
@@ -60,7 +62,7 @@ bash scripts/init/nas.sh
 psql -X -v ON_ERROR_STOP=1 -f scripts/init/pg.sql
 ```
 
-连接参数来自标准 `PGHOST/PGPORT/PGDATABASE/PGUSER` 及平台认证设置。SQL 为当前企业 cluster 形态：原生 6 表、AgentKit 23 表、PG 消息总线 5 表，共 34 表；包含当前模型的约束、索引与 `sessions.project_id` 生成列。
+连接参数来自标准 `PGHOST/PGPORT/PGDATABASE/PGUSER` 及平台认证设置。SQL 创建 5 张原生表、25 张 AgentKit 业务表和 5 张消息总线协调表，共 35 张。原生 `sessions` 保存会话状态及项目归属。每个已写入历史的会话在 `ak_session_history` 中占一行，保存用户归属和 NAS 日志的已提交字节数。应用角色需要 `ak_session_history`、`ak_session_history_gc` 的读写权限和 `ak_session_history_write_fence` 序列的 USAGE 权限。
 
 本文件只用于首次空 schema：`BEGIN/COMMIT` 保证整批执行，同名表已存在会报错并回滚，不覆盖、不删除原数据。它不创建数据库或角色，不插入默认用户和示例资源；平台默认工具由应用启动流程登记。
 
@@ -91,15 +93,13 @@ Topic 前缀、分区、副本数必须与 Nacos 对应配置一致。Kafka 运�
 
 ## 5 Redis
 
-需要核对平台提供的 Redis 时执行：
+集群部署的所有 API/Worker 使用同一个 Redis 逻辑库。Redis Streams 保存可从检查点重放的会话事件。Kafka 继续处理唤醒及广播，PostgreSQL 保存待处理输入、注册状态及租约。用企业提供的 Redis 地址检查连接：
 
 ```bash
 bash scripts/init/redis.sh
 ```
 
-脚本使用 `REDIS_HOST/REDIS_PORT/REDIS_USER/REDIS_DB`，TLS 由 `REDIS_TLS` 和可选 `REDIS_CA_FILE` 指定。密码仅通过 `REDISCLI_AUTH` 传递。
-
-**当前框架运行不依赖 Redis，没有 Redis 队列、表或业务 Key 需要初始化。** 因此本脚本只发 `PING` 检查连接，不预造 Key，不清库，不修改 ACL；本次初始化不能据此推断应用已经使用 Redis。
+脚本通过 `REDIS_HOST`、`REDIS_PORT`、`REDIS_DB` 选择逻辑库，凭据由 `REDISCLI_AUTH` 提供。`REDIS_USER`、`REDIS_TLS` 和 `REDIS_CA_FILE` 是此命令行探针的可选认证和 TLS 设置。应用的连接参数见下表；当前运行客户端支持主机、端口、逻辑库及默认用户密码。集群启动时会用应用自身的连接执行 PING。
 
 ## 6 Nacos
 
@@ -129,6 +129,10 @@ python scripts/init/nacos.py --file "$HOME/.config/agentkit/agentkit.yaml"
 | `client.kafka.connection.deploymentMode` | 企业跨进程运行设为 `cluster` |
 | `client.kafka.connection.bootstrapServers/topicPrefix` | Kafka 地址、`KAFKA_TOPIC_PREFIX` |
 | `client.kafka.topics.partitions/replicationFactor` | 与创建 Topic 时相同的分区和副本数 |
+| `client.redis.host/port/db` | 会话事件回放使用的 Redis 地址和逻辑库 |
+| `client.redis.passwordEnv` | 应用进程内保存 Redis 密码的环境变量名 |
+| `client.redis.maxConnections/connectTimeoutSeconds/socketTimeoutSeconds` | 连接池上限及连接、读写超时 |
+| `client.redis.retentionSeconds` | 会话事件流的保留秒数，模板值 86400。运行时也按已持久化的消息检查点裁剪事件 |
 | `model.catalog/selection` | 实际模型地址、模型标识、凭据环境变量和选择配置 |
 | `user.identity` | 公司 issuer、audience、RS256 和 JWKS 地址 |
 

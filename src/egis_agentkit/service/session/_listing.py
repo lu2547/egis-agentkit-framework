@@ -91,6 +91,7 @@ async def list_sessions(service, user, bus, *, limit):
         service.storage, service.config.snapshot.access if service.config else None
     )
     result = []
+    scheduled = {}
     for session in records:
         binding = session.state.middle_context.get("egis_agentkit", {})
         if not binding.get("is_initialized"):
@@ -129,8 +130,19 @@ async def list_sessions(service, user, bus, *, limit):
                 }
             item = service._session_view(session, root, agents)
             result.append(item)
+            if session.origin.type == "schedule":
+                scheduled[session.id] = (
+                    session.origin.schedule_id,
+                    binding["project_id"],
+                )
         except (Forbidden, NotFound):
             continue
+    if scheduled:
+        completed = await service.storage.schedules.latest_completed_run_ids(
+            user.user_id, scheduled
+        )
+        for item in result:
+            item["latest_schedule_run_id"] = completed.get(item["session_id"])
     if bus is not None:
         keys = [MessageBusKeys.session_lock(item["session_id"]) for item in result]
         locked = (

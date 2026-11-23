@@ -27,12 +27,16 @@ from egis_agentkit.errors import (
     AgentKitError,
     Conflict,
     Forbidden,
+    InvalidRequest,
     NotFound,
     UploadNameConflict,
 )
 
 from ._directory import PosixDirectory, is_link
 from ._file_lock import hold_file_lock
+
+HISTORY_CHUNK_BYTES = 512 * 1024
+_MAX_HISTORY_OFFSET = (1 << 63) - 1
 
 
 class FileStorage:
@@ -107,6 +111,171 @@ class FileStorage:
                 with self.open_directory(directory, [], create=True):
                     pass
 
+    @staticmethod
+    def _check_history_range(offset, size):
+        if (
+            type(offset) is not int
+            or type(size) is not int
+            or not 0 < size <= HISTORY_CHUNK_BYTES
+            or not 0 <= offset <= _MAX_HISTORY_OFFSET - size
+        ):
+            raise InvalidRequest("无效的会话历史文件位置或块大小")
+
+    def _history_directory(self, user_id, session_id, *, create=False):
+        return self.open_directory(
+            self.user_root(user_id),
+            ["session", "history", self._identifier(session_id)],
+            create=create,
+            sync_created=create,
+        )
+
+    @contextmanager
+    def _history_writer(self, user_id, session_id, *, create):
+        # A permanent lock inode serializes writers across journal unlink/reuse.
+        with self._history_directory(user_id, session_id, create=create) as directory:
+            fd = directory.open_file(".history.lock", os.O_RDWR | os.O_CREAT)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise Forbidden("会话历史写锁必须是独立的普通文件")
+                with hold_file_lock(fd, exclusive=True):
+                    yield directory
+            finally:
+                os.close(fd)
+
+    @staticmethod
+    @contextmanager
+    def _history_stream(directory, *, write=False, create=False):
+        flags = os.O_RDWR if write else os.O_RDONLY
+        if create:
+            flags |= os.O_CREAT
+        try:
+            fd = directory.open_file("messages.jsonl", flags)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise Forbidden("会话历史不能使用符号链接") from exc
+            raise AgentKitError("无法打开会话历史文件", 503) from exc
+        with os.fdopen(fd, "r+b" if write else "rb") as stream:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise Forbidden("会话历史必须是独立的普通文件")
+            yield stream
+
+    def read_history_chunk(self, user_id, session_id, offset, size):
+        """读取调用方已确认提交的精确字节范围。"""
+        self._check_history_range(offset, size)
+        if self._nas is not None:
+            return self._nas.call(
+                "workspace",
+                "read_history_chunk",
+                user_id=user_id,
+                session_id=session_id,
+                offset=offset,
+                size=size,
+            )
+        with (
+            self._history_directory(user_id, session_id) as directory,
+            self._history_stream(directory) as stream,
+        ):
+            stream.seek(offset)
+            data = stream.read(size)
+            if len(data) != size:
+                raise AgentKitError("会话历史短于已提交长度", 503)
+            return data
+
+    @staticmethod
+    def _advance_history_fence(directory, fence):
+        # Replace atomically. A crashed writer cannot leave a partially updated fence.
+        name = ".write-fence"
+        try:
+            fd = directory.open_file(name, os.O_RDONLY)
+        except FileNotFoundError:
+            previous = 0
+        else:
+            with os.fdopen(fd, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise Forbidden("会话历史写入标识必须是普通文件")
+                value = stream.read(9)
+            if len(value) != 8:
+                raise AgentKitError("会话历史写入标识损坏", 503)
+            previous = int.from_bytes(value, "big")
+        if fence < previous:
+            raise Conflict("会话历史写入已失效")
+        if fence == previous:
+            return False
+        temporary = f".fence-{uuid4().hex}"
+        fd = directory.open_file(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(fence.to_bytes(8, "big"))
+                stream.flush()
+                os.fsync(fd)
+            directory.rename(temporary, name, replace=True)
+            directory.sync()
+        finally:
+            with suppress(FileNotFoundError):
+                directory.unlink(temporary)
+        return True
+
+    def append_history_chunk(self, user_id, session_id, offset, content, fence):
+        """追加一块新历史；新的写者回收未提交尾部，已过期写者无法截断文件。"""
+        if type(fence) is not int or not 0 < fence <= _MAX_HISTORY_OFFSET:
+            raise InvalidRequest("无效的会话历史写入标识")
+        if not isinstance(content, bytes):
+            raise InvalidRequest("会话历史块必须是字节数据")
+        self._check_history_range(offset, len(content))
+        if self._nas is not None:
+            return self._nas.call(
+                "workspace",
+                "append_history_chunk",
+                user_id=user_id,
+                session_id=session_id,
+                offset=offset,
+                content=content,
+                fence=fence,
+            )
+        with self._history_writer(user_id, session_id, create=offset == 0) as directory:
+            new_writer = self._advance_history_fence(directory, fence)
+            with self._history_stream(
+                directory, write=True, create=offset == 0
+            ) as stream:
+                fd = stream.fileno()
+                size = os.fstat(fd).st_size
+                if size < offset:
+                    raise AgentKitError("会话历史短于已提交长度", 503)
+                if size > offset:
+                    if not new_writer:
+                        raise Conflict("会话历史写入位置已失效")
+                    stream.truncate(offset)
+                stream.seek(offset)
+                stream.write(content)
+                stream.flush()
+                os.fsync(fd)
+                if offset == 0:
+                    directory.sync()
+
+    def remove_history(self, user_id, session_id, fence):
+        """持久保存删除序号后移除原文；迟到的旧写入不能重新创建日志。"""
+        if type(fence) is not int or not 0 < fence <= _MAX_HISTORY_OFFSET:
+            raise InvalidRequest("无效的会话历史写入标识")
+        if self._nas is not None:
+            return self._nas.call(
+                "workspace",
+                "remove_history",
+                user_id=user_id,
+                session_id=session_id,
+                fence=fence,
+            )
+        with self._history_writer(user_id, session_id, create=True) as directory:
+            try:
+                self._advance_history_fence(directory, fence)
+            except Conflict:
+                # A new generation already wrote to the reused session path.
+                return
+            with suppress(FileNotFoundError):
+                directory.unlink("messages.jsonl")
+            directory.sync()
+
     @contextmanager
     def _user_files_lock(self, user_id, directory, *, exclusive):
         """在用户目录内锁定一组文件；路径遍历和符号链接规则沿用统一文件存储。"""
@@ -173,7 +342,7 @@ class FileStorage:
         return [p for p in value.parts if p != "."]
 
     @contextmanager
-    def open_directory(self, root: Path, parts: list[str], *, create=False):
+    def open_directory(self, root: Path, parts: list[str], *, create=False, sync_created=False):
         """在操作期间固定根下的各级目录并拒绝跟随链接。"""
         if self._nas is not None:
             raise RuntimeError("HTTP 文件模式必须通过存储操作访问 NAS")
@@ -186,6 +355,8 @@ class FileStorage:
                     if create:
                         with suppress(FileExistsError):
                             current.mkdir(part)
+                            if sync_created:
+                                current.sync()
                     current = stack.enter_context(current.child(part))
             except FileNotFoundError as exc:
                 raise NotFound("文件目录不存在") from exc

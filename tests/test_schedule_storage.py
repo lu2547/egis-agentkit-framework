@@ -281,3 +281,60 @@ async def test_one_schedule_does_not_run_twice_concurrently(storage):
     assert await store.claim_run(independent["id"], NOW) is not None
     await store.finish_run(claimed["id"], NEXT, status="succeeded")
     assert (await store.claim_run(queued_id, NEXT))["status"] == "running"
+
+
+async def test_completion_watermarks_match_owner_schedule_project_and_finished_time(
+    storage,
+):
+    """A session id alone must not expose another schedule's completion."""
+    from sqlalchemy import update
+
+    from egis_agentkit.storage._schedule import schedule_runs
+
+    store = storage.schedules
+    await store.create(task())
+    await store.create(task("another"))
+    await store.create(task("foreign", user_id="bob"))
+    sources = {"session": ("morning", "workspace")}
+    assert await store.latest_completed_run_ids("alice", sources) == {}
+    first = await store.enqueue_test("alice", "morning", NOW)
+    await store.claim_run(first["id"], NOW)
+    await store.bind_run(first["id"], "session")
+    assert await store.latest_completed_run_ids("alice", sources) == {}
+    await store.finish_run(first["id"], NEXT, status="succeeded")
+
+    # A later-created execution which finished earlier cannot lower the watermark.
+    second = await store.enqueue_test("alice", "morning", NEXT)
+    await store.claim_run(second["id"], NEXT)
+    await store.bind_run(second["id"], "session")
+    await store.finish_run(second["id"], NOW, status="failed")
+    assert await store.latest_completed_run_ids("alice", sources) == {
+        "session": first["id"]
+    }
+    for owner, schedule_id in [("alice", "another"), ("bob", "foreign")]:
+        run = await store.enqueue_test(owner, schedule_id, NEXT)
+        await store.claim_run(run["id"], NEXT)
+        await store.bind_run(run["id"], "session")
+        await store.finish_run(
+            run["id"], NEXT + timedelta(seconds=1), status="succeeded"
+        )
+    assert await store.latest_completed_run_ids(
+        "alice", {"session": ("foreign", "workspace")}
+    ) == {}
+    assert await store.latest_completed_run_ids(
+        "alice", {"session": ("morning", "other-project")}
+    ) == {}
+    assert await store.latest_completed_run_ids("bob", sources) == {}
+
+    incomplete = await store.enqueue_test("alice", "morning", NEXT)
+    await store.claim_run(incomplete["id"], NEXT)
+    await store.bind_run(incomplete["id"], "session")
+    async with storage.engine.begin() as conn:
+        await conn.execute(
+            update(schedule_runs)
+            .where(schedule_runs.c.id == incomplete["id"])
+            .values(status="succeeded")
+        )
+    assert await store.latest_completed_run_ids("alice", sources) == {
+        "session": first["id"]
+    }

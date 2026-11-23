@@ -462,7 +462,7 @@ async def test_native_verified_record_is_not_reused_by_inherited_background_task
         alice.user_id, task["agent_id"], task["session_id"]
     )
     native = SessionExecutionStorage(
-        "postgresql+asyncpg://unused", engine=storage.engine
+        "postgresql+asyncpg://unused", engine=storage.engine, files=storage.message_history().files
     )
     await native.__aenter__()
     marker = verified_chat_authorization.set(

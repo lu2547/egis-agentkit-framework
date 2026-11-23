@@ -467,7 +467,7 @@ async def test_pending_invitation_runs_on_user_input_with_bound_native_workers(
         await tasks.update_session_settings(
             alice, task["session_id"], bus, permission_mode=PermissionMode.EXPLORE
         )
-        native_storage = SessionExecutionStorage(str(storage.engine.url), storage.engine)
+        native_storage = SessionExecutionStorage(str(storage.engine.url), storage.engine, files=storage.message_history().files)
         async with SessionPreparationService(storage, tmp_path).bind(
             member.session_id
         ):

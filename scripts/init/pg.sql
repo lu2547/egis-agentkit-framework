@@ -2,15 +2,15 @@
 
 -- 执行前选定目标数据库及 search_path；本文件不创建角色、数据库或 schema。
 
--- 范围：AgentScope 原生 6 表、AgentKit 21 表、cluster 消息总线 5 表，共 32 表。
+-- 范围：AgentScope 原生 5 表、AgentKit 25 表、集群消息总线 5 表，共 35 表。
 
--- 定义来源：storage/_schema.py、storage/model/_tables.py、storage/_remote_agent.py、storage/_message_bus.py。
+-- 定义来源：storage/_schema.py、storage/model/_tables.py、storage/_remote_agent.py、storage/_schedule.py、storage/_message_bus.py。
 
 -- 同名表已存在时整笔事务失败并回滚；不覆盖数据、不执行旧库迁移。
 
 BEGIN;
 
--- 1. 原生运行记录、消息、凭据、计划和协作表及索引。
+-- 1. 原生运行记录、凭据、计划和协作表及索引。
 
 CREATE TABLE agents (
     user_id VARCHAR(255) NOT NULL,
@@ -46,16 +46,6 @@ CREATE INDEX ix_credentials_created_at ON credentials (created_at);
 CREATE INDEX ix_credentials_updated_at ON credentials (updated_at);
 
 CREATE INDEX ix_credentials_user_id ON credentials (user_id);
-
-CREATE TABLE messages (
-    session_id VARCHAR(255) NOT NULL,
-    msg_id VARCHAR(255) NOT NULL,
-    created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
-    payload JSON NOT NULL,
-    PRIMARY KEY (session_id, msg_id)
-);
-
-CREATE INDEX ix_messages_session_created ON messages (session_id, created_at);
 
 CREATE TABLE schedules (
     user_id VARCHAR(255) NOT NULL,
@@ -663,5 +653,22 @@ CREATE INDEX ak_bus_leases_expiry_idx
 
 CREATE INDEX ak_bus_broadcast_payloads_expiry_idx
     ON ak_bus_broadcast_payloads (expires_at);
+
+-- 5. NAS 历史文件的已提交字节数及跨进程写入序号。
+
+CREATE SEQUENCE ak_session_history_write_fence AS BIGINT;
+
+CREATE TABLE ak_session_history (
+    session_id VARCHAR(255) PRIMARY KEY REFERENCES sessions (id) ON DELETE CASCADE,
+    user_id VARCHAR(255) NOT NULL,
+    committed_bytes BIGINT NOT NULL CHECK (committed_bytes >= 0)
+);
+
+CREATE TABLE ak_session_history_gc (
+    fence BIGINT PRIMARY KEY,
+    user_id VARCHAR(255) NOT NULL,
+    session_id VARCHAR(255) NOT NULL,
+    retry_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 COMMIT;

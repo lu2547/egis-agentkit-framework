@@ -1,5 +1,6 @@
 """企业业务表独立于 AgentScope 的原生表。"""
 
+from agentscope.app.storage._sql._tables import SessionRow
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -11,6 +12,7 @@ from sqlalchemy import (
     Index,
     LargeBinary,
     MetaData,
+    Sequence,
     String,
     Table,
     Text,
@@ -20,6 +22,32 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 
 metadata = MetaData()
+
+session_history = Table(
+    "ak_session_history",
+    metadata,
+    Column(
+        "session_id",
+        String(255),
+        ForeignKey(SessionRow.id, ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("user_id", String(255), nullable=False),
+    Column("committed_bytes", BigInteger, nullable=False),
+    CheckConstraint("committed_bytes >= 0"),
+)
+session_history_gc = Table(
+    "ak_session_history_gc",
+    metadata,
+    Column("fence", BigInteger, primary_key=True, autoincrement=False),
+    Column("user_id", String(255), nullable=False),
+    Column("session_id", String(255), nullable=False),
+    Column("retry_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+)
+# Sequence values survive SQL rollback, so an abandoned NAS request can be fenced.
+session_history_write_fence = Sequence(
+    "ak_session_history_write_fence", metadata=metadata
+)
 
 # 反馈保留问题和回答快照，删除原会话后仍能由管理员处理。
 feedback = Table(
