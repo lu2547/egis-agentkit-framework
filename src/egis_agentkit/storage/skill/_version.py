@@ -1,6 +1,7 @@
 """Store immutable Skill version files under their registered owner's workspace."""
 
 import errno
+import hashlib
 import os
 import re
 import stat
@@ -10,7 +11,7 @@ from uuid import uuid4
 
 from egis_agentkit.core.skill._archive import calculate_files_digest
 from egis_agentkit.core.skill._avatar import AVATAR_MAX_BYTES
-from egis_agentkit.errors import Conflict, Forbidden
+from egis_agentkit.errors import Conflict, Forbidden, NotFound
 from egis_agentkit.storage._directory import is_link
 from egis_agentkit.storage._files import FileStorage
 from egis_agentkit.storage.model._resource import validate_resource_id
@@ -29,15 +30,23 @@ class SkillVersionStorage(FileStorage):
         rid = asset["resource_id"]
         version = asset["resource_version"]
         self._validate_version(rid, version)
+        scope = asset.get("storage_scope", "owner")
+        if scope not in ("owner", "shared"):
+            raise Forbidden("技能存储范围无效")
         if asset["owner_type"] == "system":
             return ["common", "skills", rid, version]
         if asset["owner_type"] == "user":
-            return ["user", self._identifier(asset["owner_id"]), "skills", rid, version]
+            owner = self._identifier(asset["owner_id"])
+            return (
+                ["common", "skills", rid, version]
+                if scope == "shared"
+                else ["user", owner, "skills", rid, version]
+            )
         raise Forbidden("技能归属无效")
 
     @staticmethod
     def _asset_locator(asset):
-        return {
+        locator = {
             key: asset[key]
             for key in (
                 "resource_id",
@@ -47,6 +56,37 @@ class SkillVersionStorage(FileStorage):
                 "checksum_sha256",
             )
         }
+        return {**locator, "storage_scope": asset.get("storage_scope", "owner")}
+
+    def publish_shared(self, asset, *, max_bytes, avatar_checksum=None):
+        """Publish verified personal files into common before activating grants."""
+        if asset["owner_type"] != "user":
+            raise Forbidden("只能发布个人技能公共副本")
+        if self._nas is not None:
+            return self._nas.call(
+                "skill_version",
+                "publish_shared",
+                asset=self._asset_locator(asset),
+                max_bytes=max_bytes,
+                avatar_checksum=avatar_checksum,
+            )
+        source = {**asset, "storage_scope": "owner"}
+        target = {**asset, "storage_scope": "shared"}
+        try:
+            self.read(target, max_bytes=max_bytes)
+        except NotFound:
+            _, files, _ = self.read(source, max_bytes=max_bytes)
+            self.publish(target, files, max_bytes=max_bytes)
+        if avatar_checksum:
+            try:
+                avatar = self.read_avatar(target)
+            except NotFound:
+                avatar = self.read_avatar(source)
+                if hashlib.sha256(avatar).hexdigest() != avatar_checksum:
+                    raise Conflict("技能头像摘要与版本记录不一致")
+                self.write_avatar(target, avatar)
+            if hashlib.sha256(avatar).hexdigest() != avatar_checksum:
+                raise Conflict("技能头像摘要与版本记录不一致")
 
     def publish(self, asset, files, *, max_bytes):
         """Install a complete directory while the caller holds the resource write lock."""

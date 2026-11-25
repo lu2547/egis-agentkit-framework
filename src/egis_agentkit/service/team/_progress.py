@@ -93,6 +93,9 @@ class CollaboratorProgress:
             return None
         kind, reply_id = event["type"], event["reply_id"]
         matching = previous is not None and previous.get("reply_id") == reply_id
+        # Late tool/confirmation events from this reply cannot reopen its terminal state.
+        if matching and previous["status"] in FINISHED:
+            return None
         if kind == EventType.REPLY_START:
             if event.get("role") != "assistant":
                 return None

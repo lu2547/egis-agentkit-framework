@@ -57,9 +57,9 @@ from egis_agentkit.service.resource._hubs import (
 from egis_agentkit.service.resource._skill_import import SkillImportService
 from egis_agentkit.service.schedule._service import ScheduleService
 from egis_agentkit.service.schedule._worker import ScheduleWorker
+from egis_agentkit.service.session._authorization import ChatAuthorizationStore
 from egis_agentkit.service.session._message_bus_override import SessionMessageBus
 from egis_agentkit.service.session._preparation import SessionPreparationService
-from egis_agentkit.service.session._authorization import ChatAuthorizationStore
 from egis_agentkit.service.session._session import SessionService
 from egis_agentkit.service.team._definition import TeamDefinition
 from egis_agentkit.service.workspace._egis_sandbox_manager import (
@@ -297,7 +297,7 @@ def init_agentkit(
         personal=personal,
         teams=TeamDefinition(storage, policies, config_provider=config),
         grants=GrantService(storage, policies),
-        sharing=ShareService(storage),
+        sharing=ShareService(storage, publish_skill=resources.publish_shared_skill),
         models=models,
         projects=projects,
         resources=resources,

@@ -229,7 +229,20 @@ class SkillDefinitionStorage:
         )
         return list(dict.fromkeys(row["resource_id"] for row in rows)), rows
 
-    async def page_catalog(self, user, *, after, limit, query, category, mine):
+    async def page_catalog(
+        self,
+        user,
+        *,
+        after,
+        limit,
+        query,
+        category,
+        mine,
+        resource_ids=None,
+        owner_type=None,
+        runtime_names=None,
+        enabled_only=False,
+    ):
         """Filter current skills and personal selections before keyset pagination."""
         summary, detail = t.skill_summary, t.skill_detail
         candidates = _catalog_skill_candidates(user)
@@ -240,6 +253,28 @@ class SkillDefinitionStorage:
         )
         if after is not None:
             statement = statement.where(summary.c.skill_id > after)
+        if resource_ids is not None:
+            statement = statement.where(summary.c.skill_id.in_(resource_ids))
+        if runtime_names is not None:
+            zero = func.decode("00", "hex")
+            digest_input = func.convert_to(user.user_id, "UTF8")
+            for part in ("skill", summary.c.skill_id, detail.c.resource_version):
+                digest_input = digest_input.op("||")(zero).op("||")(
+                    func.convert_to(part, "UTF8")
+                )
+            runtime_name = func.concat(
+                func.left(
+                    func.regexp_replace(summary.c.skill_id, "[^A-Za-z0-9_-]", "_", "g"),
+                    40,
+                ),
+                "_",
+                func.left(func.encode(func.sha256(digest_input), "hex"), 12),
+            )
+            statement = statement.where(runtime_name.in_(runtime_names))
+        if owner_type is not None:
+            statement = statement.where(summary.c.owner_type == owner_type)
+        if enabled_only:
+            statement = statement.where(detail.c.is_enabled)
         if query:
             name = func.coalesce(
                 detail.c.display_name,
@@ -250,7 +285,9 @@ class SkillDefinitionStorage:
                 detail.c.description, detail.c.payload["description"].astext, ""
             )
             statement = statement.where(
-                func.concat(name, " ", description).icontains(query, autoescape=True)
+                func.concat(summary.c.skill_id, " ", name, " ", description).icontains(
+                    query, autoescape=True
+                )
             )
         if category:
             statement = statement.where(_catalog_skill_category() == category)
@@ -301,14 +338,81 @@ class SkillDefinitionStorage:
                 "has_shareable": await conn.scalar(shareable),
             }
 
-    async def page_admin_versions(self, *, offset: int, limit: int) -> list[dict]:
+    async def page_admin_versions(
+        self, *, offset: int, limit: int, query=""
+    ) -> list[dict]:
         detail = t.skill_detail
+        statement = _definition_query()
+        if query:
+            statement = statement.where(
+                func.concat(
+                    detail.c.skill_id,
+                    " ",
+                    detail.c.resource_version,
+                    " ",
+                    func.coalesce(
+                        detail.c.display_name,
+                        detail.c.payload["display_name"].astext,
+                        "",
+                    ),
+                    " ",
+                    func.coalesce(
+                        detail.c.description, detail.c.payload["description"].astext, ""
+                    ),
+                ).icontains(query, autoescape=True)
+            )
         return await self._rows(
-            _definition_query()
-            .order_by(detail.c.skill_id, detail.c.version)
+            statement.order_by(detail.c.skill_id, detail.c.version)
             .offset(offset)
             .limit(limit)
         )
+
+    async def page_history(self, user, skill_id, *, after, limit, query):
+        summary, detail = t.skill_summary, t.skill_detail
+        candidates = _catalog_skill_candidates(user)
+        own = and_(summary.c.owner_type == "user", summary.c.owner_id == user.user_id)
+        editable = (
+            or_(own, summary.c.owner_type == "system")
+            if user.role_type == "admin"
+            else own
+        )
+        statement = (
+            _definition_query()
+            .join(candidates, summary.c.skill_id == candidates.c.skill_id)
+            .where(
+                summary.c.skill_id == skill_id,
+                or_(editable, and_(*_catalog_skill_visibility(user))),
+            )
+        )
+        if after is not None:
+            statement = statement.where(detail.c.version < after)
+        if query:
+            statement = statement.where(
+                detail.c.resource_version.icontains(query, autoescape=True)
+            )
+        return await self._rows(statement.order_by(detail.c.version.desc()).limit(limit))
+
+    async def page_shared_publications(self, *, after, limit, resource_ids=None):
+        """Read approved historical versions for an explicit deployment backfill."""
+        summary, detail, reviews = t.skill_summary, t.skill_detail, t.approvals
+        approved = (
+            select(reviews.c.review_id)
+            .where(
+                reviews.c.resource_type == "skill",
+                reviews.c.resource_id == detail.c.skill_id,
+                reviews.c.resource_version == detail.c.resource_version,
+                reviews.c.review_status_type == "approved",
+            )
+            .exists()
+        )
+        statement = _definition_query().where(
+            summary.c.owner_type == "user",
+            or_(detail.c.version == summary.c.shared_version, approved),
+            tuple_(detail.c.skill_id, detail.c.version) > after,
+        )
+        if resource_ids is not None:
+            statement = statement.where(summary.c.skill_id.in_(resource_ids))
+        return await self._rows(statement.order_by(detail.c.skill_id, detail.c.version).limit(limit))
 
     async def next_publication_revision(
         self, resource_id: str, *, conn: AsyncConnection

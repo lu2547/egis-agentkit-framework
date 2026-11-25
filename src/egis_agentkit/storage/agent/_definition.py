@@ -406,6 +406,16 @@ class AgentDefinitionStorage:
                 ),
             )
             eligible = owned_ids.union(granted_ids).cte("eligible_agent_ids")
+        published = detail.alias("published_agent_configuration")
+        same_shared = exists(
+            select(literal(1)).where(
+                published.c.definition_id == summary.c.id,
+                published.c.version == summary.c.shared_version,
+                published.c.agent_name == detail.c.agent_name,
+                published.c.agent_display_name == detail.c.agent_display_name,
+                published.c.payload == detail.c.payload,
+            )
+        ).correlate(summary, detail)
         return (
             select(
                 summary.c.id,
@@ -425,6 +435,7 @@ class AgentDefinitionStorage:
                 own.label("is_owner"),
                 direct.label("has_access"),
                 pending.label("has_pending_update"),
+                (~same_shared).label("has_shared_changes"),
                 latest_review.label("review_status"),
             )
             .select_from(
@@ -539,10 +550,13 @@ class AgentDefinitionStorage:
                     "is_deletable": editable,
                     "is_usable": granted or (own and can_use_own),
                     "has_shared_version": row["shared_version"] is not None,
-                    "can_share": own and row["shared_version"] is None and not personal,
+                    "share_version": str(row["shared_version"] or row["owner_version"]),
+                    "share_version_label": publication_label(row["shared_version"] or row["owner_version"]),
+                    "can_share": own and not personal,
                     "can_share_update": own
                     and row["shared_version"] is not None
                     and row["owner_version"] != row["shared_version"]
+                    and row["has_shared_changes"]
                     and not pending
                     and not personal,
                     "share_status_type": "approved"

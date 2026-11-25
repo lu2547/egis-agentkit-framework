@@ -78,7 +78,13 @@ async def test_skill_admin_pages_enrich_the_page_with_binding_and_grant(manageme
     assert final["page"] == 2 and not final["has_next"]
     assert final["items"][0]["resource_id"] == "beta"
     assert not final["items"][0]["bound_agents"]
-    assert (await client.get(url)).json()["items"] == [alpha, final["items"][0]]
+    default = (await client.get(url)).json()
+    assert default == first
+    following = (
+        await client.get(url, params={"page": default["page"] + 1})
+    ).json()
+    assert default["items"] + following["items"] == [alpha, final["items"][0]]
+    assert not following["has_next"]
     assert (await client.get(url, params={"page_size": 3})).status_code == 422
     assert (await client.get(url, params={"page": 0})).status_code == 422
     app.dependency_overrides[current_user] = lambda: alice

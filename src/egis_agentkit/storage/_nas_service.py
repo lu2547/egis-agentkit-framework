@@ -50,7 +50,9 @@ _OPERATIONS = {
         "read_probe_file",
         "remove_probe_file",
     },
-    "skill_version": {"publish", "read", "read_runtime", "read_avatar", "write_avatar"},
+    "skill_version": {
+        "publish", "publish_shared", "read", "read_runtime", "read_avatar", "write_avatar"
+    },
     "skill_upload": {"write", "read", "remove"},
 }
 _PREFERENCE_FILES = frozenset(DOCUMENT_FILES.values())
@@ -123,7 +125,9 @@ def _validate_arguments(snapshot, scope, operation, arguments):
             raise Forbidden("只允许访问受管偏好文档")
         arguments["max_bytes"] = limit
 
-    if scope == "skill_version" and operation in {"publish", "read", "read_runtime"}:
+    if scope == "skill_version" and operation in {
+        "publish", "publish_shared", "read", "read_runtime"
+    }:
         arguments["max_bytes"] = _bounded_limit(
             arguments.get("max_bytes"), snapshot.skill.archive.expanded_bytes_limit
         )

@@ -373,6 +373,9 @@ async def test_controllers_use_named_services_and_preserve_file_http_contract(
 async def test_access_http_requires_recipient_and_authorizes_admin_actions(storage):
     _, admin, alice, bob = await identities(storage)
     definition = await AgentManager(storage).add_definition(alice, expert())
+    system = await AgentManager(storage).add_definition(
+        admin, expert("platform", "system", "system_writer")
+    )
     app = FastAPI()
     app.state.egis_services = SimpleNamespace(
         sharing=ShareService(storage), grants=GrantService(storage)
@@ -432,7 +435,11 @@ async def test_access_http_requires_recipient_and_authorizes_admin_actions(stora
         resources = (await client.get("/manager/admin/grant-resources")).json()["items"]
         assert [
             row["resource_id"] for row in resources if row["resource_type"] == "agent"
-        ] == [definition["id"]]
+        ] == [system["id"]]
+        assert all(row["resource_owner_type"] == "system" for row in resources)
+        assert (
+            await client.post("/manager/admin/grants", json=grant)
+        ).status_code == 403
         assert (
             await client.post(
                 decision,
@@ -449,7 +456,17 @@ async def test_access_http_requires_recipient_and_authorizes_admin_actions(stora
         assert (
             await client.post("/manager/admin/grants", json={**grant, "id": "chosen"})
         ).status_code == 422
-        response = await client.post("/manager/admin/grants", json=grant)
+        assert (
+            await client.post("/manager/admin/grants", json=grant)
+        ).status_code == 403
+        system_grant = {
+            **grant,
+            "resource_id": system["id"],
+            "resource_view_type": "system",
+            "resource_owner_type": "system",
+            "resource_owner_id": "platform",
+        }
+        response = await client.post("/manager/admin/grants", json=system_grant)
         assert response.status_code == 200
         assert response.json()["granted_by"] == admin.user_id
         assert "resource_version" not in response.json()

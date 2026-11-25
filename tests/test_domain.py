@@ -120,6 +120,7 @@ async def test_failed_approval_keeps_previous_review_and_grant_current(storage):
     source = await agents.add_definition(alice, value)
     previous = await shares.submit(alice, "agent", source["id"], target=COMPANY)
     await shares.decide(admin, previous["review_id"], True, "通过")
+    value.payload["description"] = "待审核的内容修改"
     await agents.update_definition(alice, (value).id, agent_changes(value))
     pending = await shares.submit(alice, "agent", source["id"])
     async with storage.transaction() as conn:

@@ -8,8 +8,9 @@
 
 from egis_agentkit.errors import Forbidden, NotFound
 from egis_agentkit.service._user import UserService, require_admin
+from egis_agentkit.service.access._publication import same_publication_content
 from egis_agentkit.storage.model import AgentDefinition, User
-from egis_agentkit.storage.model._base import resource_available
+from egis_agentkit.storage.model._base import publication_label, resource_available
 from egis_agentkit.storage.model._resource import (
     MCP_STORAGE_VERSION,
     is_managed_connector,
@@ -175,10 +176,14 @@ class PermissionService:
         shared = await self.storage.access.shared_version(kind, identifier)
         result["has_shared_version"] = shared is not None
         if resource_available(target) and target["resource_version"] == str(version):
-            result["can_share"] = shared is None
+            result["can_share"] = True
+            changed = shared is not None and shared != str(version)
+            previous = await self._resource(kind, identifier, shared) if changed else target
+            revision = int(shared or version) if kind in DEFINITION_KINDS else previous["publication_revision"]
+            result.update(share_version=shared or str(version), share_version_label=publication_label(revision))
+            changed = changed and not same_publication_content(target, previous)
             result["can_share_update"] = (
-                shared is not None
-                and shared != str(version)
+                changed
                 and not await self.storage.access.has_pending_update(kind, identifier)
             )
         return result

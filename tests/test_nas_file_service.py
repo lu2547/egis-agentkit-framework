@@ -269,3 +269,18 @@ async def test_skill_files_round_trip_over_http(loopback_config, tmp_path):
         )
 
     await asyncio.to_thread(use_files)
+
+async def test_shared_skill_publication_round_trips_through_nas(loopback_config, tmp_path):
+    versions = SkillVersionStorage(tmp_path, config_provider=loopback_config)
+    files = {"SKILL.md": b"# shared", "data.bin": b"\x00\xff"}
+    asset = dict(resource_id="shared-skill", resource_version="1.0.0", owner_type="user",
+                 owner_id="alice", checksum_sha256=calculate_files_digest(files))
+
+    def publish_and_read():
+        versions.publish(asset, files, max_bytes=1024)
+        versions.publish_shared(asset, max_bytes=1024)
+        directory, stored, _ = versions.read({**asset, "storage_scope": "shared"}, max_bytes=1024)
+        assert directory == tmp_path / "common/skills/shared-skill/1.0.0"
+        assert stored == files
+
+    await asyncio.to_thread(publish_and_read)

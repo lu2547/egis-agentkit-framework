@@ -138,3 +138,22 @@ async def test_postgres_progress_preserves_worker_state_when_first_dispatch_arri
     finally:
         await bus.log_trim(MessageBusKeys.session_events(parent))
         await bus.aclose()
+
+
+async def test_late_tool_result_cannot_reopen_a_finished_worker():
+    async with SessionMessageBus(deployment_mode="standalone") as bus:
+        progress = bus.collaborator_progress
+        for event in (
+            ReplyStartEvent(session_id="worker", reply_id="reply", name="expert"),
+            ToolCallStartEvent(
+                reply_id="reply", tool_call_id="tool", tool_call_name="TeamSay"
+            ),
+            ReplyEndEvent(session_id="worker", reply_id="reply"),
+            ToolResultEndEvent(reply_id="reply", tool_call_id="tool", state="success"),
+        ):
+            await progress.observe(
+                "parent", "worker", "expert", "专家", event.model_dump(mode="json")
+            )
+        (saved,) = await progress.list("parent")
+        assert saved["status"] == "completed"
+        assert saved["revision"] == 3

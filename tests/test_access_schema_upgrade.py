@@ -21,18 +21,23 @@ async def test_access_upgrade_preserves_root_and_rejects_conflicting_versions(st
     definitions = AgentManager(storage)
     value = expert()
     first = await definitions.add_definition(alice, value)
-    grant = await GrantService(storage).grant(
-        admin,
-        Grant(
-            principal_type="user",
-            principal_id=bob.user_id,
-            resource_type="agent",
-            resource_id=value.id,
-            resource_view_type="shared",
-            resource_owner_type="user",
-            resource_owner_id=alice.user_id,
-        ),
-    )
+    # Recreate a historical manual root through the trusted write boundary;
+    # today's public grant API rejects manual grants for personal resources.
+    async with storage.definition_write() as write:
+        grant = await GrantService(write).issue(
+            admin,
+            Grant(
+                principal_type="user",
+                principal_id=bob.user_id,
+                resource_type="agent",
+                resource_id=value.id,
+                resource_view_type="shared",
+                resource_owner_type="user",
+                resource_owner_id=alice.user_id,
+            ),
+            first,
+            write=write,
+        )
     await definitions.update_definition(alice, (value).id, agent_changes(value))
     async with storage.engine.begin() as conn:
         schema = await conn.scalar(text("SELECT current_schema()"))

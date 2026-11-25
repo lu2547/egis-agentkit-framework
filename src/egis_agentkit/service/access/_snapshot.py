@@ -7,7 +7,7 @@ from egis_agentkit.storage._definition import (
     build_definition_data,
     definition_view_selection,
 )
-from egis_agentkit.storage.model._base import resource_available
+from egis_agentkit.storage.model._base import publication_label, resource_available
 from egis_agentkit.storage.model._resource import (
     MCP_STORAGE_VERSION,
     asset_version_order,
@@ -15,6 +15,7 @@ from egis_agentkit.storage.model._resource import (
 )
 
 from ._decision import INTERNAL_AGENT_TYPES, DefinitionAccess, PermissionDecision
+from ._publication import same_publication_content
 
 
 def reference_parts(ref):
@@ -581,10 +582,18 @@ class PermissionReadSnapshot:
                 self.pending = await self.storage.access.pending_updates(
                     {(k, ident) for k, ident, _ in self.rows}
                 )
-            result["can_share"] = shared is None
+            result["can_share"] = True
+            changed = shared is not None and shared != str(version)
+            previous = target
+            if changed:
+                previous = self._resource(kind, identifier, shared)
+                if previous is None:
+                    previous = await self.permissions._resource(kind, identifier, shared)
+            revision = int(shared or version) if kind in ("agent", "team") else previous["publication_revision"]
+            result.update(share_version=shared or str(version), share_version_label=publication_label(revision))
+            changed = changed and not same_publication_content(target, previous)
             result["can_share_update"] = (
-                shared is not None
-                and shared != str(version)
+                changed
                 and (kind, identifier) not in (self.pending or set())
             )
         return result

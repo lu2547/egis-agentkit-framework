@@ -139,13 +139,12 @@ async def test_three_expert_paths_and_marketplace_grant_are_revoked_independentl
 
 
 @pytest.mark.asyncio
-async def test_admin_direct_grant_of_private_resource_needs_no_review(storage):
+async def test_admin_direct_grant_cannot_publish_private_resource_without_review(storage):
     _, admin, alice, bob = await identities(storage)
     agents, shares = AgentManager(storage), ShareService(storage)
     row = await agents.add_definition(alice, expert())
-    grant = await GrantService(storage).grant(
-        admin,
-        Grant(
+    with pytest.raises(Forbidden):
+        await GrantService(storage).grant(admin, Grant(
             principal_type="user",
             principal_id=bob.user_id,
             resource_type="agent",
@@ -153,13 +152,7 @@ async def test_admin_direct_grant_of_private_resource_needs_no_review(storage):
             resource_view_type="shared",
             resource_owner_type="user",
             resource_owner_id=alice.user_id,
-        ),
-    )
-    assert "resource_version" not in grant
+        ))
     assert await shares.list(admin, admin=True) == []
-    assert (await AgentManager(storage).get_definition_for_use(bob, row["id"], "shared"))[
-        "id"
-    ] == row["id"]
-    await GrantService(storage).revoke(admin, grant["id"])
     with pytest.raises(Forbidden):
         await AgentManager(storage).get_definition_for_use(bob, row["id"], "shared")

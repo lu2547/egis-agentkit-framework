@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 from test_domain import COMPANY, expert, identities
 
+from egis_agentkit.core.skill._archive import calculate_files_digest
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._permission import PermissionService
@@ -11,12 +12,14 @@ from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.storage.model import Asset, ResourceRef
+from egis_agentkit.storage.skill._version import SkillVersionStorage
 
 
 async def prepare(storage):
     users, admin, alice, bob = await identities(storage)
 
-    async def publish(version, revision, digest):
+    async def publish(version, revision):
+        files = {"SKILL.md": f"# Bob asset {version}".encode()}
         async with storage.transaction() as conn:
             asset = Asset(
                 resource_type="skill",
@@ -25,15 +28,16 @@ async def prepare(storage):
                 publication_revision=revision,
                 owner_type="user",
                 owner_id="bob",
-                checksum_sha256=digest,
+                checksum_sha256=calculate_files_digest(files),
             )
+            SkillVersionStorage(storage.test_workspace_root).publish(asset.model_dump(), files, max_bytes=1024)
             await storage.assets.insert_asset(asset, actor=bob.user_id, conn=conn)
 
-    await publish("1.0.0", 1, "a" * 64)
+    await publish("1.0.0", 1)
     shares = ShareService(storage)
     review = await shares.submit(bob, "skill", "bob-asset", target=COMPANY)
     await shares.decide(admin, review["review_id"], True, "")
-    await publish("2.0.0", 2, "b" * 64)
+    await publish("2.0.0", 2)
     return users, admin, alice, bob, shares
 
 

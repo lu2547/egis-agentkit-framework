@@ -206,7 +206,7 @@ async def test_persisted_unsafe_asset_paths_are_rejected(
 
 
 @pytest.mark.asyncio
-async def test_shared_skill_stays_at_owner_path_and_restores_exact_version(
+async def test_shared_skill_uses_common_copy_and_restores_exact_version(
     storage, tmp_path
 ):
     from egis_agentkit.service.access._share import ShareService
@@ -225,9 +225,9 @@ async def test_shared_skill_stays_at_owner_path_and_restores_exact_version(
     await sharing.decide(admin, review["review_id"], True, "approved")
 
     version = await resources.materialize_skill(bob, "report", "1.0.0")
-    canonical = tmp_path / "user/alice/skills/report/1.0.0"
+    canonical = tmp_path / "common/skills/report/1.0.0"
     assert Path(version.dir) == canonical
-    assert not (tmp_path / "common/skills/report").exists()
+    assert (tmp_path / "user/alice/skills/report/1.0.0").is_dir()
     assert not (tmp_path / "user/bob/skills/report").exists()
     pin = await resources.skill_pin(
         bob,

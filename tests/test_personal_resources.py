@@ -3,7 +3,6 @@
 import pytest
 from sqlalchemy import inspect, select, text
 from test_domain import COMPANY, identities
-from test_resources import put_asset
 
 from egis_agentkit.errors import NotFound
 from egis_agentkit.service.access._share import ShareService
@@ -38,12 +37,17 @@ async def test_personal_resources_are_queried_by_user_without_crossing_users(
 async def test_removing_personal_selection_preserves_resource_grants_and_other_users(
     storage, tmp_path
 ):
-    _, admin, alice, bob = await identities(storage)
-    await put_asset(storage, owner_type="user", owner_id="admin")
-    shares = ShareService(storage)
-    review = await shares.submit(admin, "skill", "report", target=COMPANY)
-    await shares.decide(admin, review["review_id"], True, "通过")
+    users, admin, alice, bob = await identities(storage)
+    await users.sync_identity("reviewer", "审核管理员")
+    await users.provision_admin("reviewer", actor="bootstrap")
+    reviewer = await users.get("reviewer")
     resources = ResourceService(storage, tmp_path)
+    await resources.save_skill(
+        admin, {"resource_id": "report", "markdown": "# Report"}
+    )
+    shares = ShareService(storage, publish_skill=resources.publish_shared_skill)
+    review = await shares.submit(admin, "skill", "report", target=COMPANY)
+    await shares.decide(reviewer, review["review_id"], True, "通过")
     await resources.install(alice, "skill", "report")
     await resources.install(bob, "skill", "report")
     async with storage.engine.connect() as connection:
@@ -110,12 +114,17 @@ async def test_personal_resource_user_upgrade_uses_owner_and_preserves_switches(
 async def test_personal_switches_are_independent_and_follow_current_shared_version(
     storage, tmp_path
 ):
-    _, admin, alice, bob = await identities(storage)
-    await put_asset(storage, owner_type="user", owner_id="admin")
-    shares = ShareService(storage)
-    review = await shares.submit(admin, "skill", "report", target=COMPANY)
-    await shares.decide(admin, review["review_id"], True, "通过")
+    users, admin, alice, bob = await identities(storage)
+    await users.sync_identity("reviewer", "审核管理员")
+    await users.provision_admin("reviewer", actor="bootstrap")
+    reviewer = await users.get("reviewer")
     resources = ResourceService(storage, tmp_path)
+    await resources.save_skill(
+        admin, {"resource_id": "report", "markdown": "# Report"}
+    )
+    shares = ShareService(storage, publish_skill=resources.publish_shared_skill)
+    review = await shares.submit(admin, "skill", "report", target=COMPANY)
+    await shares.decide(reviewer, review["review_id"], True, "通过")
     await resources.install(alice, "skill", "report")
     await resources.install(bob, "skill", "report")
     await resources.update_installation(alice, "skill", "report", False)
@@ -125,11 +134,14 @@ async def test_personal_switches_are_independent_and_follow_current_shared_versi
     assert (await resources.personal.list_resources(bob, "skill"))["report"][
         "is_enabled"
     ] is True
-    await put_asset(
-        storage, version="2.0.0", owner_type="user", owner_id="admin", revision=2
+    await resources.save_skill(
+        admin, {
+            "resource_id": "report", "resource_version": "2.0.0",
+            "base_version": "1.0.0", "markdown": "# Report with a new workflow",
+        }
     )
     update = await shares.submit(admin, "skill", "report")
-    await shares.decide(admin, update["review_id"], True, "通过新版")
+    await shares.decide(reviewer, update["review_id"], True, "通过新版")
     assert (
         await resources.selected_for_personal(alice, "skill", enabled_only=True) == {}
     )

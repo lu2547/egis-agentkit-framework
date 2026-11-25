@@ -329,6 +329,12 @@ class ResourceService:
         latest = await self._latest_visible_assets(user, kind, rows, usable_only=True)
         return sorted(latest.values(), key=lambda row: row["resource_id"])
 
+    async def hub_page(self, user_id, kind, *, query, cursor, limit):
+        user = await UserService(self.storage, self.policies).get(user_id)
+        return await self.catalog_page(
+            user, kind, query=query or "", cursor=cursor, limit=limit, usable_only=True
+        )
+
     async def hub_asset(self, user_id, kind, rid, version):
         user = await UserService(self.storage).get(user_id)
         if version is None:
@@ -338,10 +344,49 @@ class ResourceService:
             )
             if rid not in selected:
                 raise NotFound()
-            return selected[rid]
+            return (
+                self._skill_locator(user, selected[rid])
+                if kind == "skill"
+                else selected[rid]
+            )
         asset = await self._asset(kind, rid, version)
         await self._require(user, asset)
-        return asset
+        return self._skill_locator(user, asset) if kind == "skill" else asset
+
+    async def publish_shared_skill(self, asset) -> None:
+        """Publish a fixed approved version; the caller holds its DB write lock."""
+        if asset["resource_type"] != "skill" or asset["owner_type"] != "user":
+            raise Forbidden("只能发布个人技能公共副本")
+        try:
+            await asyncio.to_thread(
+                self.skill_versions.publish_shared,
+                asset,
+                max_bytes=self.archive_limits.expanded_bytes_limit,
+                avatar_checksum=asset["payload"].get("avatar_checksum"),
+            )
+        except (OSError, NotFound) as exc:
+            raise AgentKitError(
+                "技能公共副本发布失败，请检查 NAS 存储后重试", 503
+            ) from exc
+
+    @classmethod
+    def _skill_locator(cls, user, asset, scope=None, *, view=None):
+        """Choose a physical copy after authorization, preserving business ownership."""
+        if asset["owner_type"] == "user" and asset["owner_id"] != user.user_id:
+            view = "shared"
+        if view is None and scope is not None:
+            binding = next(
+                (
+                    ref
+                    for ref in scope.definition["payload"].get("bindings", [])
+                    if cls._binding_matches(ref, asset)
+                ),
+                None,
+            )
+            if binding is not None:
+                view = binding.get("resource_view_type")
+        view = view or cls._asset_view(user, asset)
+        return {**asset, "storage_scope": "shared" if view == "shared" else "owner"}
 
     async def delete_skill(self, user: User, skill_id: str) -> None:
         """所有者删除技能，删除状态、选用和授权在同一事务提交。"""
@@ -425,18 +470,29 @@ class ResourceService:
             "grant_sources": grants or [],
         }
 
-    async def admin_list(self, user, kind, *, page=None):
+    async def admin_list(self, user, kind, *, page=None, query=""):
         user = await UserService(self.storage).get(user.user_id)
         require_admin(user)
         self._kind(kind)
+        if kind == "skill" and (
+            len(query) > self._catalog_pagination(kind).max_query_length
+            or "\0" in query
+        ):
+            raise InvalidRequest("无效的目录筛选")
         if page is None:
             rows = sorted(
                 await self._versions(kind),
                 key=lambda row: (row["resource_id"], asset_version_order(row)),
             )
         else:
-            rows = await self.storage.assets.page_admin_versions(
-                kind, offset=page.offset, limit=page.fetch_limit
+            rows = (
+                await self.storage.assets.skills.page_admin_versions(
+                    offset=page.offset, limit=page.fetch_limit, query=query.strip()
+                )
+                if kind == "skill"
+                else await self.storage.assets.page_admin_versions(
+                    kind, offset=page.offset, limit=page.fetch_limit
+                )
             )
             result = page.response(rows)
             rows = result["items"]
@@ -525,6 +581,56 @@ class ResourceService:
                     )
                 )
         return result
+
+    async def skill_versions_page(
+        self, user, rid, *, cursor=None, limit=None, query=""
+    ):
+        self._validate_identifier(rid)
+        settings = self._catalog_pagination("skill")
+        size = settings.default_page_size if limit is None else limit
+        if not 1 <= size <= settings.max_page_size:
+            raise InvalidRequest(f"分页大小必须介于 1 和 {settings.max_page_size} 之间")
+        if len(query) > settings.max_query_length or "\0" in query:
+            raise InvalidRequest("无效的目录筛选")
+        if cursor is not None and len(cursor) > settings.max_cursor_length:
+            raise InvalidRequest("无效的资源分页游标")
+        query = query.strip().lower()
+        scope = hashlib.sha256(
+            json.dumps([user.user_id, "skill-history", rid, query]).encode()
+        ).hexdigest()
+        after = self._catalog_after(cursor, scope) if cursor is not None else None
+        if after is not None and (not after.isdecimal() or not 0 < int(after) < 2**63):
+            raise InvalidRequest("无效的资源分页游标")
+        user = await UserService(self.storage, self.policies).get(user.user_id)
+        rows = await self.storage.assets.skills.page_history(
+            user, rid, after=int(after) if after else None, limit=size + 1, query=query
+        )
+        page = rows[:size]
+        snapshot = await self._read_snapshot(user, page, refresh_user=False)
+        installations, owners, credentials = await self._presentation(user, page)
+        items = []
+        for asset in page:
+            try:
+                items.append(
+                    await self._view(
+                        user,
+                        asset,
+                        snapshot=snapshot,
+                        installations=installations.get("skill"),
+                        owner_names=owners,
+                        credential_rows=credentials,
+                    )
+                )
+            except Forbidden:
+                continue
+        return {
+            "items": items,
+            "next_cursor": base64.urlsafe_b64encode(
+                json.dumps([scope, str(page[-1]["publication_revision"])]).encode()
+            ).decode()
+            if len(rows) > size
+            else None,
+        }
 
     @property
     def archive_limits(self) -> SkillArchiveConfig:
@@ -893,7 +999,7 @@ class ResourceService:
             if not usable and not editable and not self._tool_card_visible(user, asset):
                 raise Forbidden()
             if asset["resource_type"] == "skill":
-                payload["markdown"] = await self.read_skill_markdown(asset)
+                payload["markdown"] = await self.read_skill_markdown(self._skill_locator(user, asset))
                 payload["files"] = asset["payload"]["files"]
                 payload["base_version"] = asset["resource_version"]
             elif asset["resource_type"] == "mcp":
@@ -934,6 +1040,16 @@ class ResourceService:
             if editable and asset["resource_type"] == "skill"
             else {}
         )
+        if own and asset["resource_type"] == "skill":
+            shared_version = snapshot._shared_version("skill", asset["resource_id"])
+            sharing = snapshot._resource("skill", asset["resource_id"], shared_version)
+            if sharing is not None:
+                share.update(
+                    share_version=sharing["resource_version"],
+                    share_version_label=publication_label(
+                        require_skill_publication_revision(sharing["publication_revision"])
+                    ),
+                )
         owner = {"owner_type": asset["owner_type"], "owner_id": asset["owner_id"]}
         if asset["resource_type"] == "skill":
             if asset["owner_type"] == "system":
@@ -1045,17 +1161,51 @@ class ResourceService:
         return item
 
     async def catalog_page(
-        self, user, kind, *, cursor=None, limit=None, query="", category="", mine=False
+        self,
+        user,
+        kind,
+        *,
+        cursor=None,
+        limit=None,
+        query="",
+        category="",
+        mine=False,
+        resource_ids=None,
+        owner_type=None,
+        purpose=None,
+        usable_only=False,
+        runtime_names=None,
     ):
         """Page the catalog after selecting visible current versions and filters."""
         self._kind(kind)
+        if purpose not in (None, "grant"):
+            raise InvalidRequest("无效的目录用途")
+        if purpose == "grant" or owner_type is not None:
+            user = await UserService(self.storage, self.policies).get(user.user_id)
+            require_admin(user)
+            if kind != "skill" or owner_type not in (None, "system"):
+                raise InvalidRequest("授权目录仅支持系统技能")
+            owner_type = "system"
+        if resource_ids is not None:
+            if kind != "skill" or len(resource_ids) > 100:
+                raise InvalidRequest("每次最多查询 100 项技能")
+            for identifier in resource_ids:
+                self._validate_identifier(identifier)
+            resource_ids = sorted(set(resource_ids))
+        if runtime_names is not None:
+            if (
+                kind != "skill"
+                or len(runtime_names) > 100
+                or any(
+                    not isinstance(name, str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,40}_[a-f0-9]{12}", name)
+                    for name in runtime_names
+                )
+            ):
+                raise InvalidRequest("每次最多查询 100 个有效技能运行名称")
+            runtime_names = sorted(set(runtime_names))
         config = self.config.snapshot if self.config is not None else None
-        capability = "connector" if kind == "mcp" else kind
-        pagination = (
-            getattr(config, capability).catalog
-            if config is not None
-            else CatalogPaginationConfig()
-        )
+        pagination = self._catalog_pagination(kind)
         size = pagination.default_page_size if limit is None else limit
         if not 1 <= size <= pagination.max_page_size:
             raise InvalidRequest(
@@ -1070,7 +1220,20 @@ class ResourceService:
 
         query = query.strip().lower()
         scope = hashlib.sha256(
-            json.dumps([user.user_id, kind, query, category, mine]).encode()
+            json.dumps(
+                [
+                    user.user_id,
+                    kind,
+                    query,
+                    category,
+                    mine,
+                    resource_ids,
+                    owner_type,
+                    purpose,
+                    usable_only,
+                    runtime_names,
+                ]
+            ).encode()
         ).hexdigest()
         after = self._catalog_after(cursor, scope) if cursor is not None else None
         users = UserService(self.storage, self.policies)
@@ -1083,6 +1246,10 @@ class ResourceService:
                 query=query,
                 category=category,
                 mine=mine,
+                resource_ids=resource_ids,
+                owner_type=owner_type,
+                runtime_names=runtime_names,
+                enabled_only=purpose == "grant",
             )
         elif kind == "mcp":
             company_group_id = users.company_group().group_id
@@ -1103,10 +1270,10 @@ class ResourceService:
                 ),
             )
         items, more = await self._render_catalog_page(
-            user, kind, read_page, after=after, size=size
+            user, kind, read_page, after=after, size=size, usable_only=usable_only
         )
         metadata = {}
-        if after is None and kind == "skill":
+        if after is None and kind == "skill" and not usable_only:
             metadata = await assets.skills.catalog_metadata(user)
         elif after is None and kind == "tool":
             metadata = {"categories": list(TOOL_CATEGORIES)}
@@ -1120,7 +1287,13 @@ class ResourceService:
             **metadata,
         }
 
-    async def _render_catalog_page(self, user, kind, read_page, *, after, size):
+    def _catalog_pagination(self, kind):
+        if self.config is None:
+            return CatalogPaginationConfig()
+        capability = "connector" if kind == "mcp" else kind
+        return getattr(self.config.snapshot, capability).catalog
+
+    async def _render_catalog_page(self, user, kind, read_page, *, after, size, usable_only=False):
         # A grant can be revoked between selection and view assembly. Refill
         # from the last examined ID if a selected card is no longer visible.
         items = []
@@ -1152,7 +1325,7 @@ class ResourceService:
                     visible = item["is_usable"] or (
                         kind == "skill" and item["is_editable"]
                     )
-                if visible:
+                if visible and (not usable_only or item["is_usable"]):
                     items.append(item)
             if not more or len(items) == size:
                 return items, more
@@ -1669,7 +1842,9 @@ class ResourceService:
         asset = await self._asset("skill", resource_id, version)
         if not (for_edit and self._editable(user, asset)):
             await self._require(user, asset, authorization_scope)
-        return await self.export_skill_archive(asset, archive_limits=archive_limits)
+        return await self.export_skill_archive(
+            self._skill_locator(user, asset, authorization_scope), archive_limits=archive_limits
+        )
 
     async def read_skill_avatar(self, user, resource_id, version):
         asset = await self._asset("skill", resource_id, version)
@@ -1682,6 +1857,7 @@ class ResourceService:
             key: asset[key]
             for key in ("resource_id", "resource_version", "owner_type", "owner_id")
         }
+        locator = self._skill_locator(user, locator)
         content = await asyncio.to_thread(self.skill_versions.read_avatar, locator)
         if hashlib.sha256(content).hexdigest() != expected:
             raise NotFound()
@@ -1706,7 +1882,7 @@ class ResourceService:
     ):
         asset = await self._asset("skill", resource_id, version)
         await self._require(user, asset, authorization_scope)
-        return await self._runtime_skill(user, asset)
+        return await self._runtime_skill(user, self._skill_locator(user, asset, authorization_scope))
 
     async def skill_pin(self, user, ref, skill):
         asset = await self._asset("skill", ref["resource_id"], ref["resource_version"])
@@ -1726,7 +1902,9 @@ class ResourceService:
         await self._require(user, asset, authorization_scope)
         if asset["checksum_sha256"] != pin["source_checksum_sha256"]:
             raise Conflict("已激活技能的注册内容已变化，不能自动替换会话版本")
-        return await self._runtime_skill(user, asset)
+        return await self._runtime_skill(user, self._skill_locator(
+            user, asset, authorization_scope, view=pin["resource_view_type"]
+        ))
 
     async def mcps_for_refs(
         self,

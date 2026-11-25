@@ -36,6 +36,11 @@ class _LocalHub:
     async def _list(self, user_id, q, cursor, limit):
         if not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
+        if self.kind == "skill":
+            page = await self.resources.hub_page(
+                user_id, self.kind, query=q, cursor=cursor, limit=limit
+            )
+            return page["items"], page["next_cursor"]
         rows = await self.resources.hub_list(user_id, self.kind)
         needle = (q or "").casefold()
         rows = [

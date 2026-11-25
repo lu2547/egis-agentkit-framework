@@ -8,12 +8,14 @@ from egis_agentkit.service.access._grant import GrantService
 from egis_agentkit.service.access._permission import PermissionService
 from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.service.agent._agent_manager import AgentManager
-from egis_agentkit.storage.model import Asset, Grant, Group, ShareTarget
+from egis_agentkit.service.resource._catalog import ResourceService
+from egis_agentkit.storage.model import Grant, Group, ShareTarget
 
 
 @pytest.mark.asyncio
-async def test_manual_grant_uses_existing_shared_publication(storage):
-    _, admin, alice, bob = await identities(storage)
+async def test_personal_grant_requires_review_and_uses_existing_shared_publication(storage):
+    users, admin, alice, bob = await identities(storage)
+    carol = await users.sync_identity("carol", "Carol")
     definitions = AgentManager(storage)
     query = AgentManager(storage)
     shares = ShareService(storage)
@@ -33,28 +35,42 @@ async def test_manual_grant_uses_existing_shared_publication(storage):
     assert "snapshot" not in approved
     assert (await query.get_definition(bob, original.id, "shared"))["payload"] == original.payload
 
-    grant = await GrantService(storage).grant(
-        admin,
-        Grant(
-            principal_type="user",
-            principal_id=bob.user_id,
-            resource_type="agent",
-            resource_id=original.id,
-            resource_view_type="shared",
-            resource_owner_type="user",
-            resource_owner_id=alice.user_id,
-        ),
+    with pytest.raises(Forbidden):
+        await GrantService(storage).grant(
+            admin,
+            Grant(
+                principal_type="user",
+                principal_id=carol.user_id,
+                resource_type="agent",
+                resource_id=original.id,
+                resource_view_type="shared",
+                resource_owner_type="user",
+                resource_owner_id=alice.user_id,
+            ),
+        )
+    recipient = await shares.submit(
+        alice, "agent", original.id,
+        target=ShareTarget(principal_type="user", principal_id=carol.user_id),
+    )
+    approved_recipient = await shares.decide(admin, recipient["review_id"], True, "通过")
+    assert approved_recipient["resource_version"] == "1"
+    grant = next(
+        row for row in await GrantService(storage).list_grants(admin)
+        if row["source_review_id"] == recipient["review_id"]
     )
     assert "resource_version" not in grant
     with pytest.raises(Forbidden):
-        await query.get_definition(bob, original.id, "shared", version="2")
+        await query.get_definition(carol, original.id, "shared", version="2")
+    assert (await query.get_definition(carol, original.id, "shared"))["payload"] == original.payload
     await GrantService(storage).revoke(admin, grant["id"])
+    with pytest.raises(Forbidden):
+        await query.get_definition(carol, original.id, "shared")
     assert (await query.get_definition(bob, original.id, "shared"))["resource_version"] == "1"
 
 
 @pytest.mark.asyncio
 async def test_expert_share_adds_independent_dependency_paths_for_group_and_user(
-    storage,
+    storage, tmp_path,
 ):
     users, admin, alice, bob = await identities(storage)
     await users.save_group(admin, Group(group_id="team1", group_name="团队一"))
@@ -66,24 +82,22 @@ async def test_expert_share_adds_independent_dependency_paths_for_group_and_user
         admin, carol.model_copy(update={"group_ids": ["team1", "company"]})
     )
     dave = await users.sync_identity("dave", "D")
+    ed = await users.sync_identity("ed", "E")
     carol, bob = await users.get("carol"), await users.get("bob")
     permissions = PermissionService(storage)
-    shares = ShareService(storage)
+    resources = ResourceService(storage, tmp_path)
+    shares = ShareService(storage, publish_skill=resources.publish_shared_skill)
 
     async def publish_skill(version):
-        asset = Asset(
-            resource_type="skill",
-            resource_id="skill1",
-            resource_version=version,
-            publication_revision=int(version),
-            owner_type="user",
-            owner_id=alice.user_id,
+        await resources.save_skill(
+            alice,
+            {
+                "resource_id": "skill1",
+                "resource_version": version,
+                "markdown": f"# Skill workflow {version}",
+                **({"base_version": "1.0.0"} if version != "1.0.0" else {}),
+            },
         )
-        async with storage.definition_write() as write:
-            await write.assets.insert_asset(asset, actor=alice.user_id)
-            await GrantService(write).record_owner(
-                "skill", "skill1", asset.model_dump(), actor=alice.user_id
-            )
 
     async def share(owner, kind, identifier, group):
         review = await shares.submit(
@@ -94,34 +108,32 @@ async def test_expert_share_adds_independent_dependency_paths_for_group_and_user
         )
         return await shares.decide(admin, review["review_id"], True, "通过")
 
-    await publish_skill("1")
+    await publish_skill("1.0.0")
     skill_review = await share(alice, "skill", "skill1", "team1")
-    await publish_skill("2")
+    await publish_skill("2.0.0")
     definition = expert(owner=bob.user_id, name="expert2")
     definition.payload["bindings"] = [
         {
             "resource_type": "skill",
             "resource_id": "skill1",
-            "resource_version": "1",
+            "resource_version": "1.0.0",
             "resource_view_type": "shared",
         }
     ]
     await AgentManager(storage).add_definition(bob, definition)
     company_review = await share(bob, "agent", definition.id, "company")
-    direct = await GrantService(storage).grant(
-        admin,
-        Grant(
-            principal_type="user",
-            principal_id=dave.user_id,
-            resource_type="agent",
-            resource_id=definition.id,
-            resource_view_type="shared",
-            resource_owner_type="user",
-            resource_owner_id=bob.user_id,
-        ),
+    direct_review = await shares.submit(
+        bob, "agent", definition.id,
+        target=ShareTarget(principal_type="user", principal_id=dave.user_id),
     )
+    await shares.decide(admin, direct_review["review_id"], True, "通过")
     grants = await GrantService(storage).list_grants(admin)
     assert len(grants) == 7
+    direct = next(
+        row for row in grants
+        if row["source_review_id"] == direct_review["review_id"]
+        and row["root_grant_id"] is None
+    )
     company_grant = next(
         row
         for row in grants
@@ -144,7 +156,7 @@ async def test_expert_share_adds_independent_dependency_paths_for_group_and_user
     assert not (await permissions.explain(dave, "skill", "skill1", "shared")).is_allowed
     assert (
         await permissions.explain(carol, "skill", "skill1", "shared")
-    ).resource_version == "1"
+    ).resource_version == "1.0.0"
     root = await storage.definitions.get_definition_view(
         definition.id, "shared", version="1", grant_id=direct["id"]
     )
@@ -153,7 +165,7 @@ async def test_expert_share_adds_independent_dependency_paths_for_group_and_user
         bob,
         "agent",
         definition.id,
-        target=ShareTarget(principal_type="user", principal_id=dave.user_id),
+        target=ShareTarget(principal_type="user", principal_id=ed.user_id),
     )
     skill_grant = next(
         row for row in grants if row["source_review_id"] == skill_review["review_id"]

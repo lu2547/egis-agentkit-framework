@@ -60,8 +60,8 @@ class GrantService:
         )
         return page.response(rows)
 
-    async def grantable_resources(self, admin):
-        """列出每项资源可直接授权的当前版本。"""
+    async def grantable_resources(self, admin, *, include_skills=False):
+        """列出可直接授权的系统定义，技能选择使用分页目录。"""
         require_admin(admin)
         resources = []
         for kind in DEFINITION_KINDS:
@@ -69,13 +69,17 @@ class GrantService:
                 kind, excluded_agent_types=INTERNAL_AGENT_TYPES
             )
             for row in rows:
+                if row["owner_type"] != "system":
+                    continue
                 resources.append(
                     self._grantable_row(
                         kind, row["id"], row, row[f"{kind}_display_name"]
                     )
                 )
-        skills = await self.storage.assets.list_current_skill_versions()
+        skills = await self.storage.assets.list_current_skill_versions() if include_skills else []
         for row in sorted(skills, key=lambda skill: skill["resource_id"]):
+            if row["owner_type"] != "system":
+                continue
             version = row["shared_version"] or row["owner_version"]
             if row["publication_revision"] != version or not row["is_enabled"]:
                 continue
@@ -111,8 +115,10 @@ class GrantService:
         }
 
     async def grant(self, admin: User, data: Grant, *, write=None):
-        """立即发放授权，现有共享版优先于私有最新配置。"""
+        """立即发放系统资源授权，个人共享由审核入口发放。"""
         require_admin(admin)
+        if data.resource_owner_type != "system" or data.resource_view_type != "system":
+            raise Forbidden("个人资源请提交共享申请并由其他管理员审核")
         if write is None:
             async with self.storage.definition_write() as transaction:
                 return await self.grant(admin, data, write=transaction)
@@ -249,15 +255,14 @@ class GrantService:
             "principal_id": root["principal_id"],
         }
 
-    async def _grant_dependencies_many(self, roots, definition, *, actor, write):
+    async def definition_dependencies(self, definition, *, write):
+        """读取审批和派生授权共同使用的固定成员及技能版本。"""
         from egis_agentkit.storage._authorization import resource_rows
         from egis_agentkit.storage._definition import (
             build_definition_data,
             definition_view_selection,
         )
 
-        if not roots:
-            return
         team_id = definition["id"] if definition["definition_type"] == "team" else None
         members = [definition]
         if team_id:
@@ -300,6 +305,17 @@ class GrantService:
             (row["resource_id"], row["resource_version"]): row
             for row in await resource_rows(write.engine, references)
         }
+        for _, identifier, version in references:
+            asset = assets.get((identifier, version))
+            if asset is None or not asset["is_enabled"]:
+                raise NotFound("绑定资源指定版本不存在或已停用")
+        return members, assets
+
+    async def _grant_dependencies_many(self, roots, definition, *, actor, write):
+        if not roots:
+            return
+        team_id = definition["id"] if definition["definition_type"] == "team" else None
+        members, assets = await self.definition_dependencies(definition, write=write)
         retained = {root["id"]: set() for root in roots}
         parents = {}
         if team_id:
@@ -327,9 +343,7 @@ class GrantService:
                 for ref in member["payload"].get("bindings", []):
                     if ref["resource_type"] != "skill":
                         continue
-                    asset = assets.get((ref["resource_id"], ref["resource_version"]))
-                    if asset is None or not asset["is_enabled"]:
-                        raise NotFound("绑定资源指定版本不存在或已停用")
+                    asset = assets[ref["resource_id"], ref["resource_version"]]
                     layer.append(
                         self._dependency_values(
                             root,

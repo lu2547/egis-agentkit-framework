@@ -203,7 +203,7 @@ async def test_system_agent_requires_visibility_grant_even_for_admin(storage):
 
 
 @pytest.mark.asyncio
-async def test_grantable_agent_label_matches_shared_version(storage):
+async def test_grant_catalog_is_system_only_and_owner_label_matches_shared_version(storage):
     _, admin, alice, _ = await identities(storage)
     manager = agent_manager(storage)
     data = expert()
@@ -211,11 +211,21 @@ async def test_grantable_agent_label_matches_shared_version(storage):
     shares = ShareService(storage)
     review = await shares.submit(alice, "agent", created["id"], target=COMPANY)
     await shares.decide(admin, review["review_id"], True, "approved")
-    await manager.update_definition(alice, (data).id, agent_changes(data))
+    data.payload["description"] = "尚未审核的新内容"
+    await manager.update_definition(alice, data.id, agent_changes(data))
+    system = await manager.add_definition(
+        admin, expert("platform", "system", "system_writer")
+    )
     rows = await GrantService(storage).grantable_resources(admin)
-    row = next(item for item in rows if item["resource_id"] == created["id"])
+    assert [item["resource_id"] for item in rows] == [system["id"]]
+    row = rows[0]
     assert row["resource_version"] == "1"
     assert row["version_label"] == "1.0"
+    owner = await manager.get_definition(alice, created["id"], "private")
+    assert owner["resource_version"] == "2"
+    assert owner["share_version"] == "1"
+    assert owner["share_version_label"] == "1.0"
+    assert owner["can_share_update"]
 
 
 @pytest.mark.asyncio

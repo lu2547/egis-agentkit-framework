@@ -8,10 +8,12 @@ from agentscope.tool import Bash, Edit, Glob, Grep, Read, Write
 from sqlalchemy import event
 from test_domain import identities
 
+from egis_agentkit.core.skill._archive import calculate_files_digest
 from egis_agentkit.errors import Forbidden
 from egis_agentkit.service._admin_page import AdminPage
 from egis_agentkit.service.resource._catalog import ResourceService
 from egis_agentkit.storage.model import Asset
+from egis_agentkit.storage.skill._version import SkillVersionStorage
 
 
 @contextmanager
@@ -31,6 +33,10 @@ def sql_queries(storage):
 async def seed_owned_skills(storage, owner, count, *, prefix="skill"):
     async with storage.definition_write() as write:
         for index in range(count):
+            files = {"SKILL.md": f"# Skill {index}".encode()}
+            asset = dict(resource_id=f"{prefix}-{index:03}", resource_version="1.0.0",
+                         owner_type="user", owner_id=owner.user_id, checksum_sha256=calculate_files_digest(files))
+            SkillVersionStorage(storage.test_workspace_root).publish(asset, files, max_bytes=1024)
             await write.assets.insert_asset(
                 Asset(
                     resource_type="skill",
@@ -39,7 +45,7 @@ async def seed_owned_skills(storage, owner, count, *, prefix="skill"):
                     publication_revision=1,
                     owner_type="user",
                     owner_id=owner.user_id,
-                    checksum_sha256="a" * 64,
+                    checksum_sha256=asset["checksum_sha256"],
                     payload={"display_name": f"Skill {index}", "category": "Reports"},
                 ),
                 actor=owner.user_id,
@@ -331,31 +337,19 @@ async def test_shared_pages_deduplicate_grants_keep_shared_version_and_recheck_r
     storage, tmp_path
 ):
     from egis_agentkit.service.access._grant import GrantService
-    from egis_agentkit.storage.model import Grant, Group
+    from egis_agentkit.service.access._share import ShareService
+    from egis_agentkit.storage.model import Group, ShareTarget
 
     users, admin, alice, bob = await identities(storage)
     resources, grants = ResourceService(storage, tmp_path), GrantService(storage)
     await seed_owned_skills(storage, bob, 12)
+    shares = ShareService(storage, publish_skill=resources.publish_shared_skill)
     direct = []
     for index in range(12):
-        for principal_type, principal_id in (
-            ("user", alice.user_id),
-            ("group", "company"),
-        ):
-            direct.append(
-                await grants.grant(
-                    admin,
-                    Grant(
-                        principal_type=principal_type,
-                        principal_id=principal_id,
-                        resource_type="skill",
-                        resource_id=f"skill-{index:03}",
-                        resource_view_type="shared",
-                        resource_owner_type="user",
-                        resource_owner_id=bob.user_id,
-                    ),
-                )
-            )
+        for principal_type, principal_id in (("user", alice.user_id), ("group", "company")):
+            review = await shares.submit(bob, "skill", f"skill-{index:03}", target=ShareTarget(principal_type=principal_type, principal_id=principal_id))
+            await shares.decide(admin, review["review_id"], True, "")
+            direct.append(next(row for row in await grants.list_grants(admin) if row["source_review_id"] == review["review_id"]))
     async with storage.definition_write() as write:
         for index in range(12):
             await write.assets.insert_asset(

@@ -384,7 +384,7 @@ class DefinitionStorage:
         owner = identity.c.owner_version
         selected = func.coalesce(identity.c.shared_version, owner)
         query = _build_definition_query(identity, selected).where(
-            identity.c.deleted_at.is_(None)
+            identity.c.deleted_at.is_(None), identity.c.owner_type == "system"
         )
         if kind == "agent":
             query = query.where(

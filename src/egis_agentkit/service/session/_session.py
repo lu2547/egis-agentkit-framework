@@ -9,7 +9,11 @@ from agentscope.app.storage import (
     SessionRecord,
     TeamMember,
 )
-from agentscope.app.storage._model._session import ScheduleOrigin, TeamOrigin, UserOrigin
+from agentscope.app.storage._model._session import (
+    ScheduleOrigin,
+    TeamOrigin,
+    UserOrigin,
+)
 from agentscope.app.storage._utils import _resolve_team_leader
 from agentscope.event import ReplyEndEvent, ReplyFinishedReason
 from agentscope.permission import PermissionMode
@@ -593,7 +597,7 @@ class SessionService:
     async def delete_session(self, user, session_id, bus):
         """在项目和会话锁内删除主会话及其成员记录。"""
         session = await self.get_session_record(user, session_id, require_use=False)
-        if session.origin.type != "user":
+        if session.origin.type not in {"user", "schedule"}:
             raise Forbidden("只能删除主对话")
         project_id = session.state.middle_context["egis_agentkit"]["project_id"]
         async with self.projects.guard(user, project_id):

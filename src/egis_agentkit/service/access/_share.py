@@ -14,6 +14,7 @@ from egis_agentkit.service.access._permission import (
     INTERNAL_AGENT_TYPES,
     PermissionService,
 )
+from egis_agentkit.service.access._publication import same_publication_content
 from egis_agentkit.storage.model import Grant, ShareReview, ShareTarget, User, utcnow
 from egis_agentkit.storage.model._base import publication_label, resource_available
 
@@ -21,9 +22,10 @@ from egis_agentkit.storage.model._base import publication_label, resource_availa
 class ShareService:
     """记录并审核所有权限资源的共享申请。"""
 
-    def __init__(self, storage):
+    def __init__(self, storage, *, publish_skill=None):
         self.storage = storage
         self.grants = GrantService(storage)
+        self._publish_skill = publish_skill
 
     async def recipients(self, user: User):
         """列出有效个人和组织组供申请人选择。"""
@@ -105,6 +107,11 @@ class ShareService:
             else:
                 if not shared or shared == version:
                     raise Conflict("没有可提交的共享新版本")
+                previous = await self.grants.read_version(
+                    resource_type, resource_id, shared, write=write
+                )
+                if same_publication_content(resource, previous):
+                    raise Conflict("资源内容没有变化，无需共享新版本")
                 pending = resource.get("_has_pending_update")
                 if pending is None:
                     pending = await write.access.has_pending_update(
@@ -213,6 +220,8 @@ class ShareService:
             review = await write.access.locked_review(review_id)
             if review is None:
                 raise NotFound()
+            if admin.user_id in {review["submitted_by"], review["owner_id"]}:
+                raise Forbidden("不能审核自己的共享申请，请由其他管理员审核")
             desired = "approved" if is_approved else "rejected"
             if review["review_status_type"] == desired:
                 return await self._with_publication_label(review, storage=write)
@@ -233,6 +242,34 @@ class ShareService:
             if "_publication_revision" in review:
                 updated["_publication_revision"] = review["_publication_revision"]
             return await self._with_publication_label(updated, storage=write)
+
+    async def withdraw(self, user, review_id):
+        """所有者取消申请或撤回单个受众，保留其他入口及历史发布文件。"""
+        if not user.is_enabled:
+            raise Forbidden("用户已停用")
+        async with self.storage.definition_write() as write:
+            review = await write.access.locked_review(review_id)
+            if review is None:
+                raise NotFound("共享申请不存在")
+            if review["owner_id"] != user.user_id:
+                raise Forbidden("只能撤回自己的共享申请")
+            if review["review_status_type"] == "cancelled":
+                return
+            if review["review_status_type"] not in {"pending", "approved"}:
+                raise Conflict("该共享申请已处理，不能撤回")
+            if review["review_status_type"] == "approved":
+                if review["review_type"] != "share":
+                    raise Conflict("请在原共享申请中撤回接收方，已发布版本不能回退")
+                # definition_write 的授权写锁串行化受众增加、撤回和版本切换。
+                # 资源停用后仍允许所有者清理已发出的授权。
+                for grant in await write.access.direct_grants(
+                    review["resource_type"], review["resource_id"]
+                ):
+                    if grant["source_review_id"] == review_id:
+                        await write.access.revoke_grant(grant["id"], actor=user.user_id)
+            await write.access.update_review(review_id, {
+                "review_status_type": "cancelled", "is_current": False,
+            })
 
     async def _issue_approved_grant(self, admin, review, *, write):
         """重新校验申请版本，原子更新共享入口及其依赖。"""
@@ -255,6 +292,10 @@ class ShareService:
         if review["review_type"] == "update":
             if not shared or shared == version:
                 raise Conflict("没有可更新的共享版本")
+            previous = await self.grants.read_version(kind, identifier, shared, write=write)
+            if same_publication_content(resource, previous):
+                raise Conflict("资源内容没有变化，无需共享新版本")
+            await self._publish_dependencies(resource, write=write)
             await write.access.set_shared_version(kind, identifier, version)
             if kind in DEFINITION_KINDS:
                 await self.grants.refresh_dependencies(
@@ -268,6 +309,7 @@ class ShareService:
             principal_id=review["principal_id"],
         )
         await self._check_new_recipient(kind, identifier, target, write=write)
+        await self._publish_dependencies(resource, write=write)
         await self.grants.issue(
             admin,
             Grant(
@@ -310,12 +352,17 @@ class ShareService:
         if review["review_type"] == "update":
             if not shared or shared == version:
                 raise Conflict("没有可更新的共享版本")
+            previous = await self.grants.read_version("skill", identifier, shared, write=write)
+            if same_publication_content(resource, previous):
+                raise Conflict("资源内容没有变化，无需共享新版本")
+            await self._publish_personal_skill(resource)
             await write.access.set_shared_version("skill", identifier, version)
             return
         if shared is not None and shared != version:
             raise Conflict("共享版本已变更，请重新申请")
         if resource["_has_share_recipient"]:
             raise Conflict("该接收方已有共享授权")
+        await self._publish_personal_skill(resource)
         await self.grants.issue(
             admin,
             Grant(
@@ -331,3 +378,22 @@ class ShareService:
             resource,
             write=write,
         )
+
+    async def _publish_dependencies(self, definition, *, write):
+        _, assets = await self.grants.definition_dependencies(definition, write=write)
+        for asset in assets.values():
+            await self._publish_personal_skill(asset)
+
+    async def _publish_personal_skill(self, resource):
+        if resource["owner_type"] != "user":
+            return
+        if self._publish_skill is None:
+            from egis_agentkit.service.resource._catalog import ResourceService
+
+            files = self.storage.history.files
+            publisher = ResourceService(
+                self.storage, files.root, config=files.config
+            ).publish_shared_skill
+        else:
+            publisher = self._publish_skill
+        await publisher(resource)

@@ -8,8 +8,9 @@ from test_domain import identities
 from egis_agentkit.client.nacos._settings import SkillConfig
 from egis_agentkit.errors import InvalidRequest
 from egis_agentkit.service.access._grant import GrantService
+from egis_agentkit.service.access._share import ShareService
 from egis_agentkit.service.resource._catalog import ResourceService
-from egis_agentkit.storage.model import Asset, Grant
+from egis_agentkit.storage.model import Asset, ShareTarget
 
 
 def identifiers(page):
@@ -129,18 +130,10 @@ async def test_skill_catalog_refills_if_a_shared_grant_is_revoked_during_read(
         )
     await resources.set_asset_enabled(alice, "skill", "second-own", "1.0.0", False)
     grants = GrantService(storage)
-    grant = await grants.grant(
-        admin,
-        Grant(
-            principal_type="user",
-            principal_id=alice.user_id,
-            resource_type="skill",
-            resource_id="first-shared",
-            resource_view_type="shared",
-            resource_owner_type="user",
-            resource_owner_id=bob.user_id,
-        ),
-    )
+    sharing = ShareService(storage, publish_skill=resources.publish_shared_skill)
+    review = await sharing.submit(bob, "skill", "first-shared", target=ShareTarget(principal_type="user", principal_id="alice"))
+    await sharing.decide(admin, review["review_id"], True, "")
+    grant = next(row for row in await grants.list_grants(admin) if row["resource_id"] == "first-shared")
     await resources.save_skill(
         bob,
         {
@@ -264,7 +257,11 @@ async def test_manager_resource_routes_opt_in_to_catalog_pages(storage, tmp_path
         for path in ("skills", "connectors", "tools"):
             legacy = await client.get(f"/manager/{path}")
             assert legacy.status_code == 200
-            assert set(legacy.json()) == {"items"}
+            assert "items" in legacy.json()
+            if path == "skills":
+                assert "next_cursor" in legacy.json()
+            else:
+                assert set(legacy.json()) == {"items"}
             page = await client.get(f"/manager/{path}", params={"catalog": "true"})
             assert page.status_code == 200
             assert len(page.json()["items"]) == min(10, len(legacy.json()["items"]))

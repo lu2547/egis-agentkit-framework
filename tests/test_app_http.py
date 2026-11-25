@@ -208,13 +208,19 @@ async def test_http_identity_native_write_seal_and_real_task_files(
             identifier = controlled.json()["id"]
             catalog = (await client.get("/manager/agents")).json()
             assert set(catalog) == {"items", "next_cursor"}
-            assert [item["id"] for item in catalog["items"]] == [identifier]
+            from egis_agentkit.core.skill._assistant import SKILL_ASSISTANT_ID
+            assert [item["id"] for item in catalog["items"]] == [identifier, SKILL_ASSISTANT_ID]
             page = await client.get(
                 "/manager/agents", params={"type": "expert", "limit": 1}
             )
             assert page.status_code == 200
             assert [item["id"] for item in page.json()["items"]] == [identifier]
-            assert page.json()["next_cursor"] is None
+            assert page.json()["next_cursor"] is not None
+            next_page = await client.get("/manager/agents", params={
+                "type": "expert", "limit": 1, "cursor": page.json()["next_cursor"]
+            })
+            assert [item["id"] for item in next_page.json()["items"]] == [SKILL_ASSISTANT_ID]
+            assert next_page.json()["next_cursor"] is None
             filtered = await client.get(
                 "/manager/agents",
                 params={
