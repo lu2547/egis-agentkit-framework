@@ -298,7 +298,7 @@ class SkillConfig(ConfigModel):
 class ConnectorOAuthConfig(ConfigModel):
     credential_key_env: SecretRef = "AGENTKIT_MCP_CREDENTIAL_KEY"
     redirect_uri: str | None = None
-    redirect_uri_env: SecretRef | None = None
+    redirect_uri_env: SecretRef | None = "AGENTKIT_MCP_OAUTH_REDIRECT_URI"
     timeout_seconds: Seconds = 10
     state_lifetime_seconds: Seconds = 600
     refresh_window_seconds: NonNegativeSeconds = 15

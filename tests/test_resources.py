@@ -33,7 +33,7 @@ def archive(name="report", extra="references/checklist.md"):
     return out.getvalue()
 
 
-async def test_owner_deletes_skill_and_revokes_access_to_all_versions(storage, tmp_path):
+async def test_owner_deletes_skill_after_approved_withdrawal_and_revokes_all_versions(storage, tmp_path):
     import httpx
     from egis_agentkit_app.bootstrap._router import manager_router
     from egis_agentkit_app.controller.base import current_user
@@ -71,6 +71,11 @@ async def test_owner_deletes_skill_and_revokes_access_to_all_versions(storage, t
         app.dependency_overrides[current_user] = lambda: bob
         assert (await client.delete(url)).status_code == 403
         app.dependency_overrides[current_user] = lambda: alice
+        assert (await client.delete(url)).status_code == 409
+        withdrawal = await shares.withdraw(alice, approved["review_id"])
+        assert (await client.delete(url)).status_code == 409
+        assert (await resources.detail(bob, "skill", rid, version))["is_usable"]
+        await shares.decide(admin, withdrawal["review_id"], True, "批准撤回后删除")
         assert (await client.delete(url)).status_code == 204
         assert (await client.delete(url)).status_code == 404
     assert not await resources.list(alice, "skill")

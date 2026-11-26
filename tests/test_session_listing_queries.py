@@ -12,6 +12,7 @@ from sqlalchemy import event
 from test_domain import expert, identities
 
 from egis_agentkit.core.message_bus import EgisMessageBus
+from egis_agentkit.errors import Conflict
 from egis_agentkit.service.agent._agent_manager import AgentManager
 from egis_agentkit.service.session._session import SessionService
 
@@ -288,7 +289,14 @@ async def test_listing_keeps_shared_pinned_history_but_filters_deleted_definitio
     expected = await service.get_session(bob, task["session_id"])
     assert expected["resource_version"] == "1"
     assert await service.list_sessions(bob) == [expected]
-    await agents.delete_definition(alice, source["id"])
+    with pytest.raises(Conflict, match="撤回.*审核"):
+        await agents.delete_definition(alice, source["id"])
+    # Retain the approved entry while isolating the deleted-source list filter.
+    # End-to-end withdrawal approval is covered by test_share_review_workflow.
+    grants = await storage.access.direct_grants("agent", source["id"])
+    async with storage.definition_write() as write:
+        await write.definitions.delete_definition(source["id"], actor=admin.user_id)
+    assert await storage.access.direct_grants("agent", source["id"]) == grants
     assert await service.list_sessions(bob) == []
 
 

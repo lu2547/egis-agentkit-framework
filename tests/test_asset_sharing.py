@@ -122,7 +122,9 @@ async def test_asset_update_moves_one_shared_publication(storage, tmp_path):
     assert {
         row["source_review_id"] for row in grants if row["grant_source_type"] == "share"
     } == {first["review_id"]}
-    await resources.set_asset_enabled(alice, "skill", "versions", "2.0.0", False)
+    with pytest.raises(Conflict, match="撤回.*审核"):
+        await resources.set_asset_enabled(alice, "skill", "versions", "2.0.0", False)
+    await resources.set_asset_enabled(admin, "skill", "versions", "2.0.0", False, admin=True)
     with pytest.raises(Forbidden):
         await resources.detail(bob, "skill", "versions", "2.0.0")
     with pytest.raises(Conflict):

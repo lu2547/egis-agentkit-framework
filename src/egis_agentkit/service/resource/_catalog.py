@@ -400,6 +400,9 @@ class ResourceService:
                 raise NotFound("技能不存在")
             if (skill["owner_type"], skill["owner_id"]) != ("user", user.user_id):
                 raise Forbidden("只能删除自己创建的个人技能")
+            await GrantService(write).require_withdrawal_before_delete(
+                user, "skill", skill_id, write=write
+            )
             await write.assets.delete_skill(skill_id, actor=user.user_id)
             await write.access.revoke_resource("skill", skill_id, actor=user.user_id)
             await write.access.cancel_pending_reviews("skill", skill_id)
@@ -415,6 +418,11 @@ class ResourceService:
             asset = await self._asset(kind, rid, version, assets=write.assets)
             if not admin and not self._editable(user, asset):
                 raise Forbidden()
+            if (not enabled and asset["owner_type"] == "user"
+                    and asset["owner_id"] == user.user_id):
+                await GrantService(write).require_withdrawal_before_delete(
+                    user, kind, rid, write=write, version=asset["resource_version"]
+                )
             if not enabled and is_system_default_tool(asset):
                 raise Conflict("系统默认工具不能停用")
             await write.assets.set_enabled(

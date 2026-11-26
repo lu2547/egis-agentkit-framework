@@ -13,9 +13,10 @@
 | 1 | [01_schedules.sql](01_schedules.sql) | 扩展 `schedules` 的项目关联、下次执行时间、软删除字段；创建 `ak_schedule_runs` 及调度/历史索引 |
 | 2 | [02_personal_optional_tools.sql](02_personal_optional_tools.sql) | 个人助理资源选择的类型约束增加 `tool`；保留已有 Skill/MCP 选择，不默认勾选工具 |
 | 3 | [nas-history.sql](nas-history.sql) | 创建 NAS 历史提交位置表、删除任务表和写入序列，可在既有 1.0.3 环境单独执行 |
-| 4 | [03_verify_schema.sql](03_verify_schema.sql) | 只读输出 38 项结构、约束和索引检查，`passed` 必须全部为 `true` |
+| 4 | [04_share_review_workflow.sql](04_share_review_workflow.sql) | 增加撤回申请原审批关联、提交内容快照和待审撤回唯一索引；不修改现有授权或审核状态 |
+| 5 | [03_verify_schema.sql](03_verify_schema.sql) | 只读输出 38 项结构、约束和索引检查，`passed` 必须全部为 `true` |
 
-在发布窗口停止 API/Worker 后执行 DDL。三个 DDL 脚本自带事务，可重复执行，锁等待超时为 5 秒；失败时该脚本的事务回滚。普通建索引和 ALTER TABLE 会持锁，因此不要在长任务仍在运行时直接执行。校验脚本不修改业务数据。
+在发布窗口停止 API/Worker 后执行 DDL。四个 DDL 脚本自带事务，可重复执行，锁等待超时为 5 秒；失败时该脚本的事务回滚。普通建索引和 ALTER TABLE 会持锁，因此不要在长任务仍在运行时直接执行。校验脚本不修改业务数据。
 
 以下命令从 Framework 根目录执行。使用与应用相同的数据库及**单一 schema**，不要照抄 `public` 代替实际部署值。`PGHOST/PGPORT/PGUSER` 和认证由平台提供，密码放受保护的 `PGPASSFILE` 或平台注入的环境变量，不写进脚本。
 
@@ -30,8 +31,13 @@ PGOPTIONS='-c search_path=public' psql -X -v ON_ERROR_STOP=1 \
   --dbname='<实际数据库名>' --file=scripts/releases/1.0.3/nas-history.sql
 
 PGOPTIONS='-c search_path=public' psql -X -v ON_ERROR_STOP=1 \
+  --dbname='<实际数据库名>' --file=scripts/releases/1.0.3/04_share_review_workflow.sql
+
+PGOPTIONS='-c search_path=public' psql -X -v ON_ERROR_STOP=1 \
   --dbname='<实际数据库名>' --file=scripts/releases/1.0.3/03_verify_schema.sql
 ```
+
+共享撤回在管理员通过前继续保留当前授权；所有者不能通过删除或停用已共享版本绕过审批。`04_share_review_workflow.sql` 为既有 1.0.3 环境的追加升级。旧申请的快照保持空值，详情明确标识为重建内容，历史 MCP 只能展示当前重建配置。新申请保存安全连接配置及修订号，技能包仍保存在版本文件存储中。
 
 受管定时任务只读取带项目关联的任务；已有原生 `schedules` 行保持原状。Kafka 继续处理集群唤醒和广播，PG 继续保存队列、注册信息和租约。Redis Streams 保存会话事件回放。旧自研引导链路的待发消息应在切换前排空。
 

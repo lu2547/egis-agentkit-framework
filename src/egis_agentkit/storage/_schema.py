@@ -23,6 +23,7 @@ from .migration._project import (
     migrate_session_workspaces,
 )
 from .migration._sequences import repair_sequences
+from .migration._share_reviews import migrate_share_reviews
 from .migration._skills import migrate_skills
 from .migration._table_names import RENAMES as TABLE_RENAMES
 from .migration._table_names import migrate_table_names
@@ -120,6 +121,8 @@ async def init_schema(engine):
                 raise ValueError(
                     "工作区变更表缺少会话归属字段或索引，请通过部署 SQL 脚本更新"
                 )
+        if await migrate_share_reviews(connection, schema) == "pending":
+            raise ValueError("共享审核表需要通过部署 SQL 脚本更新")
         await connection.run_sync(native.create_all, tables=required)
         await create_schedule_columns(connection)
         if assets.name in existing:
@@ -245,6 +248,7 @@ async def upgrade_schema(
         states["技能版本指针"] = await migrate_skills(
             connection, schema, access_pending=states["授权和共享版本"] == "pending"
         )
+        states["共享撤回与审核快照"] = await migrate_share_reviews(connection, schema)
         states["MCP 历史配置"] = await migrate_connectors(connection, schema)
         states[LEGACY_PROJECT_SESSIONS] = (
             await _check_legacy_project_links(
@@ -299,6 +303,9 @@ async def upgrade_schema(
                 connection, schema, apply=True
             )
         if apply:
+            states["共享撤回与审核快照"] = await migrate_share_reviews(
+                connection, schema, apply=True
+            )
             states["MCP 历史配置"] = await migrate_connectors(
                 connection, schema, apply=True
             )

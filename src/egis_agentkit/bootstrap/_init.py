@@ -58,6 +58,7 @@ from egis_agentkit.service.resource._skill_import import SkillImportService
 from egis_agentkit.service.schedule._service import ScheduleService
 from egis_agentkit.service.schedule._worker import ScheduleWorker
 from egis_agentkit.service.session._authorization import ChatAuthorizationStore
+from egis_agentkit.service.session._execution_phase import SessionExecutionPhase
 from egis_agentkit.service.session._message_bus_override import SessionMessageBus
 from egis_agentkit.service.session._preparation import SessionPreparationService
 from egis_agentkit.service.session._session import SessionService
@@ -231,7 +232,12 @@ def init_agentkit(
     models = ModelService(storage, config)
     memory = (
         ProjectMemoryService(
-            storage, root, config, middleware_factory=ProjectMemoryMiddlewareOverride
+            storage,
+            root,
+            config,
+            middleware_factory=partial(
+                ProjectMemoryMiddlewareOverride, progress=SessionExecutionPhase(bus)
+            ),
         )
         if snapshot.project.memory.is_enabled
         else None

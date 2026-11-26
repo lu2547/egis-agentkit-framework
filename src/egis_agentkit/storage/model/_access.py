@@ -1,7 +1,7 @@
 """定义共享对象、资源授权和固定发布版本的审核记录。"""
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field
 
@@ -37,7 +37,9 @@ class ShareReview(Model):
     resource_type: ManagedResourceType
     resource_id: str
     resource_version: str
-    review_type: Literal["share", "update"] = "share"
+    review_type: Literal["share", "update", "revoke"] = "share"
+    original_review_id: str | None = None
+    content_snapshot: dict[str, Any] | None = None
     owner_id: str
     review_status_type: Literal["pending", "approved", "rejected", "cancelled"] = (
         "pending"

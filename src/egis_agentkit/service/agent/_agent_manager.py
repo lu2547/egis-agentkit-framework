@@ -160,6 +160,9 @@ class AgentManager:
                 previous["owner_type"],
                 previous["owner_id"],
             )
+            await GrantService(write).require_withdrawal_before_delete(
+                user, "agent", definition_id, write=write
+            )
             # 2. 定义删除与授权回收一起提交，失败一起回滚。
             await write.agents.delete_definition(definition_id, actor=user.user_id)
             await GrantService(write).retire_definition_grants(

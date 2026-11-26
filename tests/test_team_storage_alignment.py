@@ -55,6 +55,11 @@ async def test_team_versions_sharing_and_deletion_match_agent_semantics(storage)
     assert shared["version"] == 1 and shared["payload"]["description"] == "首版"
     with pytest.raises(Conflict):
         await teams.save(owner, changed)
+    with pytest.raises(Conflict, match="撤回.*审核"):
+        await teams.delete(owner, first["id"])
+    withdrawal = await ShareService(storage).withdraw(owner, review["review_id"])
+    assert (await teams.read(recipient, first["id"], "shared"))["version"] == 1
+    await ShareService(storage).decide(admin, withdrawal["review_id"], True, "批准撤回")
     await teams.delete(owner, first["id"])
     deleted = await storage.definitions.get_definition(first["id"])
     assert deleted["deleted_at"] is not None

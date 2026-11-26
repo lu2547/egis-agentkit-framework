@@ -294,6 +294,23 @@ class AccessStorage:
             rows = await conn.execute(statement)
             return [dict(row) for row in rows.mappings()]
 
+    async def owned_sharing_roots(self, kind, identifier, owner_id, *, conn=None):
+        """Find current entry grants that expose an owner's resource or dependency."""
+        conn = transaction_connection(self.engine, conn)
+        grants = t.resource_permission
+        root = grants.alias("sharing_root")
+        rows = await conn.execute(select(root).join(
+            grants, root.c.id == func.coalesce(grants.c.root_grant_id, grants.c.id)
+        ).where(
+            grants.c.resource_type == kind,
+            grants.c.resource_id == identifier,
+            grants.c.resource_owner_type == "user",
+            grants.c.resource_owner_id == owner_id,
+            grants.c.grant_source_type.in_(("share", "manual", "dependency")),
+            grants.c.revoked_at.is_(None), root.c.revoked_at.is_(None),
+        ).distinct())
+        return [dict(row) for row in rows.mappings()]
+
     async def direct_grants(
         self, kind, identifier, *, include_revoked=False, conn=None
     ):
@@ -741,7 +758,7 @@ class AccessStorage:
     async def list_reviews(
         self, *, owner_id: str | None = None, offset: int = 0, limit: int | None = None
     ) -> list[dict]:
-        statement = select(t.approvals).order_by(t.approvals.c.submitted_at.desc())
+        statement = select(*[column for column in t.approvals.c if column.name != "content_snapshot"]).order_by(t.approvals.c.submitted_at.desc())
         if owner_id is not None:
             statement = statement.where(t.approvals.c.owner_id == owner_id)
         if limit is not None:
@@ -750,8 +767,20 @@ class AccessStorage:
             )
         selected = statement.subquery("review_page")
         detail = t.skill_detail
+        grants = t.resource_permission
+        active_share = select(grants.c.id).where(
+            grants.c.source_review_id == selected.c.review_id,
+            grants.c.resource_type == selected.c.resource_type,
+            grants.c.resource_id == selected.c.resource_id,
+            grants.c.grant_source_type == "share",
+            grants.c.root_grant_id.is_(None),
+            grants.c.revoked_at.is_(None),
+        ).correlate(selected).exists()
         statement = (
-            select(selected, detail.c.version.label("_publication_revision"))
+            select(
+                selected, detail.c.version.label("_publication_revision"),
+                active_share.label("has_active_share"),
+            )
             .select_from(selected)
             .outerjoin(
                 detail,
@@ -773,6 +802,24 @@ class AccessStorage:
         async with self.engine.connect() as conn:
             rows = await conn.execute(statement)
             return [dict(row) for row in rows.mappings()]
+
+    async def get_review(self, review_id, *, conn=None):
+        if conn is None:
+            async with self.engine.connect() as connection:
+                return await self.get_review(review_id, conn=connection)
+        row = (await conn.execute(
+            select(t.approvals).where(t.approvals.c.review_id == review_id)
+        )).mappings().first()
+        return dict(row) if row is not None else None
+
+    async def pending_revocation(self, original_review_id, *, conn=None):
+        conn = transaction_connection(self.engine, conn)
+        row = (await conn.execute(select(t.approvals).where(
+            t.approvals.c.original_review_id == original_review_id,
+            t.approvals.c.review_type == "revoke",
+            t.approvals.c.review_status_type == "pending",
+        ))).mappings().first()
+        return dict(row) if row is not None else None
 
     async def locked_review(
         self, review_id: str, *, conn: AsyncConnection | None = None

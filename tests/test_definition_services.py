@@ -192,7 +192,14 @@ async def test_definition_views_are_engine_only_reads_not_use_authorization(stor
     assert (await views.get_definition_view(row["id"], "shared", version="1"))["payload"][
         "system_prompt"
     ] == "旧版"
-    await agents.delete_definition(alice, row["id"])
+    with pytest.raises(Conflict, match="撤回.*审核"):
+        await agents.delete_definition(alice, row["id"])
+    # This engine-only read test retains grants while independently tombstoning
+    # the source, so its failure proves the lifecycle filter rather than revocation.
+    grants = await storage.access.direct_grants("agent", row["id"])
+    async with storage.definition_write() as write:
+        await write.definitions.delete_definition(row["id"], actor=admin.user_id)
+    assert await storage.access.direct_grants("agent", row["id"]) == grants
     with pytest.raises(Forbidden):
         await views.get_definition_view(row["id"], "shared")
     with pytest.raises(NotFound):

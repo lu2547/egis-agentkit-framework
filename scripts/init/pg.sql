@@ -208,6 +208,8 @@ CREATE TABLE ak_approve (
     resource_type VARCHAR(16) NOT NULL,
     resource_id VARCHAR(128) NOT NULL,
     review_type VARCHAR(16) DEFAULT 'share' NOT NULL,
+    original_review_id VARCHAR(64) REFERENCES ak_approve (review_id),
+    content_snapshot JSONB,
     owner_id VARCHAR(128) NOT NULL,
     review_status_type VARCHAR(16) NOT NULL,
     is_current BOOLEAN NOT NULL,
@@ -224,12 +226,15 @@ CREATE TABLE ak_approve (
     CHECK (resource_type IN ('agent','team','skill','mcp')),
     CHECK (resource_version <> ''),
     CHECK (NOT is_current OR review_status_type='approved'),
-    CONSTRAINT ck_ak_approve_target CHECK ((review_type = 'share' AND share_scope_type IS NOT NULL AND share_scope_type IN ('user','group') AND principal_id IS NOT NULL AND principal_id NOT IN ('', '*')) OR (review_type = 'update' AND share_scope_type IS NULL AND principal_id IS NULL))
+    CONSTRAINT ck_ak_approve_original CHECK ((review_type = 'revoke') = (original_review_id IS NOT NULL)),
+    CONSTRAINT ck_ak_approve_target CHECK ((review_type IN ('share','revoke') AND share_scope_type IS NOT NULL AND share_scope_type IN ('user','group') AND principal_id IS NOT NULL AND principal_id NOT IN ('', '*')) OR (review_type = 'update' AND share_scope_type IS NULL AND principal_id IS NULL))
 );
 
 CREATE INDEX ix_ak_approve_resource_version ON ak_approve (resource_type, resource_id, resource_version);
 
 CREATE UNIQUE INDEX uq_ak_approve_pending_update ON ak_approve (resource_type, resource_id) WHERE review_type = 'update' AND review_status_type = 'pending';
+
+CREATE UNIQUE INDEX uq_ak_approve_pending_revoke ON ak_approve (original_review_id) WHERE review_type = 'revoke' AND review_status_type = 'pending';
 
 CREATE TABLE ak_feedback (
     id VARCHAR(64) NOT NULL,

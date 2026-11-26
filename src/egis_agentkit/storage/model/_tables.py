@@ -477,6 +477,8 @@ approvals = Table(
     Column("resource_type", String(16), nullable=False),
     Column("resource_id", String(128), nullable=False),
     Column("review_type", String(16), nullable=False, server_default="share"),
+    Column("original_review_id", String(64), ForeignKey("ak_approve.review_id")),
+    Column("content_snapshot", JSONB),
     Column("owner_id", String(128), nullable=False),
     Column("review_status_type", String(16), nullable=False),
     Column("is_current", Boolean, nullable=False),
@@ -493,9 +495,10 @@ approvals = Table(
     ),
     CheckConstraint("resource_type IN ('agent','team','skill','mcp')"),
     CheckConstraint("resource_version <> ''"),
+    CheckConstraint("(review_type = 'revoke') = (original_review_id IS NOT NULL)", name="ck_ak_approve_original"),
     CheckConstraint("NOT is_current OR review_status_type='approved'"),
     CheckConstraint(
-        "(review_type = 'share' AND share_scope_type IS NOT NULL "
+        "(review_type IN ('share', 'revoke') AND share_scope_type IS NOT NULL "
         "AND share_scope_type IN ('user','group') AND principal_id IS NOT NULL "
         "AND principal_id NOT IN ('', '*')) OR "
         "(review_type = 'update' AND share_scope_type IS NULL AND principal_id IS NULL)",
@@ -514,6 +517,13 @@ Index(
     approvals.c.resource_id,
     unique=True,
     postgresql_where=text("review_type = 'update' AND review_status_type = 'pending'"),
+)
+
+Index(
+    "uq_ak_approve_pending_revoke",
+    approvals.c.original_review_id,
+    unique=True,
+    postgresql_where=text("review_type = 'revoke' AND review_status_type = 'pending'"),
 )
 
 projects = Table(

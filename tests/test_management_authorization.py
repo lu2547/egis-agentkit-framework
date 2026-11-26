@@ -94,14 +94,16 @@ async def test_owner_withdraws_one_audience_and_preserves_other_grants(storage):
         principal_type="user", principal_id=admin.user_id
     ))
     await sharing.decide(admin, extra["review_id"], True, "")
-    await sharing.withdraw(alice, review["review_id"])
+    withdrawal = await sharing.withdraw(alice, review["review_id"])
     await sharing.withdraw(alice, review["review_id"])
     permissions = PermissionService(storage)
+    assert (await permissions.explain(bob, "agent", source["id"], "shared")).is_allowed
+    await sharing.decide(admin, withdrawal["review_id"], True, "approved withdrawal")
     assert not (await permissions.explain(bob, "agent", source["id"], "shared")).is_allowed
     assert (await permissions.explain(admin, "agent", source["id"], "shared")).is_allowed
     assert (await permissions.explain(alice, "agent", source["id"], "private")).is_allowed
     reviews = {row["review_id"]: row for row in await sharing.list(alice)}
-    assert reviews[review["review_id"]]["review_status_type"] == "cancelled"
+    assert reviews[review["review_id"]]["review_status_type"] == "approved"
     assert not reviews[review["review_id"]]["is_current"]
 
 

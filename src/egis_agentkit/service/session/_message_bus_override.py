@@ -29,6 +29,7 @@ from egis_agentkit.core.session._context import (
 )
 from egis_agentkit.errors import AgentKitError
 from egis_agentkit.service.session._authorization import ChatAuthorizationStore
+from egis_agentkit.service.session._execution_phase import SessionExecutionPhase
 from egis_agentkit.service.session._preparation import SessionPreparationService
 from egis_agentkit.service.session._rewrite_notice import publish_rewrite_notice
 from egis_agentkit.service.session._steering_projection import SteeringPresentation
@@ -262,6 +263,8 @@ class SessionMessageBus(EgisMessageBus):
                     await lifetime.enter_async_context(
                         super().acquire_lock(key, ttl_secs=ttl_secs)
                     )
+                if key.startswith(prefix):
+                    await SessionExecutionPhase(self)(key[len(prefix) :], None, None)
                 if (
                     key.startswith(prefix)
                     and self.delegate is None

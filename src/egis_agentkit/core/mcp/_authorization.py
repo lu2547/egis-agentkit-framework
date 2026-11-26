@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 from datetime import timedelta
+from ipaddress import ip_address
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -37,16 +38,24 @@ from egis_agentkit.storage.model import (
 _STATUS_NOT_LOADED = object()
 
 
-def _https(url):
-    """解析 OAuth 端点，拒绝明文连接及携带用户信息的 URL。"""
+def _https(url, *, allow_loopback_http=False):
+    """解析 OAuth 地址，仅对显式本机回调允许 HTTP。"""
     if not isinstance(url, str) or any(ord(character) <= 32 for character in url):
         raise ValueError("MCP OAuth URL is required")
     parsed = urlsplit(url)
+    loopback_http = False
+    if allow_loopback_http and parsed.scheme == "http":
+        try:
+            loopback_http = (
+                parsed.hostname == "localhost" or ip_address(parsed.hostname).is_loopback
+            )
+        except ValueError:
+            pass
     if (
-        parsed.scheme != "https"
+        (parsed.scheme != "https" and not loopback_http)
         or not parsed.hostname
-        or parsed.username
-        or parsed.password
+        or parsed.username is not None
+        or parsed.password is not None
         or parsed.fragment
         or parsed.port == 0
     ):
@@ -90,9 +99,7 @@ class MCPAuthorization:
     def settings(self) -> ConnectorOAuthConfig:
         """取得当前已校验的认证配置，保留配置更新后的实时限额。"""
         if self.config is None:
-            return ConnectorOAuthConfig(
-                redirect_uri_env="AGENTKIT_MCP_OAUTH_REDIRECT_URI"
-            )
+            return ConnectorOAuthConfig()
         return self.config.snapshot.connector.oauth
 
     @staticmethod
@@ -347,9 +354,16 @@ class MCPAuthorization:
         redirect_uri = self.redirect_uri or settings.redirect_uri
         if not redirect_uri and settings.redirect_uri_env:
             redirect_uri = os.environ.get(settings.redirect_uri_env)
-        if self.cipher is None or not redirect_uri:
-            raise AgentKitError("MCP OAuth 客户端未配置", 503)
-        _https(redirect_uri)
+        if self.cipher is None:
+            raise AgentKitError("MCP 凭证加密密钥未配置，请联系管理员", 503)
+        if not redirect_uri:
+            raise AgentKitError("请联系管理员配置 OAuth 回调地址", 503)
+        try:
+            _https(redirect_uri, allow_loopback_http=True)
+        except ValueError:
+            raise AgentKitError(
+                "MCP OAuth 回调地址无效，需使用 HTTPS 或本机 HTTP 地址", 503
+            ) from None
         verifier = secrets.token_urlsafe(48)
         state = secrets.token_urlsafe(32)
         code_challenge = (

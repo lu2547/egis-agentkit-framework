@@ -191,6 +191,9 @@ class TeamDefinition:
             self.permissions.require_definition_write(
                 user, owner_type=row["owner_type"], owner_id=row["owner_id"]
             )
+            await GrantService(write).require_withdrawal_before_delete(
+                user, "team", identifier, write=write
+            )
             await write.definitions.delete_definition(identifier, actor=user.user_id)
             await GrantService(write).retire_definition_grants(
                 identifier, actor=user.user_id, previous=row

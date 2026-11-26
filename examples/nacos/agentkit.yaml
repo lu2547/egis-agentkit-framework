@@ -106,7 +106,7 @@ agentkit:
     oauth:
       credentialKeyEnv: AGENTKIT_MCP_CREDENTIAL_KEY
       redirectUri: null
-      redirectUriEnv: null
+      redirectUriEnv: AGENTKIT_MCP_OAUTH_REDIRECT_URI
       timeoutSeconds: 10.0
       stateLifetimeSeconds: 600.0
       refreshWindowSeconds: 15.0

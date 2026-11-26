@@ -9,9 +9,11 @@
 import asyncio
 import json
 import logging
+from contextlib import aclosing
+from contextvars import ContextVar
 
 from agentscope.app._tool import TeamSay
-from agentscope.event import HintBlockEvent
+from agentscope.event import HintBlockEvent, ReplyStartEvent
 from agentscope.message import AssistantMsg, TextBlock, ToolResultState, UserMsg
 from agentscope.middleware import ReMeMiddleware
 
@@ -19,14 +21,16 @@ from egis_agentkit.client._tracing import trace_phase
 from egis_agentkit.middleware.team._message import team_message_text
 
 logger = logging.getLogger(__name__)
+_reply_progress = ContextVar("egis_memory_reply_progress", default=None)
 
 
 class ProjectMemoryMiddlewareOverride(ReMeMiddleware):
     """复用项目级 ReMe，为 Inbox 协作回合补齐检索和回写。"""
 
-    def __init__(self, *, workspace_dir: str, parameters=None):
+    def __init__(self, *, workspace_dir: str, parameters=None, progress=None):
         super().__init__(workspace_dir=workspace_dir, parameters=parameters)
         self._startup_lock = asyncio.Lock()
+        self._progress = progress
 
     async def _ensure_started(self):
         """将同一项目的首次初始化串行化。"""
@@ -34,6 +38,26 @@ class ProjectMemoryMiddlewareOverride(ReMeMiddleware):
             await super()._ensure_started()
 
     async def on_reply(self, agent, input_kwargs, next_handler):
+        """Bind each invocation independently, using the reply ID actually emitted this turn."""
+        session_id = self._session_id_of(agent)
+        token = _reply_progress.set((session_id, None))
+        try:
+            await self._report_progress(session_id, None, None)
+            async with aclosing(
+                self._reply(agent, input_kwargs, next_handler)
+            ) as stream:
+                async for event in stream:
+                    if (
+                        isinstance(event, ReplyStartEvent)
+                        and event.role == "assistant"
+                        and event.session_id == session_id
+                    ):
+                        _reply_progress.set((session_id, event.reply_id))
+                    yield event
+        finally:
+            _reply_progress.reset(token)
+
+    async def _reply(self, agent, input_kwargs, next_handler):
         """从 Inbox 事件读取本轮任务，不改变 Agent 的原生会话输入。"""
         if input_kwargs.get("inputs") is not None:
             async for event in super().on_reply(agent, input_kwargs, next_handler):
@@ -61,6 +85,33 @@ class ProjectMemoryMiddlewareOverride(ReMeMiddleware):
             )
             if replies:
                 await self._write_back(tasks + replies, self._session_id_of(agent))
+
+    async def _report_progress(self, session_id, reply_id, phase):
+        if self._progress is not None:
+            try:
+                await self._progress(session_id, reply_id, phase)
+            except Exception:
+                logger.exception(
+                    "Failed to report memory execution phase",
+                    extra={
+                        "context": {
+                            "session_id": session_id,
+                            "reply_id": reply_id,
+                            "phase": phase,
+                        }
+                    },
+                )
+
+    async def _write_back(self, messages, session_id):
+        current = _reply_progress.get()
+        if current is None or current[0] != session_id or not current[1]:
+            return await super()._write_back(messages, session_id)
+        reply_id = current[1]
+        try:
+            await self._report_progress(session_id, reply_id, "memory")
+            return await super()._write_back(messages, session_id)
+        finally:
+            await self._report_progress(session_id, reply_id, None)
 
     async def _retrieve_for_team(self, task):
         if self._parameters.mode == "agent_control":

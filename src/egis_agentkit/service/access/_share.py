@@ -5,7 +5,7 @@
 - 审批通过时发放授权或切换已有受众的共享版。
 """
 
-from egis_agentkit.errors import Conflict, Forbidden, NotFound
+from egis_agentkit.errors import AgentKitError, Conflict, Forbidden, NotFound
 from egis_agentkit.service._admin_page import AdminPage
 from egis_agentkit.service._user import UserService, require_admin
 from egis_agentkit.service.access._grant import GrantService
@@ -15,6 +15,10 @@ from egis_agentkit.service.access._permission import (
     PermissionService,
 )
 from egis_agentkit.service.access._publication import same_publication_content
+from egis_agentkit.service.access._review_content import (
+    capture_content,
+    with_skill_documents,
+)
 from egis_agentkit.storage.model import Grant, ShareReview, ShareTarget, User, utcnow
 from egis_agentkit.storage.model._base import publication_label, resource_available
 
@@ -131,6 +135,7 @@ class ShareService:
                 share_scope_type=target.principal_type if target else None,
                 principal_id=target.principal_id if target else None,
                 submitted_by=user.user_id,
+                content_snapshot=await capture_content(write, self.grants, resource_type, resource),
             )
             row = await write.access.insert_review(review.model_dump())
             return await self._with_publication_label(
@@ -208,7 +213,7 @@ class ShareService:
             **{
                 key: value
                 for key, value in row.items()
-                if key != "_publication_revision"
+                if key not in {"_publication_revision", "content_snapshot"}
             },
             "version_label": publication_label(revision) if revision else version,
         }
@@ -228,7 +233,10 @@ class ShareService:
             if review["review_status_type"] != "pending":
                 raise Conflict("申请已处理")
             if is_approved:
-                await self._issue_approved_grant(admin, review, write=write)
+                if review["review_type"] == "revoke":
+                    await self._approve_revocation(admin, review, write=write)
+                else:
+                    await self._issue_approved_grant(admin, review, write=write)
             updated = await write.access.update_review(
                 review_id,
                 {
@@ -236,15 +244,54 @@ class ShareService:
                     "reviewed_by": admin.user_id,
                     "reviewed_at": utcnow(),
                     "review_reason": reason,
-                    "is_current": is_approved,
+                    "is_current": is_approved and review["review_type"] != "revoke",
                 },
             )
             if "_publication_revision" in review:
                 updated["_publication_revision"] = review["_publication_revision"]
             return await self._with_publication_label(updated, storage=write)
 
+    async def detail(self, admin, review_id):
+        """管理员仅按审核编号检查提交内容，不增加目录或运行权限。"""
+        require_admin(admin)
+        review = await self.storage.access.get_review(review_id)
+        if review is None:
+            raise NotFound("共享申请不存在")
+        snapshot = review.get("content_snapshot")
+        if snapshot is None:
+            resource = await self.grants.read_version(
+                review["resource_type"], review["resource_id"],
+                review["resource_version"], write=self.storage,
+            )
+            snapshot = await capture_content(
+                self.storage, self.grants, review["resource_type"], resource,
+                origin="reconstructed", require_available=False,
+            )
+        return {
+            **await self._with_publication_label(review, storage=self.storage),
+            "content": await with_skill_documents(self.storage, snapshot),
+        }
+
+    async def skill_archive(self, admin, review_id, resource_id, version):
+        """仅下载审核快照实际引用的固定技能，供检查脚本等完整文件。"""
+        from egis_agentkit.service.resource._catalog import ResourceService
+
+        detail = await self.detail(admin, review_id)
+        snapshot = detail["content"]
+        asset = next((node for node in [snapshot["root"], *snapshot["dependencies"]]
+                      if (node["resource_type"], node["resource_id"], node["resource_version"])
+                      == ("skill", resource_id, version)), None)
+        if asset is None:
+            raise NotFound("此技能版本不在该审核申请中")
+        files = self.storage.history.files
+        resources = ResourceService(self.storage, files.root, config=files.config)
+        try:
+            return await resources.export_skill_archive({**asset, "storage_scope": "owner"})
+        except (OSError, UnicodeError, AgentKitError, ValueError):
+            return await resources.export_skill_archive({**asset, "storage_scope": "shared"})
+
     async def withdraw(self, user, review_id):
-        """所有者取消申请或撤回单个受众，保留其他入口及历史发布文件。"""
+        """取消待审申请；已共享的受众仅创建撤回申请，审批前保留使用权。"""
         if not user.is_enabled:
             raise Forbidden("用户已停用")
         async with self.storage.definition_write() as write:
@@ -253,23 +300,61 @@ class ShareService:
                 raise NotFound("共享申请不存在")
             if review["owner_id"] != user.user_id:
                 raise Forbidden("只能撤回自己的共享申请")
-            if review["review_status_type"] == "cancelled":
-                return
-            if review["review_status_type"] not in {"pending", "approved"}:
-                raise Conflict("该共享申请已处理，不能撤回")
-            if review["review_status_type"] == "approved":
-                if review["review_type"] != "share":
-                    raise Conflict("请在原共享申请中撤回接收方，已发布版本不能回退")
-                # definition_write 的授权写锁串行化受众增加、撤回和版本切换。
-                # 资源停用后仍允许所有者清理已发出的授权。
-                for grant in await write.access.direct_grants(
-                    review["resource_type"], review["resource_id"]
-                ):
-                    if grant["source_review_id"] == review_id:
-                        await write.access.revoke_grant(grant["id"], actor=user.user_id)
-            await write.access.update_review(review_id, {
-                "review_status_type": "cancelled", "is_current": False,
-            })
+            status = review["review_status_type"]
+            if status == "cancelled":
+                return await self._with_publication_label(review, storage=write)
+            if status == "pending":
+                updated = await write.access.update_review(review_id, {
+                    "review_status_type": "cancelled", "is_current": False,
+                })
+                return await self._with_publication_label(updated, storage=write)
+            if status != "approved" or review["review_type"] != "share":
+                raise Conflict("请从已通过的原共享申请提交撤回申请")
+            pending = await write.access.pending_revocation(review_id)
+            if pending is not None:
+                return await self._with_publication_label(pending, storage=write)
+            grants = [grant for grant in await write.access.direct_grants(
+                review["resource_type"], review["resource_id"]
+            ) if grant["source_review_id"] == review_id]
+            if not grants:
+                raise Conflict("此共享授权已撤回")
+            version = await write.access.shared_version(review["resource_type"], review["resource_id"])
+            resource = await self.grants.read_version(
+                review["resource_type"], review["resource_id"], version, write=write,
+            )
+            approved = await write.access.get_approved_review(
+                review["resource_id"], resource_type=review["resource_type"], version=version,
+            )
+            snapshot = approved.get("content_snapshot") if approved else None
+            if snapshot is None:
+                snapshot = await capture_content(
+                    write, self.grants, review["resource_type"], resource,
+                    origin="reconstructed", require_available=False,
+                )
+            revoke = ShareReview(
+                resource_type=review["resource_type"], resource_id=review["resource_id"],
+                resource_version=resource["resource_version"], review_type="revoke",
+                original_review_id=review_id, owner_id=user.user_id,
+                share_scope_type=review["share_scope_type"], principal_id=review["principal_id"],
+                submitted_by=user.user_id,
+                content_snapshot=snapshot,
+            )
+            row = await write.access.insert_review(revoke.model_dump())
+            return await self._with_publication_label(row, storage=write, resource=resource)
+
+    @staticmethod
+    async def _approve_revocation(admin, review, *, write):
+        original = await write.access.locked_review(review["original_review_id"])
+        if original is None or original["review_type"] != "share" or any(
+            original[key] != review[key] for key in (
+                "resource_type", "resource_id", "owner_id", "share_scope_type", "principal_id"
+            )
+        ):
+            raise Conflict("撤回申请与原共享不匹配")
+        for grant in await write.access.direct_grants(review["resource_type"], review["resource_id"]):
+            if grant["source_review_id"] == original["review_id"]:
+                await write.access.revoke_grant(grant["id"], actor=admin.user_id)
+        await write.access.update_review(original["review_id"], {"is_current": False})
 
     async def _issue_approved_grant(self, admin, review, *, write):
         """重新校验申请版本，原子更新共享入口及其依赖。"""

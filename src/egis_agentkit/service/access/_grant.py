@@ -255,7 +255,7 @@ class GrantService:
             "principal_id": root["principal_id"],
         }
 
-    async def definition_dependencies(self, definition, *, write):
+    async def definition_dependencies(self, definition, *, write, require_available=True):
         """读取审批和派生授权共同使用的固定成员及技能版本。"""
         from egis_agentkit.storage._authorization import resource_rows
         from egis_agentkit.storage._definition import (
@@ -283,12 +283,13 @@ class GrantService:
                 )
                 if row is None:
                     raise NotFound("绑定专家版本不存在")
-                definition_view_selection(
-                    row,
-                    ref["resource_view_type"],
-                    version=ref["resource_version"],
-                    dependency=True,
-                )
+                if require_available:
+                    definition_view_selection(
+                        row,
+                        ref["resource_view_type"],
+                        version=ref["resource_version"],
+                        dependency=True,
+                    )
                 members.append(
                     {
                         **build_definition_data(row),
@@ -304,10 +305,11 @@ class GrantService:
         assets = {
             (row["resource_id"], row["resource_version"]): row
             for row in await resource_rows(write.engine, references)
+            if ("skill", row["resource_id"], row["resource_version"]) in references
         }
         for _, identifier, version in references:
             asset = assets.get((identifier, version))
-            if asset is None or not asset["is_enabled"]:
+            if asset is None or (require_available and not asset["is_enabled"]):
                 raise NotFound("绑定资源指定版本不存在或已停用")
         return members, assets
 
@@ -391,6 +393,31 @@ class GrantService:
             },
             actor=actor,
         )
+
+    async def require_withdrawal_before_delete(
+        self, user, kind, identifier, *, write, version=None
+    ):
+        roots = await write.access.owned_sharing_roots(kind, identifier, user.user_id)
+        if version is not None:
+            affected = []
+            for root in roots:
+                root_kind, root_id = root["resource_type"], root["resource_id"]
+                shared = await write.access.shared_version(root_kind, root_id)
+                if root_kind not in DEFINITION_KINDS:
+                    if shared == version:
+                        affected.append(root)
+                    continue
+                resource = await self.read_version(
+                    root_kind, root_id,
+                    shared if root["resource_view_type"] == "shared" else None,
+                    write=write,
+                )
+                _, assets = await self.definition_dependencies(resource, write=write)
+                if (identifier, version) in assets:
+                    affected.append(root)
+            roots = affected
+        if roots:
+            raise Conflict("请先提交共享撤回申请并等待管理员审核通过，再删除或停用资源")
 
     async def record_definition_owner(self, definition, *, actor):
         """登记所有者或同步系统配置变更后的授权路径。"""
